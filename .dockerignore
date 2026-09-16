@@ -1,0 +1,6 @@
+.git
+result
+.env
+**/node_modules
+**/.env
+*.md
