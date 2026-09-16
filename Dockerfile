@@ -1,4 +1,4 @@
-# Heimcloud ops — optional multi-stage Node image for non-Nix local dev (Neo uses package.nix).
+# Heimcloud ops — optional multi-stage Node image for non-Nix local dev (Neo uses packages.heimcloud-ops).
 FROM node:22-alpine AS deps
 RUN apk add --no-cache python3 make g++
 WORKDIR /app
