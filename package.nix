@@ -1,4 +1,5 @@
-# Heimcloud ops OCI image — buildNpmPackage (better-sqlite3) + dockerTools.
+# Package: heimcloud-ops — OCI image (buildNpmPackage + dockerTools).
+# Wired once via modules/packages/heimcloud-ops-image.nix → packages.heimcloud-ops.
 {
   lib,
   dockerTools,

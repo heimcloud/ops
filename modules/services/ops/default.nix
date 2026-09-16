@@ -1,5 +1,5 @@
-# Ops service implementation — OCI container from flake dockerTools image.
-{...}: {
+# Ops service implementation — OCI image from flake packages (import-tree).
+{self, ...}: {
   flake.modules.nixos.ops = {
     config,
     lib,
@@ -9,7 +9,7 @@
     with lib; let
       cfg = config.neo.services.ops;
       opsAppdata = "${config.neo.core.volumes.appdata}/ops";
-      opsImage = pkgs.callPackage ../../../package.nix {};
+      opsImage = self.packages.${pkgs.stdenv.hostPlatform.system}.heimcloud-ops;
       adminPath = let
         p = cfg.admin.path or "/admin";
       in

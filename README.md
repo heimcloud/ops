@@ -101,7 +101,7 @@ neo.services.ops = {
 };
 ```
 
-Build OCI image: `nix build .#heimcloud-ops` (or `.#default`).
+Build OCI image: `nix build .#heimcloud-ops` / `.#default`; NixOS `imageFile` = `self.packages.<system>.heimcloud-ops` (or `.#default`).
 
 ### Deploy later
 
