@@ -19,6 +19,7 @@
       secretEnv = lib.filterAttrs (_: v: v != null && v != "") {
         OPS_INGEST_SECRET = cfg.ingestSecret;
         GITHUB_TOKEN = cfg.githubToken;
+        OPS_GITHUB_TOKEN = cfg.githubToken;
         SITE_URL = cfg.siteUrl;
         OPS_TARGET_ALLOWLIST = cfg.targetAllowlist;
       };

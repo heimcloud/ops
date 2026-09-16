@@ -1,10 +1,11 @@
 /**
  * Draft PR shell for incidents via GitHub REST API.
- * Token: GITHUB_TOKEN or GH_TOKEN. No auto-merge.
+ * Token: OPS_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN. No auto-merge.
  */
 
 function getToken() {
   return (
+    process.env.OPS_GITHUB_TOKEN ||
     process.env.GITHUB_TOKEN ||
     process.env.GH_TOKEN ||
     ""
@@ -55,6 +56,26 @@ export function resolveTargetRepo(incident) {
     if (isRepoAllowed(candidate)) return candidate;
   }
   return "madebydamo/neo";
+}
+
+/**
+ * Logical allowlisted target vs writable head repo.
+ * heimcloud token cannot push to madebydamo/neo — push to fork heimcloud/neo
+ * and open the draft PR against upstream when possible.
+ */
+export function resolveWriteRepo(logicalRepo) {
+  const slug = String(logicalRepo || "").trim();
+  if (slug === "madebydamo/neo") return "heimcloud/neo";
+  return slug;
+}
+
+export function resolvePrBaseRepo(logicalRepo, writeRepo) {
+  const logical = String(logicalRepo || "").trim();
+  const write = String(writeRepo || "").trim();
+  if (logical === "madebydamo/neo" && write === "heimcloud/neo") {
+    return "madebydamo/neo";
+  }
+  return write;
 }
 
 async function gh(path, { method = "GET", body } = {}) {
@@ -140,38 +161,44 @@ function incidentChecklist(incident) {
  * add docs/heimcloud-ops/incident-<id>.md stub, open draft PR.
  */
 export async function createDraftPrForIncident(incident) {
-  const repo = resolveTargetRepo(incident);
-  if (!isRepoAllowed(repo)) {
-    const err = new Error(`target_repo_not_allowlisted:${repo}`);
+  const logicalRepo = resolveTargetRepo(incident);
+  if (!isRepoAllowed(logicalRepo)) {
+    const err = new Error(`target_repo_not_allowlisted:${logicalRepo}`);
     err.status = 400;
     throw err;
   }
-  const [owner, name] = repo.split("/");
+  const writeRepo = resolveWriteRepo(logicalRepo);
+  const baseRepo = resolvePrBaseRepo(logicalRepo, writeRepo);
+  const [writeOwner, writeName] = writeRepo.split("/");
+  const [baseOwner, baseName] = baseRepo.split("/");
   const branch = `heimcloud/incident-${incident.id}`;
   const filePath = `docs/heimcloud-ops/incident-${incident.id}.md`;
   const bodyMd = incidentChecklist(incident);
 
-  const repoInfo = await gh(`/repos/${owner}/${name}`);
-  const defaultBranch = repoInfo.default_branch || "main";
-  const ref = await gh(`/repos/${owner}/${name}/git/ref/heads/${defaultBranch}`);
+  // Prefer tip of write repo (fork) so we can push; fall back to logical base tip sync is operator's job
+  const writeInfo = await gh(`/repos/${writeOwner}/${writeName}`);
+  const writeDefault = writeInfo.default_branch || "master";
+  const baseInfo = await gh(`/repos/${baseOwner}/${baseName}`);
+  const baseDefault = baseInfo.default_branch || "main";
+  const ref = await gh(
+    `/repos/${writeOwner}/${writeName}/git/ref/heads/${writeDefault}`,
+  );
   const baseSha = ref.object.sha;
 
-  // Create branch (ignore if already exists)
+  // Create branch on writable repo (ignore if already exists)
   try {
-    await gh(`/repos/${owner}/${name}/git/refs`, {
+    await gh(`/repos/${writeOwner}/${writeName}/git/refs`, {
       method: "POST",
       body: { ref: `refs/heads/${branch}`, sha: baseSha },
     });
   } catch (err) {
     if (err.status !== 422) throw err;
-    // Branch may already exist — continue and try file + PR
   }
 
-  // Create or update stub file via Contents API
   let existingSha = null;
   try {
     const existing = await gh(
-      `/repos/${owner}/${name}/contents/${filePath}?ref=${encodeURIComponent(branch)}`,
+      `/repos/${writeOwner}/${writeName}/contents/${filePath}?ref=${encodeURIComponent(branch)}`,
     );
     existingSha = existing.sha;
   } catch (err) {
@@ -179,7 +206,7 @@ export async function createDraftPrForIncident(incident) {
   }
 
   const contentB64 = Buffer.from(bodyMd, "utf8").toString("base64");
-  await gh(`/repos/${owner}/${name}/contents/${filePath}`, {
+  await gh(`/repos/${writeOwner}/${writeName}/contents/${filePath}`, {
     method: "PUT",
     body: {
       message: `ops: incident #${incident.id} draft checklist`,
@@ -189,15 +216,18 @@ export async function createDraftPrForIncident(incident) {
     },
   });
 
-  // Find existing PR for this head, else create draft
-  const head = `${owner}:${branch}`;
+  // Cross-fork head when write repo differs from PR base
+  const head =
+    writeRepo === baseRepo ? branch : `${writeOwner}:${branch}`;
   const openPrs = await gh(
-    `/repos/${owner}/${name}/pulls?state=open&head=${encodeURIComponent(head)}`,
+    `/repos/${baseOwner}/${baseName}/pulls?state=open&head=${encodeURIComponent(head.includes(":") ? head : `${writeOwner}:${branch}`)}`,
   );
   if (Array.isArray(openPrs) && openPrs.length > 0) {
     const pr = openPrs[0];
     return {
-      repo,
+      repo: logicalRepo,
+      write_repo: writeRepo,
+      base_repo: baseRepo,
       branch,
       pr_number: pr.number,
       pr_url: pr.html_url,
@@ -206,19 +236,21 @@ export async function createDraftPrForIncident(incident) {
     };
   }
 
-  const pr = await gh(`/repos/${owner}/${name}/pulls`, {
+  const pr = await gh(`/repos/${baseOwner}/${baseName}/pulls`, {
     method: "POST",
     body: {
       title: `ops: incident #${incident.id} (${incident.severity || "unspecified"})`,
-      head: branch,
-      base: defaultBranch,
+      head,
+      base: baseDefault,
       body: bodyMd,
       draft: true,
     },
   });
 
   return {
-    repo,
+    repo: logicalRepo,
+    write_repo: writeRepo,
+    base_repo: baseRepo,
     branch,
     pr_number: pr.number,
     pr_url: pr.html_url,

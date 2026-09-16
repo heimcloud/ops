@@ -64,7 +64,7 @@ On an incident detail page, **Create PR**:
 4. Opens a **draft** pull request with the incident body. Reuses an existing open PR for the same head if present.
 5. Sets incident `status=pr_opened` and stores `draft_pr_url`. **No auto-merge.**
 
-Requires `GITHUB_TOKEN` or `GH_TOKEN` with `repo` scope on allowlisted targets.
+Requires `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` with write on the push target. `madebydamo/neo` is remapped: branches push to fork `heimcloud/neo`, draft PR opens against `madebydamo/neo`.
 
 ## Run locally
 
@@ -80,7 +80,7 @@ OPS_DB_PATH=./data/ops.sqlite OPS_INGEST_SECRET=devsecret npm start
 Env placeholders (never commit secrets):
 
 - `OPS_INGEST_SECRET` — ingest shared secret
-- `GITHUB_TOKEN` / `GH_TOKEN` — draft PR API
+- `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` — draft PR API (neo writes go to `heimcloud/neo` fork)
 - `OPS_DB_PATH` — SQLite path (WAL)
 - `OPS_TARGET_ALLOWLIST` — default `madebydamo/neo,heimcloud/*`
 
