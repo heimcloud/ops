@@ -126,6 +126,24 @@ IDs are stable (`REQ-…`) for linking test runs.
 
 ---
 
+
+
+## J. Customer SSH enrollment & auth (2026-09-17)
+
+| ID | Requirement | Verify |
+|----|-------------|--------|
+| REQ-J1 | Two paths: **S** services-only (customer submits pubkey) and **H** hardware flash (Heimcloud captures Neo pubkey at setup) | Design + flows implemented |
+| REQ-J2 | No unauthenticated SSH-key claim (prevents stealing another customer's repo) | Attempt unauth POST → 401/403 |
+| REQ-J3 | Path S: Customer Portal login bound to Stripe/ledger email (magic link phase 1) | Login only works for known customer email |
+| REQ-J4 | Path S: After auth, submit/rotate OpenSSH pubkey → RO Gitea deploy key on their `repo_slug` only | Key attached; other repos unaffected |
+| REQ-J5 | Path H: Factory/setup after neo activate reads `/home/homeserver/.ssh/id_ed25519.pub` and attaches via staff-authenticated API | Factory checklist |
+| REQ-J6 | Portal shows repo/plugin instructions; never asks for private key | UX review |
+| REQ-J7 | Staff Tinyauth `/admin` ≠ customer portal; separate trust boundaries | Route separation |
+| REQ-J8 | Phase 1 auth = shop magic link; Authentik optional later for SSO (Gitea/portal); Authelia not preferred as full customer IdP | Architecture decision recorded |
+
+Full concept: [CUSTOMER_SSH_AND_AUTH.md](./CUSTOMER_SSH_AND_AUTH.md)
+
 ## Changelog
 
 - 2026-09-17: Initial dump from Damo↔CEO conversation (product → shop → credentials overlays → ops/Hermes → user management).
+- 2026-09-17: Added §J customer SSH enrollment paths S/H + auth plan (magic link first; Authentik later).
