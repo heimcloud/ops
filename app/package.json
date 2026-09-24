@@ -2,11 +2,12 @@
   "name": "heimcloud-ops",
   "version": "0.1.0",
   "private": true,
-  "description": "Heimcloud Ops — incident ingest + admin (Neo plugin phase 1)",
+  "description": "Heimcloud Ops \u2014 incident ingest + admin (Neo plugin phase 1)",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test test/**/*.test.js"
   },
   "engines": {
     "node": ">=20"

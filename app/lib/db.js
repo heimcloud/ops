@@ -245,3 +245,14 @@ export function countByStatus() {
   for (const r of rows) out[r.status] = r.n;
   return out;
 }
+
+export function listDistinctCustomerRepoSlugs() {
+  const rows = getDb()
+    .prepare(
+      `SELECT DISTINCT customer_repo_slug AS slug FROM incidents
+       WHERE customer_repo_slug IS NOT NULL AND trim(customer_repo_slug) != ''`,
+    )
+    .all();
+  return rows.map((r) => String(r.slug));
+}
+

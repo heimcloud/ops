@@ -1,7 +1,21 @@
 /**
- * Draft PR shell for incidents via GitHub REST API.
- * Token: OPS_GITHUB_TOKEN, GITHUB_TOKEN, or GH_TOKEN. No auto-merge.
+ * GitHub helpers for Ops.
+ *
+ * Choice (TASK 2): the old Create-PR path that committed
+ * docs/heimcloud-ops/incident-*.md into target repos is removed. Draft PRs
+ * cannot exist without a commit, and those commits leaked customer
+ * identifiers. Fix PRs now come from tested branches (Start fix only
+ * records intent in Ops). buildAnonymousPrPayload remains as the single
+ * place that would format GitHub-facing text if we ever open a PR again —
+ * title/body are built only from incident number, report_hash, unit,
+ * severity, class, neo_version, and a redacted logs excerpt.
  */
+
+import {
+  redactIdentifyingDetails,
+  mergeKnownSlugs,
+} from "./redact.js";
+import { listDistinctCustomerRepoSlugs } from "./db.js";
 
 function getToken() {
   return (
@@ -29,19 +43,14 @@ export function getAllowlist() {
 export function isRepoAllowed(repo, allowlist = getAllowlist()) {
   const slug = String(repo || "").trim();
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)) return false;
-  const [owner, name] = slug.split("/");
+  const [owner] = slug.split("/");
   for (const rule of allowlist) {
     if (rule === slug) return true;
     if (rule.endsWith("/*")) {
       const prefix = rule.slice(0, -2);
       if (owner === prefix) return true;
     }
-    if (rule === `${owner}/*`) return true;
-    if (rule === name && owner) {
-      /* ignore bare name */
-    }
   }
-  // Explicit default coverage even if env is empty-ish
   if (slug === "madebydamo/neo") return true;
   if (owner === "heimcloud") return true;
   return false;
@@ -51,7 +60,6 @@ export function resolveTargetRepo(incident) {
   const hint = (incident.target_repo || incident.target_hint || "").trim();
   if (hint && isRepoAllowed(hint)) return hint;
   if (hint && !hint.includes("/")) {
-    // bare name under heimcloud
     const candidate = `heimcloud/${hint}`;
     if (isRepoAllowed(candidate)) return candidate;
   }
@@ -60,8 +68,7 @@ export function resolveTargetRepo(incident) {
 
 /**
  * Logical allowlisted target vs writable head repo.
- * heimcloud token cannot push to madebydamo/neo — push to fork heimcloud/neo
- * and open the draft PR against upstream when possible.
+ * heimcloud token cannot push to madebydamo/neo — push to fork heimcloud/neo.
  */
 export function resolveWriteRepo(logicalRepo) {
   const slug = String(logicalRepo || "").trim();
@@ -78,183 +85,76 @@ export function resolvePrBaseRepo(logicalRepo, writeRepo) {
   return write;
 }
 
-async function gh(path, { method = "GET", body } = {}) {
-  const token = getToken();
-  if (!token) {
-    const err = new Error("github_token_not_configured");
-    err.status = 503;
-    throw err;
-  }
-  const res = await fetch(`https://api.github.com${path}`, {
-    method,
-    headers: {
-      Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "heimcloud-ops",
-      ...(body ? { "Content-Type": "application/json" } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { raw: text };
-  }
-  if (!res.ok) {
-    const err = new Error(
-      (data && (data.message || data.error)) || `github_api_${res.status}`,
-    );
-    err.status = res.status;
-    err.data = data;
-    throw err;
-  }
-  return data;
-}
+/**
+ * Build an anonymous title + body for a hypothetical GitHub PR.
+ * Does not call GitHub. Never includes customer_repo_slug, target_hint,
+ * plugin_urls, or unredacted logs.
+ *
+ * @param {object} incident
+ * @param {{ knownSlugs?: string[], logsMaxChars?: number }} [opts]
+ * @returns {{ title: string, body: string }}
+ */
+export function buildAnonymousPrPayload(incident, opts = {}) {
+  const knownSlugs = mergeKnownSlugs(
+    opts.knownSlugs ?? listDistinctCustomerRepoSlugs(),
+    incident.customer_repo_slug,
+  );
+  const redact = (s) => redactIdentifyingDetails(s, { knownSlugs });
 
-function incidentChecklist(incident) {
-  return [
-    `# Heimcloud Ops incident #${incident.id}`,
+  const id = incident.id;
+  const hash = String(incident.report_hash || "");
+  const hashShort = hash.slice(0, 12);
+  const severity = redact(incident.severity || "unspecified");
+  const klass = redact(incident.class || "unknown");
+  const unit = redact(incident.unit || "—");
+  const neoVersion = redact(incident.neo_version || "—");
+  const logsMax = opts.logsMaxChars ?? 4000;
+  let logs = redact(incident.logs_excerpt || "(none)");
+  if (logs.length > logsMax) {
+    logs = `${logs.slice(0, logsMax)}\n…[truncated]`;
+  }
+
+  const title = `ops: incident #${id} (${severity})`;
+  const body = [
+    `# Heimcloud Ops incident #${id}`,
     "",
-    "Phase 1 draft PR shell — fill in the repair. **Do not auto-merge.**",
+    "Anonymous incident reference. **Do not auto-merge.**",
+    "Fix PRs come from tested branches; this text is metadata only.",
     "",
     "## Incident",
     "",
-    `- **report_hash:** \`${incident.report_hash}\``,
-    `- **severity:** ${incident.severity || "—"}`,
-    `- **class:** ${incident.class}`,
-    `- **status:** ${incident.status}`,
-    `- **neo_version:** ${incident.neo_version || "—"}`,
-    `- **unit:** ${incident.unit || "—"}`,
-    `- **customer_repo_slug:** ${incident.customer_repo_slug || "—"}`,
-    `- **target_hint:** ${incident.target_hint || "—"}`,
+    `- **report_hash:** \`${hash}\` (\`${hashShort}…\`)`,
+    `- **severity:** ${severity}`,
+    `- **class:** ${klass}`,
+    `- **neo_version:** ${neoVersion}`,
+    `- **unit:** ${unit}`,
     "",
-    "## Plugin URLs",
+    "## Logs excerpt (redacted)",
     "",
     "```",
-    incident.plugin_urls || "(none)",
+    logs,
     "```",
-    "",
-    "## Logs excerpt",
-    "",
-    "```",
-    incident.logs_excerpt || "(none)",
-    "```",
-    "",
-    "## Checklist for Repair / human",
-    "",
-    "- [ ] Confirm class (software vs human_config)",
-    "- [ ] Reproduce or verify from logs",
-    "- [ ] Implement fix on this branch",
-    "- [ ] Request review — **no auto-merge**",
     "",
     "---",
-    `_Opened by Heimcloud Ops · branch \`heimcloud/incident-${incident.id}\`_`,
+    `_Heimcloud Ops · incident #${id} · report_hash ${hashShort}…_`,
     "",
   ].join("\n");
+
+  // Final sweep over the whole payload (defense in depth).
+  return {
+    title: redact(title),
+    body: redact(body),
+  };
 }
 
 /**
- * Create branch heimcloud/incident-<id> from default branch tip,
- * add docs/heimcloud-ops/incident-<id>.md stub, open draft PR.
+ * @deprecated Removed: doc-commit draft PRs leaked identifiers.
+ * Use admin "Start fix" (intent only) + tested fix branches instead.
  */
-export async function createDraftPrForIncident(incident) {
-  const logicalRepo = resolveTargetRepo(incident);
-  if (!isRepoAllowed(logicalRepo)) {
-    const err = new Error(`target_repo_not_allowlisted:${logicalRepo}`);
-    err.status = 400;
-    throw err;
-  }
-  const writeRepo = resolveWriteRepo(logicalRepo);
-  const baseRepo = resolvePrBaseRepo(logicalRepo, writeRepo);
-  const [writeOwner, writeName] = writeRepo.split("/");
-  const [baseOwner, baseName] = baseRepo.split("/");
-  const branch = `heimcloud/incident-${incident.id}`;
-  const filePath = `docs/heimcloud-ops/incident-${incident.id}.md`;
-  const bodyMd = incidentChecklist(incident);
-
-  // Prefer tip of write repo (fork) so we can push; fall back to logical base tip sync is operator's job
-  const writeInfo = await gh(`/repos/${writeOwner}/${writeName}`);
-  const writeDefault = writeInfo.default_branch || "master";
-  const baseInfo = await gh(`/repos/${baseOwner}/${baseName}`);
-  const baseDefault = baseInfo.default_branch || "main";
-  const ref = await gh(
-    `/repos/${writeOwner}/${writeName}/git/ref/heads/${writeDefault}`,
+export async function createDraftPrForIncident() {
+  const err = new Error(
+    "create_draft_pr_removed: use Start fix + tested branch; doc-commit PRs are disabled",
   );
-  const baseSha = ref.object.sha;
-
-  // Create branch on writable repo (ignore if already exists)
-  try {
-    await gh(`/repos/${writeOwner}/${writeName}/git/refs`, {
-      method: "POST",
-      body: { ref: `refs/heads/${branch}`, sha: baseSha },
-    });
-  } catch (err) {
-    if (err.status !== 422) throw err;
-  }
-
-  let existingSha = null;
-  try {
-    const existing = await gh(
-      `/repos/${writeOwner}/${writeName}/contents/${filePath}?ref=${encodeURIComponent(branch)}`,
-    );
-    existingSha = existing.sha;
-  } catch (err) {
-    if (err.status !== 404) throw err;
-  }
-
-  const contentB64 = Buffer.from(bodyMd, "utf8").toString("base64");
-  await gh(`/repos/${writeOwner}/${writeName}/contents/${filePath}`, {
-    method: "PUT",
-    body: {
-      message: `ops: incident #${incident.id} draft checklist`,
-      content: contentB64,
-      branch,
-      ...(existingSha ? { sha: existingSha } : {}),
-    },
-  });
-
-  // Cross-fork head when write repo differs from PR base
-  const head =
-    writeRepo === baseRepo ? branch : `${writeOwner}:${branch}`;
-  const openPrs = await gh(
-    `/repos/${baseOwner}/${baseName}/pulls?state=open&head=${encodeURIComponent(head.includes(":") ? head : `${writeOwner}:${branch}`)}`,
-  );
-  if (Array.isArray(openPrs) && openPrs.length > 0) {
-    const pr = openPrs[0];
-    return {
-      repo: logicalRepo,
-      write_repo: writeRepo,
-      base_repo: baseRepo,
-      branch,
-      pr_number: pr.number,
-      pr_url: pr.html_url,
-      draft: Boolean(pr.draft),
-      reused: true,
-    };
-  }
-
-  const pr = await gh(`/repos/${baseOwner}/${baseName}/pulls`, {
-    method: "POST",
-    body: {
-      title: `ops: incident #${incident.id} (${incident.severity || "unspecified"})`,
-      head,
-      base: baseDefault,
-      body: bodyMd,
-      draft: true,
-    },
-  });
-
-  return {
-    repo: logicalRepo,
-    write_repo: writeRepo,
-    base_repo: baseRepo,
-    branch,
-    pr_number: pr.number,
-    pr_url: pr.html_url,
-    draft: true,
-    reused: false,
-  };
+  err.status = 410;
+  throw err;
 }

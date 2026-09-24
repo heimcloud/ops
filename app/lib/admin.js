@@ -1,5 +1,5 @@
 /**
- * Admin UI — list incidents, set class, Create draft PR.
+ * Admin UI — list incidents, set class, Start fix (intent only).
  * Edge auth: Tinyauth via SWAG (admin.auth). In-app: ADMIN_ENABLED / ADMIN_READ_ONLY.
  */
 import { Router } from "express";
@@ -16,7 +16,6 @@ import {
   getStatuses,
 } from "./db.js";
 import {
-  createDraftPrForIncident,
   getGithubTokenConfigured,
   getAllowlist,
   isRepoAllowed,
@@ -124,7 +123,7 @@ export function createAdminRouter() {
         ${
           ghOk
             ? ""
-            : `<div class="alert warn"><strong>GITHUB_TOKEN / GH_TOKEN not set.</strong> Create PR will return 503 until configured.</div>`
+            : `<div class="alert warn"><strong>GITHUB_TOKEN / GH_TOKEN not set.</strong> Optional for Ops; fix PRs are opened from tested branches, not from this UI.</div>`
         }
         <div class="grid grid-2">
           ${getStatuses()
@@ -190,13 +189,13 @@ export function createAdminRouter() {
           <input name="target_repo" value="${escapeHtml(incident.target_repo || incident.target_hint || resolved)}" placeholder="owner/repo" />
           <p style="margin-top:1rem"><button class="btn" type="submit">Save</button></p>
         </form>
-        <form method="post" action="${base}/incidents/${id}/create-pr" class="card" onsubmit="return confirm('Open a draft PR shell on ${escapeHtml(resolved)}?');">
-          <p>Creates branch <code>heimcloud/incident-${id}</code> on <strong>${escapeHtml(resolved)}</strong>,
-             commits a checklist stub under <code>docs/heimcloud-ops/</code>, and opens a <strong>draft</strong> PR. No auto-merge.</p>
-          <button class="btn" type="submit" ${getGithubTokenConfigured() ? "" : "disabled"}>Create PR</button>
+        <form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Record fix intent for incident #${id}? No GitHub PR will be opened.');">
+          <p><strong>Start fix</strong> records intent only (status → triaged). It does <em>not</em> open a GitHub PR or commit into the target repo.
+             Fix PRs come from a <strong>tested branch</strong> on the allowlisted target (resolved: <code>${escapeHtml(resolved)}</code>).</p>
+          <button class="btn" type="submit">Start fix</button>
           ${
             incident.draft_pr_url
-              ? `<p style="margin-top:0.75rem">Existing: <a href="${escapeHtml(incident.draft_pr_url)}" target="_blank" rel="noopener">${escapeHtml(incident.draft_pr_url)}</a></p>`
+              ? `<p style="margin-top:0.75rem" class="muted">Legacy draft PR link: <a href="${escapeHtml(incident.draft_pr_url)}" target="_blank" rel="noopener">${escapeHtml(incident.draft_pr_url)}</a></p>`
               : ""
           }
         </form>`;
@@ -271,38 +270,32 @@ export function createAdminRouter() {
     }
   });
 
-  router.post("/incidents/:id/create-pr", async (req, res) => {
+  router.post("/incidents/:id/start-fix", (req, res) => {
     const base = req.adminBase;
     if (refuseMutations(res, base)) return;
     const id = Number(req.params.id);
     const incident = getIncident(id);
     if (!incident) return res.status(404).send("Not found");
     try {
-      const result = await createDraftPrForIncident(incident);
-      updateIncident(id, {
-        status: "pr_opened",
-        target_repo: result.repo,
-        draft_pr_url: result.pr_url,
-        draft_pr_number: result.pr_number,
-        draft_branch: result.branch,
+      const resolved = resolveTargetRepo(incident);
+      const updated = updateIncident(id, {
+        status: incident.status === "open" ? "triaged" : incident.status,
+        target_repo: incident.target_repo || resolved,
       });
-      addIncidentEvent(id, "draft_pr", result.reused ? "Reused open draft PR" : "Opened draft PR", result);
-      const msg = result.reused
-        ? `Reused draft PR #${result.pr_number}`
-        : `Opened draft PR #${result.pr_number}`;
+      addIncidentEvent(id, "fix_intent", "Start fix recorded (no GitHub PR)", {
+        target_repo: updated.target_repo,
+        previous_status: incident.status,
+        status: updated.status,
+      });
       return res.redirect(
         303,
-        `${base}/incidents/${id}?msg=${encodeURIComponent(msg)}`,
+        `${base}/incidents/${id}?msg=${encodeURIComponent("Fix intent recorded")}`,
       );
     } catch (err) {
-      console.error("[admin] create-pr", err);
-      addIncidentEvent(id, "draft_pr_error", err.message || "Create PR failed", {
-        status: err.status,
-        data: err.data || null,
-      });
+      console.error("[admin] start-fix", err);
       return res.redirect(
         303,
-        `${base}/incidents/${id}?err=${encodeURIComponent(err.message || "Create PR failed")}`,
+        `${base}/incidents/${id}?err=${encodeURIComponent(err.message || "Start fix failed")}`,
       );
     }
   });
