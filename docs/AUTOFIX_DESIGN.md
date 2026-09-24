@@ -22,7 +22,7 @@ flowchart TD
   J --> L["heimcloud-lab-test branch checks<br/>record generation; activate tip"]
   L --> M{Auto checks}
   M -->|pass| N[Draft PR + anonymized evidence<br/>Damo reviews / merge]
-  M -->|fail| O[Rollback to master]
+  M -->|fail| O[Rollback to previous NixOS generation]
   O --> P{Attempts &lt; N=2?}
   P -->|yes| H
   P -->|no| Q[needs_human + Telegram<br/>NO PR]
@@ -61,7 +61,9 @@ Until a second lab box exists:
 
 ## Lab test
 
-Host-side script owned by Fleet: `heimcloud-lab-test <branch> <checks>` — timeout, switch neo input override to fork branch tip + activate (or Fleet lab-deploy helper), run class-specific checks, rollback to `master`.
+Host-side script owned by Fleet: `heimcloud-lab-test <branch> <checks>` — timeout, switch neo input override to fork branch tip + activate (or Fleet lab-deploy helper), run class-specific checks, then on failure switch back to the recorded previous NixOS generation (no re-eval).
+
+**Rollback is never "switch the neo input back to `master`".** The lab host may run a neo branch that is ahead of `master` (e.g. Gitea service, Hermes skill materialize), so a `master` rollback can remove live services. Fix branches must be based on the neo ref the lab host currently runs, and rollback uses the previous-generation switch that restores the exact prior system. On pass, the fix branch may stay deployed until it merges if it is a superset of the running ref.
 
 Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines; no limiter / proxy-header warning; healthz 200; search returns results.
 
