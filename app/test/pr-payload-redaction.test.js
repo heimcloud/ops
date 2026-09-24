@@ -17,14 +17,14 @@ const { getDb, upsertIncident, listDistinctCustomerRepoSlugs } = await import(
 const { buildAnonymousPrPayload } = await import("../lib/github.js");
 const { redactIdentifyingDetails } = await import("../lib/redact.js");
 
-const SEED_SLUG = "KAKJWG9RM5";
+const SEED_SLUG = "ZZTEST0000";
 const SEED_HOST = "hattori";
-const SEED_EMAIL = "ops-leak@damo4mf20.ch";
+const SEED_EMAIL = "ops-leak@example.com";
 const SEED_IP = "203.0.113.77";
 const SEED_IPV6 = "2001:db8::abcd";
-const SEED_HOME = "/home/damo";
-const SEED_FQDN = "box.damo4mf20.ch";
-const SEED_PLUGIN = "github:heimcloud/customers/KAKJWG9RM5";
+const SEED_HOME = "/home/testuser";
+const SEED_FQDN = "box.example.com";
+const SEED_PLUGIN = "github:heimcloud/customers/ZZTEST0000";
 
 before(() => {
   getDb();
@@ -126,3 +126,23 @@ test("buildAnonymousPrPayload never leaks seeded slug or identifiers", () => {
   assert.match(payload.body, /docker-searxng/);
   assert.match(payload.body, /docker\.io\/searxng\/searxng:latest/);
 });
+
+test("OPS_REDACT_EXTRA_SLUGS merges into PR payload redaction", () => {
+  const burned = "YYBURNED01"; // synthetic stand-in for rotated/burned slugs
+  process.env.OPS_REDACT_EXTRA_SLUGS = burned;
+  const { incident } = upsertIncident({
+    report_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    neo_version: "neo 0.1.0",
+    unit: "docker-searxng",
+    logs_excerpt: `customer touched ${burned} and docker.io/searxng/searxng:latest`,
+    customer_repo_slug: "ZZTEST0001",
+    severity: "warning",
+  });
+  const payload = buildAnonymousPrPayload(incident);
+  const blob = `${payload.title}\n${payload.body}`;
+  assert.equal(blob.includes(burned), false);
+  assert.equal(blob.includes("ZZTEST0001"), false);
+  assert.match(blob, /docker\.io\/searxng\/searxng:latest/);
+  delete process.env.OPS_REDACT_EXTRA_SLUGS;
+});
+

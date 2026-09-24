@@ -14,6 +14,7 @@
 import {
   redactIdentifyingDetails,
   mergeKnownSlugs,
+  getExtraRedactSlugs,
 } from "./redact.js";
 import { listDistinctCustomerRepoSlugs } from "./db.js";
 
@@ -97,6 +98,7 @@ export function resolvePrBaseRepo(logicalRepo, writeRepo) {
 export function buildAnonymousPrPayload(incident, opts = {}) {
   const knownSlugs = mergeKnownSlugs(
     opts.knownSlugs ?? listDistinctCustomerRepoSlugs(),
+    ...getExtraRedactSlugs(),
     incident.customer_repo_slug,
   );
   const redact = (s) => redactIdentifyingDetails(s, { knownSlugs });

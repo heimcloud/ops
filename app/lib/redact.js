@@ -124,3 +124,17 @@ export function mergeKnownSlugs(fromDb = [], ...extras) {
   }
   return [...set];
 }
+
+/**
+ * Extra burned / rotated slugs that must stay redacted even if DB rows change.
+ * Comma-separated via OPS_REDACT_EXTRA_SLUGS.
+ * @returns {string[]}
+ */
+export function getExtraRedactSlugs() {
+  const raw = process.env.OPS_REDACT_EXTRA_SLUGS || "";
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
