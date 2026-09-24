@@ -1,6 +1,6 @@
 # Heimcloud Ops (Neo plugin)
 
-Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and a **Start fix** intent flow (fix PRs come from tested branches; no incident docs committed to target repos). No Hermes client plugin in this repo, no auto-fix agent, no auto-merge. Deploy = Fleet activates `main` tip.
+Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and a **Start fix** intent flow (fix PRs come from tested branches; no incident docs committed to target repos). No Hermes client plugin in this repo, no auto-merge. Deploy = Fleet activates `main` tip. Auto-fix loop design: [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md).
 
 Repo: <https://github.com/heimcloud/ops>
 
@@ -8,7 +8,7 @@ Repo: <https://github.com/heimcloud/ops>
 
 1. **`POST /api/incidents`** — protected by `OPS_INGEST_SECRET` (`Authorization: Bearer …` or `X-Ops-Secret`). Idempotent on `report_hash`.
 2. **SQLite WAL** (`PRAGMA journal_mode=WAL`) at `OPS_DB_PATH` (default `/data/ops.sqlite`).
-3. **Admin UI** at `/admin` — list incidents, set class/status, **Create PR** opens a draft PR on an allowlisted target repo (`madebydamo/neo` + `heimcloud/*` by default). Branch: `heimcloud/incident-<id>`.
+3. **Admin UI** at `/admin` — list incidents, set class/status, **Start fix** records intent (fix PRs come from the tested-branch loop; see design doc).
 
 ## Schema
 
@@ -22,7 +22,7 @@ Repo: <https://github.com/heimcloud/ops>
 | `customer_repo_slug`, `severity`, `target_hint`, `target_repo` | TEXT |
 | `status` | `open` \| `triaged` \| `pr_opened` \| `resolved` \| `closed` |
 | `class` | `software` \| `human_config` \| `unknown` |
-| `draft_pr_url`, `draft_pr_number`, `draft_branch` | set by Create PR |
+| `draft_pr_url`, `draft_pr_number`, `draft_branch` | set when a tested draft PR is opened |
 | `created_at`, `updated_at` | ISO text |
 
 ### `incident_events`
@@ -54,17 +54,11 @@ curl -sS -X POST "http://localhost:3000/api/incidents" \
 
 Bearer also works: `-H "Authorization: Bearer $OPS_INGEST_SECRET"`.
 
-## Admin Create PR
+## Admin Start fix
 
-On an incident detail page, **Create PR**:
+On an incident detail page, **Start fix** records intent (status → `triaged`) and does **not** open a GitHub PR or commit into the target repo. Coded fix PRs come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → anonymized draft PR). **No auto-merge.**
 
-1. Resolves target repo from `target_repo` / `target_hint` (must match allowlist; default `madebydamo/neo`).
-2. Creates branch `heimcloud/incident-<id>` from the repo default branch.
-3. Commits checklist stub `docs/heimcloud-ops/incident-<id>.md` (documentation-only shell for human/Repair).
-4. Opens a **draft** pull request with the incident body. Reuses an existing open PR for the same head if present.
-5. Sets incident `status=pr_opened` and stores `draft_pr_url`. **No auto-merge.**
-
-Requires `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` with write on the push target. `madebydamo/neo` is remapped: branches push to fork `heimcloud/neo`, draft PR opens against `madebydamo/neo`.
+Outbound GitHub text is built only from incident #, `report_hash`, unit, severity, class, `neo_version`, and a redacted logs excerpt (`app/lib/redact.js`, plus `OPS_REDACT_EXTRA_SLUGS`).
 
 ## Run locally
 
