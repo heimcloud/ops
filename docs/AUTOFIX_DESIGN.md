@@ -97,17 +97,22 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 | Skills | `skills/heimcloud-ops-triage`, `skills/heimcloud-ops-fix` materialized into `HERMES_HOME/skills` when autofix enable. |
 | Credentials | `neo.services.credentials.ops.autofixForkPushToken` → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check` then wrap git/gh. |
 | Upstream PR | Fine-grained token cannot open `madebydamo/neo` PR. Fallback: push `heimcloud/neo` branch + compare URL `https://github.com/madebydamo/neo/compare/master...heimcloud:neo:<branch>?expand=1` + prepared title/body in admin. If `/run/heimcloud-autofix/pr-token` exists later → `gh pr create --draft --repo madebydamo/neo --head heimcloud:<branch>`. |
-| Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `autofix.redactExtraSlugsFile` EnvironmentFile only. |
+| Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `neo.services.ops.redactExtraSlugsFile` (docker-ops `environmentFiles`) and the same path for the autofix worker (`autofix.redactExtraSlugsFile` defaults to it). |
 | Deny-list | While `labSharesOpsHost` (default true): refuse diffs under `nix/services/{ops,hermes,swag}`, `nix/modules/core`. |
 
 ### Enable (Fleet)
 
 ```toml
+# Persistent AppData EnvironmentFile (0600). Feeds docker-ops always (outbound
+# redaction) and the autofix worker when enabled. Fleet must create the file.
+[services.ops]
+redactExtraSlugsFile = "/var/neo/DATA/AppData/ops/redact-extra.env"  # OPS_REDACT_EXTRA_SLUGS=…
+
 [services.ops.autofix]
 enable = true
 maxAttempts = 2
 labSharesOpsHost = true
-redactExtraSlugsFile = "/run/heimcloud-ops/redact-extra.env"  # contains OPS_REDACT_EXTRA_SLUGS=…
+# redactExtraSlugsFile defaults to services.ops.redactExtraSlugsFile
 
 [services.ops.autofix.triage]
 enable = true
@@ -121,6 +126,7 @@ autofixForkPushToken = "…"  # fine-grained, heimcloud/neo contents:write only
 ```
 
 Also ensure Hermes is enabled on the ops host. Deploy = activate ops + credentials tips on hattori.
+Ensure `/var/neo/DATA/AppData/ops/redact-extra.env` exists (0600, `OPS_REDACT_EXTRA_SLUGS=…`); docker `--env-file` fails if missing.
 
 ## Open decisions (Damo)
 

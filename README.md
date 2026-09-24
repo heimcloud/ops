@@ -119,9 +119,13 @@ Fleet enable (hattori):
 2. Ops settings:
 
 ```toml
+[services.ops]
+# Default; feeds docker-ops environmentFiles (outbound redaction) always.
+redactExtraSlugsFile = "/var/neo/DATA/AppData/ops/redact-extra.env"
+
 [services.ops.autofix]
 enable = true
-redactExtraSlugsFile = "/run/heimcloud-ops/redact-extra.env"
+# redactExtraSlugsFile defaults to services.ops.redactExtraSlugsFile
 
 [services.ops.autofix.triage]
 enable = true
@@ -131,7 +135,7 @@ enable = true
 enable = true
 ```
 
-3. EnvironmentFile contents (0600): `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`.
-4. Activate. Confirm no worker units when `autofix.enable = false`.
+3. EnvironmentFile contents (0600) at that path: `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`. Fleet must create it or docker `--env-file` fails.
+4. Activate. Confirm no worker units when `autofix.enable = false`. Confirm docker-ops has `OPS_REDACT_EXTRA_SLUGS` set (do not print the value).
 5. Admin **Start fix** enqueues a job; worker runs as `hermes`. Open the compare link from the incident page (Damo opens the upstream PR until `GH_PR_TOKEN` exists).
 

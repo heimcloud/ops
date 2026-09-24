@@ -65,6 +65,18 @@
                 description = "Admin UI for incidents. Gated by Tinyauth at the Neo reverse-proxy edge when admin.auth is true; ingest stays shared-secret only.";
                 rank = 10;
               };
+              redactExtraSlugsFile = mkOption {
+                type = types.nullOr types.str;
+                default = "/var/neo/DATA/AppData/ops/redact-extra.env";
+                description = ''
+                  Host path to an EnvironmentFile exporting OPS_REDACT_EXTRA_SLUGS=…
+                  (never inline secrets in nix). Passed to the docker-ops container via
+                  oci-containers environmentFiles regardless of autofix. Default is
+                  persistent AppData; Fleet must create the file (0600) or the
+                  container runtime may fail on a missing --env-file.
+                '';
+                rank = 15;
+              };
               autofix = mkOption {
                 type = types.submodule {
                   options = {
@@ -134,9 +146,9 @@
                       rank = 50;
                     };
                     redactExtraSlugsFile = mkOption {
-                      type = types.nullOr types.path;
-                      default = null;
-                      description = "EnvironmentFile path exporting OPS_REDACT_EXTRA_SLUGS=… (never inline secrets in nix).";
+                      type = types.nullOr types.str;
+                      default = config.neo.services.ops.redactExtraSlugsFile;
+                      description = "EnvironmentFile path exporting OPS_REDACT_EXTRA_SLUGS=… (never inline secrets in nix). Defaults to neo.services.ops.redactExtraSlugsFile so one file serves docker-ops and the autofix worker.";
                       rank = 60;
                     };
                   };

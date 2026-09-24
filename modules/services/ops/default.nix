@@ -59,6 +59,9 @@
                 then "true"
                 else "false";
             };
+          # Host EnvironmentFile → container env (OPS_REDACT_EXTRA_SLUGS). Only when
+          # set; Fleet must create the file (default AppData path) or docker --env-file fails.
+          environmentFiles = lib.optional (cfg.redactExtraSlugsFile != null) cfg.redactExtraSlugsFile;
           image = cfg.containers.ops;
           imageFile = opsImage;
           user = "${toString config.neo.core.uid}:${toString config.neo.core.gid}";
