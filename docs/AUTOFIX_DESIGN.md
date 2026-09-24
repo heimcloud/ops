@@ -34,7 +34,7 @@ flowchart TD
 |------|--------|
 | Local AI only | Triage, summaries, and coding run on **local Hermes** on the ops host (`hermes-agent.service`, `hermes gateway`, provider xai-oauth / `grok-build-latest`). No external/cloud coding agents. |
 | Non-interactive call | As user `hermes`: `hermes --yolo chat -Q --source tool --max-turns 40 -s <skill> --query-file <prompt_file>` (same pattern as supervise). Auth in `$HERMES_HOME/auth.json` (`HERMES_HOME=/var/neo/DATA/AppData/hermes/.hermes`). Port 18789 is configured but not listening — do not depend on it. |
-| GitHub from ops host only | Fine-grained token (heimcloud): push branches on `heimcloud/neo` + `heimcloud/*`, open **draft** PRs. Readable only by user `hermes`. **Never** on lab machines. |
+| GitHub from ops host only | GitHub App `heimcloud-autofix` (owned by heimcloud): installed on `heimcloud/neo` with contents:write (push `fix/*`) and on `madebydamo/neo` with pull_requests:write + contents:read (open/edit draft PRs; no push/merge/admin). 1-hour installation tokens minted per job from a key at `/run/heimcloud-autofix/` (tmpfs, `hermes`, 0400). Wrapper `heimcloud-autofix-env <cmd>` (credentials plugin) sets a scoped `GIT_CONFIG_GLOBAL` (helper only for `https://github.com/heimcloud/`), `GH_TOKEN` (fork) and `GH_PR_TOKEN` (upstream) for the child process only; `--check` non-zero means triage-only. Never on lab machines; nix/flake fetches stay unauthenticated. A fine-grained PAT cannot do the upstream PR (cross-owner `POST /pulls` returns 403), so the interim is: fine-grained fork token pushes, and the runner posts a compare link + prepared body for Damo to open the PR. |
 | Lab pull | Public fork **branch tip** (e.g. `github:heimcloud/neo/fix/…`), never a SHA; **no** GitHub auth on lab boxes. |
 | Redaction | Before any GitHub write: branch name, commit message, diff, PR title/body, evidence. `app/lib/redact.js` + DB `DISTINCT customer_repo_slug` + `OPS_REDACT_EXTRA_SLUGS`. **Fail closed** on hit; `app/test` enforces payload anonymity. |
 | Branch names | `fix/<short-topic>` or `ops/incident-<n>` — no customer info. |
@@ -87,7 +87,7 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 
 ## Open decisions (Damo)
 
-1. **Token issuance** via Credentials (fine-grained heimcloud push/draft-PR scope; hermes-readable only).
+1. **Token issuance** via Credentials: create the `heimcloud-autofix` GitHub App and have Damo install it on `madebydamo/neo`; interim fine-grained fork token (heimcloud/neo contents:write). Then revoke the broad `repo`-scope OAuth token currently in the ops container (Create-PR is retired, so ops needs no write access).
 2. **xAI quota / credential** dedicated to the pipeline (spending limit → 403 on 20 Sep); backoff + `triage_failed` when unavailable.
 3. **Revive thatch** as dedicated lab box (unblocks deny-listed subsystems).
 4. **Plaintext secrets in Hermes unit env** — Fleet flagged; Fleet/Credentials own remediation.
