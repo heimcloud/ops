@@ -1,6 +1,6 @@
 # Auto-fix loop design
 
-**Goal:** the ops host turns incidents into **already-coded, lab-tested draft PRs**. Humans merge; nothing auto-merges.
+**Goal:** the ops host turns incidents into **already-coded, lab-tested fix branches**. The runner pushes the branch to the `heimcloud/neo` fork and posts a compare link in Ops; Damo opens the upstream PR in the GitHub web UI. Humans merge; nothing auto-merges.
 
 Implements [REQ-G10](REQUIREMENTS.md#g-ops--hermes-self-improvement) (local Hermes only) and [REQ-G12](REQUIREMENTS.md#g-ops--hermes-self-improvement) (test before PR). Outbound GitHub text follows [REQ-G11](REQUIREMENTS.md#g-ops--hermes-self-improvement) via `app/lib/redact.js`.
 
@@ -21,7 +21,7 @@ flowchart TD
   I -->|hit| K[Abort push; needs_human]
   J --> L["heimcloud-lab-test branch checks<br/>record generation; activate tip"]
   L --> M{Auto checks}
-  M -->|pass| N[Draft PR + anonymized evidence<br/>Damo reviews / merge]
+  M -->|pass| N[Compare link + anonymized evidence<br/>Damo opens upstream PR / merge]
   M -->|fail| O[Rollback to previous NixOS generation]
   O --> P{Attempts &lt; N=2?}
   P -->|yes| H
@@ -34,11 +34,11 @@ flowchart TD
 |------|--------|
 | Local AI only | Triage, summaries, and coding run on **local Hermes** on the ops host (`hermes-agent.service`, `hermes gateway`, provider xai-oauth / `grok-build-latest`). No external/cloud coding agents. |
 | Non-interactive call | As user `hermes`: `hermes --yolo chat -Q --source tool --max-turns 40 -s <skill> --query-file <prompt_file>` (same pattern as supervise). Auth in `$HERMES_HOME/auth.json` (`HERMES_HOME=/var/neo/DATA/AppData/hermes/.hermes`). Port 18789 is configured but not listening — do not depend on it. |
-| GitHub from ops host only | GitHub App `heimcloud-autofix` (owned by heimcloud): installed on `heimcloud/neo` with contents:write (push `fix/*`) and on `madebydamo/neo` with pull_requests:write + contents:read (open/edit draft PRs; no push/merge/admin). 1-hour installation tokens minted per job from a key at `/run/heimcloud-autofix/` (tmpfs, `hermes`, 0400). Wrapper `heimcloud-autofix-env <cmd>` (credentials plugin) sets a scoped `GIT_CONFIG_GLOBAL` (helper only for `https://github.com/heimcloud/`), `GH_TOKEN` (fork) and `GH_PR_TOKEN` (upstream) for the child process only; `--check` non-zero means triage-only. Never on lab machines; nix/flake fetches stay unauthenticated. A fine-grained PAT cannot do the upstream PR (cross-owner `POST /pulls` returns 403), so the interim is: fine-grained fork token pushes, and the runner posts a compare link + prepared body for Damo to open the PR. |
+| GitHub from ops host only | No GitHub App is used in this phase. Credentials provide a fine-grained fork-push token at `/run/heimcloud-autofix/github-token`; `heimcloud-autofix-env <cmd>` sets the scoped Git helper for the child process, and `--check` non-zero means triage-only. Hermes pushes the fix branch to `heimcloud/neo`; the runner posts the compare link and prepared body in Ops, and Damo opens the upstream PR in the GitHub web UI. Never on lab machines; nix/flake fetches stay unauthenticated. |
 | Lab pull | Public fork **branch tip** (e.g. `github:heimcloud/neo/fix/…`), never a SHA; **no** GitHub auth on lab boxes. |
 | Redaction | Before any GitHub write: branch name, commit message, diff, PR title/body, evidence. `app/lib/redact.js` + DB `DISTINCT customer_repo_slug` + `OPS_REDACT_EXTRA_SLUGS`. **Fail closed** on hit; `app/test` enforces payload anonymity. |
 | Branch names | `fix/<short-topic>` or `ops/incident-<n>` — no customer info. |
-| No auto-merge | Draft PR only; Damo merges. |
+| No auto-merge | The runner does not open or merge a PR; Damo opens the upstream PR from the compare link and merges it. |
 
 ## Ops ↔ Hermes bridge (no container network change)
 
@@ -80,8 +80,8 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 ## Phases
 
 1. **Triage only** — queue + Hermes skill → class/summary events (no code push).
-2. **Fix + lab-test stub (implemented, default OFF)** — see runner contract below. Hermes codes on fork branch; worker pushes via `heimcloud-autofix-env`; compare-link fallback; `heimcloud-lab-test` if on PATH (Fleet owns it).
-3. **Full loop** — automatic lab test, evidence, draft PR via future `GH_PR_TOKEN` / GitHub App.
+2. **Fix + lab-test stub (implemented, default OFF)** — see runner contract below. Hermes codes on a fork branch; worker pushes via `heimcloud-autofix-env`; the runner posts a compare link; `heimcloud-lab-test` if on PATH (Fleet owns it).
+3. **Full loop** — automatic lab test, evidence, fork push, and compare link; Damo opens the upstream PR in the GitHub web UI.
 
 **Ops incident #10** is the first **manually driven** example of the full loop (branch `fix/searxng-engines-limiter` on `heimcloud/neo`).
 
@@ -96,7 +96,7 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 | Units | `heimcloud-ops-worker.path` + oneshot `heimcloud-ops-worker.service` (User=hermes, concurrency 1 via lock). Only when `autofix.enable` and triage/fix enable. |
 | Skills | `skills/heimcloud-ops-triage`, `skills/heimcloud-ops-fix` materialized into `HERMES_HOME/skills` when autofix enable. |
 | Credentials | `neo.services.credentials.ops.autofixForkPushToken` → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check` then wrap git/gh. |
-| Upstream PR | Fine-grained token cannot open `madebydamo/neo` PR. Fallback: push `heimcloud/neo` branch + compare URL `https://github.com/madebydamo/neo/compare/master...heimcloud:neo:<branch>?expand=1` + prepared title/body in admin. If `/run/heimcloud-autofix/pr-token` exists later → `gh pr create --draft --repo madebydamo/neo --head heimcloud:<branch>`. |
+| Upstream PR | The worker pushes the `heimcloud/neo` branch and posts compare URL `https://github.com/madebydamo/neo/compare/master...heimcloud:neo:<branch>?expand=1` plus the prepared title/body in admin. Damo opens the upstream PR in the GitHub web UI. The worker's optional `GH_PR_TOKEN` → `gh pr create --draft` branch remains dormant and unused this phase; no `/run/heimcloud-autofix/pr-token` is provisioned. |
 | Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `neo.services.ops.redactExtraSlugsFile` (docker-ops `environmentFiles`) and the same path for the autofix worker (`autofix.redactExtraSlugsFile` defaults to it). |
 | Deny-list | While `labSharesOpsHost` (default true): refuse diffs under `nix/services/{ops,hermes,swag}`, `nix/modules/core`. |
 
@@ -130,7 +130,7 @@ Ensure `/var/neo/DATA/AppData/ops/redact-extra.env` exists (0600, `OPS_REDACT_EX
 
 ## Open decisions (Damo)
 
-1. **Token issuance** via Credentials: create the `heimcloud-autofix` GitHub App and have Damo install it on `madebydamo/neo`; interim fine-grained fork token (heimcloud/neo contents:write). Then revoke the broad `repo`-scope OAuth token currently in the ops container (Create-PR is retired, so ops needs no write access).
+1. **GitHub App and token scope** — GitHub App setup and automatic upstream PR creation are out of scope/deferred for this phase. The final phase flow uses the Credentials-provided fine-grained `heimcloud/neo` fork-push token; the broad `OPS_GITHUB_TOKEN` in the ops container remains as-is, with revocation an open item rather than a planned step.
 2. **xAI quota / credential** dedicated to the pipeline (spending limit → 403 on 20 Sep); backoff + `triage_failed` when unavailable.
 3. **Revive thatch** as dedicated lab box (unblocks deny-listed subsystems).
-4. **Plaintext secrets in Hermes unit env** — Fleet flagged; Fleet/Credentials own remediation.
+4. **Runtime secrets in the Nix store / Hermes unit env** — low priority for this phase; native processes on the machine and container isolation are trusted. Fleet/Credentials may remediate later.

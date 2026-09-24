@@ -22,7 +22,7 @@ Repo: <https://github.com/heimcloud/ops>
 | `customer_repo_slug`, `severity`, `target_hint`, `target_repo` | TEXT |
 | `status` | `open` \| `triaged` \| `pr_opened` \| `resolved` \| `closed` |
 | `class` | `software` \| `human_config` \| `unknown` |
-| `draft_pr_url`, `draft_pr_number`, `draft_branch` | set when a tested draft PR is opened |
+| `draft_pr_url`, `draft_pr_number`, `draft_branch` | tested branch / PR preparation metadata |
 | `created_at`, `updated_at` | ISO text |
 
 ### `incident_events`
@@ -56,7 +56,7 @@ Bearer also works: `-H "Authorization: Bearer $OPS_INGEST_SECRET"`.
 
 ## Admin Start fix
 
-On an incident detail page, **Start fix** records intent (status → `triaged`) and does **not** open a GitHub PR or commit into the target repo. Coded fix PRs come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → anonymized draft PR). **No auto-merge.**
+On an incident detail page, **Start fix** records intent (status → `triaged`) and does **not** open a GitHub PR or commit into the target repo. Coded fixes come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → compare link); Damo opens the upstream PR in the GitHub web UI. **No auto-merge.**
 
 Outbound GitHub text is built only from incident #, `report_hash`, unit, severity, class, `neo_version`, and a redacted logs excerpt (`app/lib/redact.js`, plus `OPS_REDACT_EXTRA_SLUGS`).
 
@@ -74,7 +74,7 @@ OPS_DB_PATH=./data/ops.sqlite OPS_INGEST_SECRET=devsecret npm start
 Env placeholders (never commit secrets):
 
 - `OPS_INGEST_SECRET` — ingest shared secret
-- `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` — draft PR API (neo writes go to `heimcloud/neo` fork)
+- `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` — container GitHub API credentials, kept as-is; the autofix runner uses the separate Credentials fork-push token
 - `OPS_DB_PATH` — SQLite path (WAL)
 - `OPS_TARGET_ALLOWLIST` — default `madebydamo/neo,heimcloud/*`
 
@@ -106,8 +106,8 @@ Client reporting (not this repo): credentials tip `github:heimcloud/credentials`
 ## Out of scope (phase 1)
 
 - Hermes client plugin (reporting lives in credentials / Neo units)
-- Auto-fix / Repair agent
-- Auto-merge of draft PRs
+- Automatic upstream PR creation / GitHub App
+- Auto-merge
 
 ## Autofix runner (opt-in, default off)
 
@@ -137,5 +137,5 @@ enable = true
 
 3. EnvironmentFile contents (0600) at that path: `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`. Fleet must create it or docker `--env-file` fails.
 4. Activate. Confirm no worker units when `autofix.enable = false`. Confirm docker-ops has `OPS_REDACT_EXTRA_SLUGS` set (do not print the value).
-5. Admin **Start fix** enqueues a job; worker runs as `hermes`. Open the compare link from the incident page (Damo opens the upstream PR until `GH_PR_TOKEN` exists).
+5. Admin **Start fix** enqueues a job; worker runs as `hermes`, pushes the fork branch, and posts a compare link. Damo opens the upstream PR from the incident page in the GitHub web UI.
 
