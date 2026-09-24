@@ -1,6 +1,6 @@
 # Heimcloud Ops (Neo plugin)
 
-Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and **draft** GitHub PR shells. No Hermes client plugin in this repo, no auto-fix agent, no auto-merge. Deploy = Fleet activates `main` tip.
+Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and a **Start fix** intent flow (fix PRs come from tested branches; no incident docs committed to target repos). No Hermes client plugin in this repo, no auto-fix agent, no auto-merge. Deploy = Fleet activates `main` tip.
 
 Repo: <https://github.com/heimcloud/ops>
 

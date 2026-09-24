@@ -83,13 +83,16 @@ IDs are stable (`REQ-…`) for linking test runs.
 |----|-------------|--------|
 | REQ-G1 | Hermes company reports go to Heimcloud ops, **not** public `madebydamo/neo` Issues | Ingest target |
 | REQ-G2 | `https://ops.heimcloud.site` ingest + SQLite WAL incidents | `/health` + POST |
-| REQ-G3 | Manual **Create PR** only first; no auto-merge; Damo reviews | Draft PR + human gate |
+| REQ-G3 | No auto-merge; Damo reviews every draft PR (fix PRs per REQ-G12; manual report-only PRs retired) | Draft PR + human gate |
 | REQ-G4 | Neo contributions: **fork+PR** (`heimcloud/neo` → `madebydamo/neo`) | Create-PR routing |
 | REQ-G5 | Allowlist: `madebydamo/neo`, `heimcloud/*`, explicit plugins | Config |
 | REQ-G6 | Rate-limit / fingerprint; no secrets in PR bodies | Code review |
 | REQ-G7 | Lab machines POST to ops with bearer from `ops/ingest.token` (credentials plugin tip `github:heimcloud/credentials`, not a pinned SHA). Prefer deterministic `neo-heimcloud-ops-report` oneshot; Hermes skill `heimcloud-ops-ingest` optional | Token present + smoke/oneshot POST |
 | REQ-G8 | Nightly update / activate / dependency failures → auto incident | `neo-heimcloud-ops-report` oneshot on failure (+ `superviseUpdates` notify); pipeline-failure-probe drill |
 | REQ-G9 | Lab boxes on neo **`master`** for testing (not long-lived feature branches) | Flake input ref |
+| REQ-G10 | Hermes runs on the ops host (the machine serving `ops.heimcloud.site`) and the incident pipeline uses that local Hermes harness for triage/classification, incident summaries/responses and coding fixes on fork branches. No external or cloud coding agents in the loop | Hermes service active on the ops host (`systemctl is-active` on the Hermes unit) **and** a sample incident gets a local Hermes triage result (class + summary recorded as an `incident_events` row) |
+| REQ-G11 | No customer identifiers on GitHub (public or private): no customer slug, hostnames, domains, IPs, emails, usernames or slug-bearing plugin URLs in PR titles/bodies, commits, branch names or comments. Incidents referenced only by Ops incident # + `report_hash`; no incident docs committed to target repos | Redaction pass on every outbound payload + test that fails if a DB slug appears in the PR payload |
+| REQ-G12 | Fix PRs are coded and tested before they exist: incident, then triage, then fix on a fork branch, then lab test on hattori only (Neo input at branch tip, never a SHA; no GitHub creds on lab machines), then automatic checks, then draft PR with anonymized evidence; human merge only | Draft PR contains diff + lab test evidence; failed tests produce no PR |
 
 ## Deploy policy (Heimcloud org)
 
@@ -150,6 +153,7 @@ IDs are stable (`REQ-…`) for linking test runs.
 Full concept: [CUSTOMER_SSH_AND_AUTH.md](./CUSTOMER_SSH_AND_AUTH.md)
 
 ## Changelog
+- 2026-09-24: REQ-G10..G12 (local Hermes on ops host, anonymized PRs, tested-fix loop).
 
 - 2026-09-17: Initial dump from Damo↔CEO conversation (product → shop → credentials overlays → ops/Hermes → user management).
 - 2026-09-17: Added §J customer SSH enrollment paths S/H + auth plan (magic link first; Authentik later).
