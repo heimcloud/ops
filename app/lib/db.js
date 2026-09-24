@@ -1,6 +1,7 @@
 /**
  * SQLite (better-sqlite3) with WAL + foreign keys.
  * Path: OPS_DB_PATH (default /data/ops.sqlite).
+ * Schema version via PRAGMA user_version (v2 adds fixing/testing/needs_human + fix_attempts).
  */
 import Database from "better-sqlite3";
 import fs from "node:fs";
@@ -8,7 +9,19 @@ import path from "node:path";
 
 const DB_PATH = process.env.OPS_DB_PATH || "/data/ops.sqlite";
 
-const STATUSES = ["open", "triaged", "pr_opened", "resolved", "closed"];
+/** Schema user_version after autofix statuses + fix_attempts. */
+export const SCHEMA_VERSION = 2;
+
+const STATUSES = [
+  "open",
+  "triaged",
+  "fixing",
+  "testing",
+  "needs_human",
+  "pr_opened",
+  "resolved",
+  "closed",
+];
 const CLASSES = ["software", "human_config", "unknown"];
 
 let db;
@@ -25,6 +38,18 @@ export function getClasses() {
   return CLASSES;
 }
 
+/** Reset singleton (tests only). */
+export function _resetDbForTests() {
+  if (db) {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+  }
+  db = undefined;
+}
+
 export function getDb() {
   if (db) return db;
 
@@ -39,7 +64,90 @@ export function getDb() {
 }
 
 function migrate(database) {
-  database.exec(`
+  const version = Number(database.pragma("user_version", { simple: true }) || 0);
+  if (version >= SCHEMA_VERSION) {
+    ensureFixAttempts(database);
+    return;
+  }
+
+  const tx = database.transaction(() => {
+    const hasIncidents = database
+      .prepare(
+        `SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='incidents'`,
+      )
+      .get();
+
+    if (!hasIncidents) {
+      database.exec(createIncidentsSql());
+      database.exec(createEventsSql());
+      database.exec(createIndexesSql());
+    } else {
+      // Rebuild incidents to widen CHECK constraint (SQLite cannot ALTER CHECK).
+      database.exec(`
+        CREATE TABLE incidents_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          report_hash TEXT NOT NULL UNIQUE,
+          neo_version TEXT,
+          plugin_urls TEXT,
+          unit TEXT,
+          logs_excerpt TEXT,
+          customer_repo_slug TEXT,
+          severity TEXT,
+          target_hint TEXT,
+          target_repo TEXT,
+          status TEXT NOT NULL DEFAULT 'open'
+            CHECK (status IN (${STATUSES.map((s) => `'${s}'`).join(", ")})),
+          class TEXT NOT NULL DEFAULT 'unknown'
+            CHECK (class IN ('software', 'human_config', 'unknown')),
+          draft_pr_url TEXT,
+          draft_pr_number INTEGER,
+          draft_branch TEXT,
+          compare_url TEXT,
+          prepared_pr_title TEXT,
+          prepared_pr_body TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+      const cols = database.prepare(`PRAGMA table_info(incidents)`).all();
+      const names = new Set(cols.map((c) => c.name));
+      const copy = [
+        "id",
+        "report_hash",
+        "neo_version",
+        "plugin_urls",
+        "unit",
+        "logs_excerpt",
+        "customer_repo_slug",
+        "severity",
+        "target_hint",
+        "target_repo",
+        "status",
+        "class",
+        "draft_pr_url",
+        "draft_pr_number",
+        "draft_branch",
+        "created_at",
+        "updated_at",
+      ].filter((c) => names.has(c));
+      database.exec(
+        `INSERT INTO incidents_new (${copy.join(", ")})
+         SELECT ${copy.join(", ")} FROM incidents`,
+      );
+      database.exec(`DROP TABLE incidents`);
+      database.exec(`ALTER TABLE incidents_new RENAME TO incidents`);
+      database.exec(createEventsSql());
+      database.exec(createIndexesSql());
+    }
+
+    ensureFixAttempts(database);
+    database.pragma(`user_version = ${SCHEMA_VERSION}`);
+  });
+  tx();
+}
+
+function createIncidentsSql() {
+  return `
     CREATE TABLE IF NOT EXISTS incidents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       report_hash TEXT NOT NULL UNIQUE,
@@ -52,16 +160,23 @@ function migrate(database) {
       target_hint TEXT,
       target_repo TEXT,
       status TEXT NOT NULL DEFAULT 'open'
-        CHECK (status IN ('open', 'triaged', 'pr_opened', 'resolved', 'closed')),
+        CHECK (status IN (${STATUSES.map((s) => `'${s}'`).join(", ")})),
       class TEXT NOT NULL DEFAULT 'unknown'
         CHECK (class IN ('software', 'human_config', 'unknown')),
       draft_pr_url TEXT,
       draft_pr_number INTEGER,
       draft_branch TEXT,
+      compare_url TEXT,
+      prepared_pr_title TEXT,
+      prepared_pr_body TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+  `;
+}
 
+function createEventsSql() {
+  return `
     CREATE TABLE IF NOT EXISTS incident_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
@@ -70,10 +185,32 @@ function migrate(database) {
       meta_json TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+  `;
+}
 
+function createIndexesSql() {
+  return `
     CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status);
     CREATE INDEX IF NOT EXISTS idx_incidents_created ON incidents(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_incident_events_incident ON incident_events(incident_id);
+  `;
+}
+
+function ensureFixAttempts(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS fix_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+      attempt INTEGER NOT NULL,
+      branch TEXT,
+      result TEXT,
+      evidence_path TEXT,
+      compare_url TEXT,
+      meta_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (incident_id, attempt)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fix_attempts_incident ON fix_attempts(incident_id);
   `);
 }
 
@@ -211,6 +348,13 @@ export function updateIncident(id, patch) {
   if (patch.draft_pr_url !== undefined) next.draft_pr_url = patch.draft_pr_url;
   if (patch.draft_pr_number !== undefined) next.draft_pr_number = patch.draft_pr_number;
   if (patch.draft_branch !== undefined) next.draft_branch = patch.draft_branch;
+  if (patch.compare_url !== undefined) next.compare_url = patch.compare_url;
+  if (patch.prepared_pr_title !== undefined) {
+    next.prepared_pr_title = patch.prepared_pr_title;
+  }
+  if (patch.prepared_pr_body !== undefined) {
+    next.prepared_pr_body = patch.prepared_pr_body;
+  }
 
   const now = new Date().toISOString();
   database
@@ -218,6 +362,7 @@ export function updateIncident(id, patch) {
       `UPDATE incidents SET
          status = ?, class = ?, target_repo = ?,
          draft_pr_url = ?, draft_pr_number = ?, draft_branch = ?,
+         compare_url = ?, prepared_pr_title = ?, prepared_pr_body = ?,
          updated_at = ?
        WHERE id = ?`,
     )
@@ -228,6 +373,9 @@ export function updateIncident(id, patch) {
       next.draft_pr_url,
       next.draft_pr_number,
       next.draft_branch,
+      next.compare_url ?? null,
+      next.prepared_pr_title ?? null,
+      next.prepared_pr_body ?? null,
       now,
       id,
     );
@@ -237,9 +385,7 @@ export function updateIncident(id, patch) {
 
 export function countByStatus() {
   const rows = getDb()
-    .prepare(
-      `SELECT status, COUNT(*) AS n FROM incidents GROUP BY status`,
-    )
+    .prepare(`SELECT status, COUNT(*) AS n FROM incidents GROUP BY status`)
     .all();
   const out = Object.fromEntries(STATUSES.map((s) => [s, 0]));
   for (const r of rows) out[r.status] = r.n;
@@ -256,3 +402,38 @@ export function listDistinctCustomerRepoSlugs() {
   return rows.map((r) => String(r.slug));
 }
 
+export function addFixAttempt(incidentId, { attempt, branch, result, evidence_path, compare_url, meta } = {}) {
+  const database = getDb();
+  const info = database
+    .prepare(
+      `INSERT INTO fix_attempts (incident_id, attempt, branch, result, evidence_path, compare_url, meta_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      incidentId,
+      attempt,
+      branch || null,
+      result || null,
+      evidence_path || null,
+      compare_url || null,
+      meta == null ? null : JSON.stringify(meta),
+    );
+  return database.prepare(`SELECT * FROM fix_attempts WHERE id = ?`).get(info.lastInsertRowid);
+}
+
+export function listFixAttempts(incidentId) {
+  return getDb()
+    .prepare(
+      `SELECT * FROM fix_attempts WHERE incident_id = ? ORDER BY attempt ASC`,
+    )
+    .all(incidentId);
+}
+
+export function nextFixAttemptNumber(incidentId) {
+  const row = getDb()
+    .prepare(
+      `SELECT COALESCE(MAX(attempt), 0) AS n FROM fix_attempts WHERE incident_id = ?`,
+    )
+    .get(incidentId);
+  return Number(row?.n || 0) + 1;
+}

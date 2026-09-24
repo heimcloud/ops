@@ -138,3 +138,48 @@ export function getExtraRedactSlugs() {
     .filter(Boolean);
 }
 
+/**
+ * Return list of hit descriptions if text still contains identifiers after redaction
+ * would leave them (or raw known slugs / slug-shape tokens).
+ * Used for fail-closed push gates.
+ * @param {string} text
+ * @param {{ knownSlugs?: string[] }} [opts]
+ * @returns {string[]}
+ */
+export function findIdentifierHits(text, opts = {}) {
+  const raw = text == null ? "" : String(text);
+  const hits = [];
+  const known = Array.isArray(opts.knownSlugs) ? opts.knownSlugs : [];
+  for (const slug of known) {
+    const s = String(slug || "").trim();
+    if (s && raw.includes(s)) hits.push(`known_slug:${s.slice(0, 2)}…`);
+  }
+  // Slug shape (uppercase 10) still present
+  const shape = raw.match(/\b[A-Z0-9]{10}\b/g) || [];
+  for (const m of shape) {
+    // allow synthetic test tokens that start with ZZ/YY used only in unit tests? No — fail closed on any.
+    hits.push(`slug_shape:${m.slice(0, 2)}…`);
+  }
+  if (/\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(raw)) hits.push("ipv4");
+  if (/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.test(raw)) hits.push("email");
+  if (/\/home\/[A-Za-z0-9._-]+/.test(raw)) hits.push("home_path");
+  for (const host of ["hattori", "thatch", "agwanti"]) {
+    if (new RegExp(`\\b${host}\\b`, "i").test(raw)) hits.push(`lab_host:${host}`);
+  }
+  return hits;
+}
+
+/**
+ * @param {string} text
+ * @param {{ knownSlugs?: string[] }} [opts]
+ */
+export function assertNoIdentifyingDetails(text, opts = {}) {
+  const hits = findIdentifierHits(text, opts);
+  if (hits.length) {
+    const err = new Error(`redaction_fail_closed:${hits.join(",")}`);
+    err.hits = hits;
+    err.status = 422;
+    throw err;
+  }
+  return true;
+}
