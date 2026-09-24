@@ -153,6 +153,7 @@ IDs are stable (`REQ-…`) for linking test runs.
 Full concept: [CUSTOMER_SSH_AND_AUTH.md](./CUSTOMER_SSH_AND_AUTH.md)
 
 ## Changelog
+- 2026-09-24: autofix runner opt-in (queue/worker/skills; default off; compare-link fallback).
 - 2026-09-24: AUTOFIX_DESIGN.md (local Hermes → lab-tested draft PRs; links from REQ-G10/G12).
 - 2026-09-24: REQ-G10..G12 (local Hermes on ops host, anonymized PRs, tested-fix loop).
 

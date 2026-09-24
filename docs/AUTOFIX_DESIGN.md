@@ -80,10 +80,47 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 ## Phases
 
 1. **Triage only** — queue + Hermes skill → class/summary events (no code push).
-2. **Fix + manual lab test** — Hermes codes on fork branch; human/Fleet runs `heimcloud-lab-test`.
-3. **Full loop** — automatic lab test, evidence, draft PR.
+2. **Fix + lab-test stub (implemented, default OFF)** — see runner contract below. Hermes codes on fork branch; worker pushes via `heimcloud-autofix-env`; compare-link fallback; `heimcloud-lab-test` if on PATH (Fleet owns it).
+3. **Full loop** — automatic lab test, evidence, draft PR via future `GH_PR_TOKEN` / GitHub App.
 
 **Ops incident #10** is the first **manually driven** example of the full loop (branch `fix/searxng-engines-limiter` on `heimcloud/neo`).
+
+## Runner contract (ops plugin, opt-in)
+
+**Default OFF.** `neo.services.ops.autofix.enable = false` installs nothing that calls Hermes.
+
+| Piece | Detail |
+|-------|--------|
+| Queue | Container writes `/data/queue/{triage,fix}/<id>-<ts>.json` (host: `$appdata/ops/…`). Payload: incident id, report_hash, unit, severity, class, neo_version, redacted logs only. |
+| Results | Worker writes `$appdata/ops/results/*.json`; admin/ingest applies `triage_result` / `fix_result` + `fix_attempts`. |
+| Units | `heimcloud-ops-worker.path` + oneshot `heimcloud-ops-worker.service` (User=hermes, concurrency 1 via lock). Only when `autofix.enable` and triage/fix enable. |
+| Skills | `skills/heimcloud-ops-triage`, `skills/heimcloud-ops-fix` materialized into `HERMES_HOME/skills` when autofix enable. |
+| Credentials | `neo.services.credentials.ops.autofixForkPushToken` → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check` then wrap git/gh. |
+| Upstream PR | Fine-grained token cannot open `madebydamo/neo` PR. Fallback: push `heimcloud/neo` branch + compare URL `https://github.com/madebydamo/neo/compare/master...heimcloud:neo:<branch>?expand=1` + prepared title/body in admin. If `/run/heimcloud-autofix/pr-token` exists later → `gh pr create --draft --repo madebydamo/neo --head heimcloud:<branch>`. |
+| Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `autofix.redactExtraSlugsFile` EnvironmentFile only. |
+| Deny-list | While `labSharesOpsHost` (default true): refuse diffs under `nix/services/{ops,hermes,swag}`, `nix/modules/core`. |
+
+### Enable (Fleet)
+
+```toml
+[services.ops.autofix]
+enable = true
+maxAttempts = 2
+labSharesOpsHost = true
+redactExtraSlugsFile = "/run/heimcloud-ops/redact-extra.env"  # contains OPS_REDACT_EXTRA_SLUGS=…
+
+[services.ops.autofix.triage]
+enable = true
+autoEnqueue = false   # set true only when ready for OPS_AUTOTRIAGE=1
+
+[services.ops.autofix.fix]
+enable = true
+
+[services.credentials.ops]
+autofixForkPushToken = "…"  # fine-grained, heimcloud/neo contents:write only
+```
+
+Also ensure Hermes is enabled on the ops host. Deploy = activate ops + credentials tips on hattori.
 
 ## Open decisions (Damo)
 

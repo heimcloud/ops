@@ -108,3 +108,30 @@ Client reporting (not this repo): credentials tip `github:heimcloud/credentials`
 - Hermes client plugin (reporting lives in credentials / Neo units)
 - Auto-fix / Repair agent
 - Auto-merge of draft PRs
+
+## Autofix runner (opt-in, default off)
+
+Host-side loop: queue → local Hermes → fork branch → compare link. Design: [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md).
+
+Fleet enable (hattori):
+
+1. Credentials: set `[services.credentials.ops] autofixForkPushToken` (fine-grained, `heimcloud/neo` contents:write). Materializes `/run/heimcloud-autofix/github-token`.
+2. Ops settings:
+
+```toml
+[services.ops.autofix]
+enable = true
+redactExtraSlugsFile = "/run/heimcloud-ops/redact-extra.env"
+
+[services.ops.autofix.triage]
+enable = true
+# autoEnqueue = true   # optional OPS_AUTOTRIAGE
+
+[services.ops.autofix.fix]
+enable = true
+```
+
+3. EnvironmentFile contents (0600): `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`.
+4. Activate. Confirm no worker units when `autofix.enable = false`.
+5. Admin **Start fix** enqueues a job; worker runs as `hermes`. Open the compare link from the incident page (Damo opens the upstream PR until `GH_PR_TOKEN` exists).
+
