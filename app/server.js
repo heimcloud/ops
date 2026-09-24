@@ -2,7 +2,9 @@
  * Heimcloud Ops — incident ingest API + Tinyauth-gated admin UI.
  */
 import express from "express";
-import { getDb, getDbPath, upsertIncident } from "./lib/db.js";
+import { getDb, getDbPath, upsertIncident, addIncidentEvent } from "./lib/db.js";
+import { enqueueJob } from "./lib/queue.js";
+import { ingestResultsDir } from "./lib/results.js";
 import { createAdminRouter, getAdminConfig } from "./lib/admin.js";
 import { getGithubTokenConfigured, getAllowlist } from "./lib/github.js";
 
@@ -53,7 +55,7 @@ app.get("/", (_req, res) => {
 <main>
   <section class="hero">
     <h1>Heimcloud Ops</h1>
-    <p class="lead">Incident ingest + admin. Phase 1 — no Hermes client, no auto-fix, no auto-merge.</p>
+    <p class="lead">Incident ingest + admin. Incident desk. Auto-fix is opt-in on the host (see docs/AUTOFIX_DESIGN.md). No auto-merge.</p>
     <p><a class="btn" href="/admin">Open admin</a></p>
     <div class="card">
       <p class="muted">Ingest: <code>POST /api/incidents</code> with <code>Authorization: Bearer …</code> or <code>X-Ops-Secret</code>.</p>
@@ -67,6 +69,15 @@ app.post("/api/incidents", requireIngestSecret, (req, res) => {
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
     const { incident, created } = upsertIncident(body);
+    if (created && ["1", "true", "yes", "on"].includes(String(process.env.OPS_AUTOTRIAGE || "").toLowerCase())) {
+      try {
+        const { path: jobPath } = enqueueJob("triage", incident);
+        addIncidentEvent(incident.id, "triage_enqueued", "Auto-triage job enqueued", { job_path: jobPath });
+      } catch (err) {
+        console.error("[ingest] autotriage enqueue failed", err);
+      }
+    }
+    try { ingestResultsDir(); } catch { /* ignore */ }
     return res.status(created ? 201 : 200).json({
       ok: true,
       created,

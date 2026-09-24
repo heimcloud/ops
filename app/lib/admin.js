@@ -14,7 +14,10 @@ import {
   countByStatus,
   getClasses,
   getStatuses,
+  listFixAttempts,
 } from "./db.js";
+import { enqueueJob } from "./queue.js";
+import { ingestResultsDir } from "./results.js";
 import {
   getGithubTokenConfigured,
   getAllowlist,
@@ -80,6 +83,11 @@ export function createAdminRouter() {
   });
 
   router.get("/", (req, res) => {
+    try {
+      ingestResultsDir();
+    } catch (err) {
+      console.error("[admin] ingestResultsDir", err);
+    }
     const statusFilter = String(req.query.status || "").trim() || null;
     const incidents = listIncidents({
       status: statusFilter && getStatuses().includes(statusFilter) ? statusFilter : null,
@@ -145,6 +153,11 @@ export function createAdminRouter() {
   });
 
   router.get("/incidents/:id", (req, res) => {
+    try {
+      ingestResultsDir();
+    } catch (err) {
+      console.error("[admin] ingestResultsDir", err);
+    }
     const id = Number(req.params.id);
     const incident = getIncident(id);
     if (!incident) return res.status(404).send("Not found");
@@ -189,9 +202,9 @@ export function createAdminRouter() {
           <input name="target_repo" value="${escapeHtml(incident.target_repo || incident.target_hint || resolved)}" placeholder="owner/repo" />
           <p style="margin-top:1rem"><button class="btn" type="submit">Save</button></p>
         </form>
-        <form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Record fix intent for incident #${id}? No GitHub PR will be opened.');">
-          <p><strong>Start fix</strong> records intent only (status → triaged). It does <em>not</em> open a GitHub PR or commit into the target repo.
-             Fix PRs come from a <strong>tested branch</strong> on the allowlisted target (resolved: <code>${escapeHtml(resolved)}</code>).</p>
+        <form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Enqueue fix job for incident #${id}? Host worker must be enabled (autofix.fix.enable).');">
+          <p><strong>Start fix</strong> enqueues a host-side fix job (status → fixing). The worker (opt-in) runs local Hermes, pushes a fork branch, and prepares a compare link.
+             Resolved target: <code>${escapeHtml(resolved)}</code>. No auto-merge.</p>
           <button class="btn" type="submit">Start fix</button>
           ${
             incident.draft_pr_url
@@ -232,6 +245,32 @@ export function createAdminRouter() {
           <h2>Logs excerpt</h2>
           <pre style="white-space:pre-wrap;font-size:0.85rem">${escapeHtml(incident.logs_excerpt || "—")}</pre>
         </div>
+        ${
+          incident.compare_url || incident.prepared_pr_title || incident.draft_branch
+            ? `<div class="card">
+          <h2>Prepared fix (compare-link fallback)</h2>
+          <p><strong>branch:</strong> <code>${escapeHtml(incident.draft_branch || "—")}</code></p>
+          <p><strong>compare:</strong> ${
+            incident.compare_url
+              ? `<a href="${escapeHtml(incident.compare_url)}" target="_blank" rel="noopener">${escapeHtml(incident.compare_url)}</a>`
+              : "—"
+          }</p>
+          <p><strong>title:</strong> ${escapeHtml(incident.prepared_pr_title || "—")}</p>
+          <pre style="white-space:pre-wrap;font-size:0.85rem">${escapeHtml(incident.prepared_pr_body || "")}</pre>
+        </div>`
+            : ""
+        }
+        ${(() => {
+          const attempts = listFixAttempts(id);
+          if (!attempts.length) return "";
+          const rows = attempts.map((a) => `<tr>
+            <td>${a.attempt}</td>
+            <td><code>${escapeHtml(a.branch || "—")}</code></td>
+            <td>${escapeHtml(a.result || "—")}</td>
+            <td class="muted">${escapeHtml(a.created_at || "")}</td>
+          </tr>`).join("");
+          return `<h2>Fix attempts</h2>${table(["#", "Branch", "Result", "Created"], rows)}`;
+        })()}
         ${mutate}
         <h2>Events</h2>
         ${table(["ID", "Kind", "Message", "Created"], eventRows)}
@@ -278,18 +317,19 @@ export function createAdminRouter() {
     if (!incident) return res.status(404).send("Not found");
     try {
       const resolved = resolveTargetRepo(incident);
+      const { path: jobPath, job } = enqueueJob("fix", incident);
       const updated = updateIncident(id, {
-        status: incident.status === "open" ? "triaged" : incident.status,
+        status: "fixing",
         target_repo: incident.target_repo || resolved,
       });
-      addIncidentEvent(id, "fix_intent", "Start fix recorded (no GitHub PR)", {
+      addIncidentEvent(id, "fix_enqueued", "Fix job enqueued for host worker", {
         target_repo: updated.target_repo,
-        previous_status: incident.status,
-        status: updated.status,
+        job_path: jobPath,
+        job_kind: job.kind,
       });
       return res.redirect(
         303,
-        `${base}/incidents/${id}?msg=${encodeURIComponent("Fix intent recorded")}`,
+        `${base}/incidents/${id}?msg=${encodeURIComponent("Fix job enqueued")}`,
       );
     } catch (err) {
       console.error("[admin] start-fix", err);
