@@ -65,6 +65,86 @@
                 description = "Admin UI for incidents. Gated by Tinyauth at the Neo reverse-proxy edge when admin.auth is true; ingest stays shared-secret only.";
                 rank = 10;
               };
+              autofix = mkOption {
+                type = types.submodule {
+                  options = {
+                    enable = mkOption {
+                      type = types.bool;
+                      default = false;
+                      description = "Master switch for host-side autofix runner (default OFF). When false, no path/worker units are installed.";
+                      rank = 0;
+                    };
+                    triage = mkOption {
+                      type = types.submodule {
+                        options = {
+                          enable = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = "Process triage jobs from queue/triage via local Hermes.";
+                            rank = 0;
+                          };
+                          autoEnqueue = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = "When true, ops container sets OPS_AUTOTRIAGE=1 to enqueue triage on new incidents.";
+                            rank = 10;
+                          };
+                        };
+                      };
+                      default = {};
+                      description = "Triage worker controls.";
+                      rank = 10;
+                    };
+                    fix = mkOption {
+                      type = types.submodule {
+                        options = {
+                          enable = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = "Process fix jobs (Hermes + heimcloud-autofix-env push).";
+                            rank = 0;
+                          };
+                        };
+                      };
+                      default = {};
+                      description = "Fix worker controls.";
+                      rank = 20;
+                    };
+                    maxAttempts = mkOption {
+                      type = types.ints.positive;
+                      default = 2;
+                      description = "Max Hermes fix retries after failed lab test.";
+                      rank = 30;
+                    };
+                    labSharesOpsHost = mkOption {
+                      type = types.bool;
+                      default = true;
+                      description = "When true (hattori today), deny-list patches that touch ops/hermes/swag/core.";
+                      rank = 40;
+                    };
+                    denyPaths = mkOption {
+                      type = types.listOf types.str;
+                      default = [
+                        "nix/services/ops"
+                        "nix/services/hermes"
+                        "nix/services/swag"
+                        "nix/modules/core"
+                      ];
+                      description = "Path prefixes refused in fix diffs while labSharesOpsHost.";
+                      rank = 50;
+                    };
+                    redactExtraSlugsFile = mkOption {
+                      type = types.nullOr types.path;
+                      default = null;
+                      description = "EnvironmentFile path exporting OPS_REDACT_EXTRA_SLUGS=… (never inline secrets in nix).";
+                      rank = 60;
+                    };
+                  };
+                };
+                default = {};
+                description = "Opt-in autofix loop (local Hermes + fork push). Default entirely off.";
+                rank = 20;
+              };
             }
             // lib.neo.mkReverseProxyOptions {
               subdomain = "ops";
@@ -83,7 +163,7 @@
               category = "Ops/Incidents";
               description = ''
                 Heimcloud Ops phase 1 — secret-gated incident ingest, SQLite WAL,
-                Tinyauth-gated admin with draft PR shell (no auto-merge).
+                Tinyauth-gated admin; opt-in autofix runner (default off); no auto-merge.
                 Deploy later on hattori / ops.heimcloud.site via Fleet.
               '';
               projectUrl = "https://github.com/heimcloud/ops";

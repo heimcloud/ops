@@ -23,9 +23,18 @@
         SITE_URL = cfg.siteUrl;
         OPS_TARGET_ALLOWLIST = cfg.targetAllowlist;
       };
+      autoTriage =
+        (cfg.autofix.enable or false)
+        && (cfg.autofix.triage.autoEnqueue or false);
     in {
       config = mkIf cfg.enabled {
-        systemd.services.docker-ops.preStart = lib.neo.mkEnsureDirs config [opsAppdata];
+        systemd.services.docker-ops.preStart =
+          (lib.neo.mkEnsureDirs config [opsAppdata])
+          + ''
+            mkdir -p ${opsAppdata}/queue/triage ${opsAppdata}/queue/fix ${opsAppdata}/results
+            # Container uid must write jobs; hermes group reads when autofix enabled.
+            chmod 0770 ${opsAppdata}/queue ${opsAppdata}/queue/triage ${opsAppdata}/queue/fix ${opsAppdata}/results || true
+          '';
 
         virtualisation.oci-containers.containers.ops = {
           environment =
@@ -35,6 +44,11 @@
               PORT = "3000";
               NODE_ENV = "production";
               OPS_DB_PATH = "/data/ops.sqlite";
+              OPS_DATA_DIR = "/data";
+              OPS_AUTOTRIAGE =
+                if autoTriage
+                then "true"
+                else "false";
               ADMIN_ENABLED =
                 if cfg.admin.enabled
                 then "true"
