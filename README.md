@@ -1,6 +1,6 @@
 # Heimcloud Ops (Neo plugin)
 
-Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and **draft** GitHub PR shells. No Hermes client plugin, no auto-fix agent, no Fleet deploy gate, no auto-merge.
+Phase 1 incident desk for Heimcloud: secret-gated ingest, SQLite WAL, Tinyauth-gated admin, and **draft** GitHub PR shells. No Hermes client plugin in this repo, no auto-fix agent, no auto-merge. Deploy = Fleet activates `main` tip.
 
 Repo: <https://github.com/heimcloud/ops>
 
@@ -103,13 +103,14 @@ neo.services.ops = {
 
 Build OCI image: `nix build .#heimcloud-ops` / `.#default`; NixOS `imageFile` = `self.packages.<system>.heimcloud-ops` (or `.#default`).
 
-### Deploy later
+### Deploy
 
-Production target: **hattori** / **ops.heimcloud.site** via **Fleet**. Out of scope for phase 1 — document only; do not gate Fleet here.
+Production: **hattori** / **ops.heimcloud.site** via **Fleet**. Heimcloud org policy: **`main` tip is production** — no separate staging / ready-for-prod gate. Fleet activates tip; Ops does not own an extra promote step.
+
+Client reporting (not this repo): credentials tip `github:heimcloud/credentials` ships `neo-heimcloud-ops-report` oneshot + `ops/ingest.token`.
 
 ## Out of scope (phase 1)
 
-- Hermes client plugin
+- Hermes client plugin (reporting lives in credentials / Neo units)
 - Auto-fix / Repair agent
-- Fleet deploy gate
 - Auto-merge of draft PRs

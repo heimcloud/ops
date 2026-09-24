@@ -66,7 +66,7 @@ IDs are stable (`REQ-…`) for linking test runs.
 | REQ-E5 | Import C: secrets→appdata `0600`; non-secrets→settings.toml hints | Importer behavior |
 | REQ-E6 | Provisioner: Shop job → create/fill private repo (stubs/overlays) | Job → repo URL |
 | REQ-E7 | No clash with core Hermes (`hermes_entitlement` removed/gated) | Plugin evaluates with Hermes |
-| REQ-E8 | Lab: hattori → `KAKJWG9RM5`; thatch → `W4ZGSG7SYJ`; agwanti hands-off | Mapping + Fleet policy |
+| REQ-E8 | Lab: hattori → `<lab-slug-a>`; thatch → `<lab-slug-b>`; agwanti hands-off | Mapping + Fleet policy |
 
 ## F. Central user management
 
@@ -87,16 +87,22 @@ IDs are stable (`REQ-…`) for linking test runs.
 | REQ-G4 | Neo contributions: **fork+PR** (`heimcloud/neo` → `madebydamo/neo`) | Create-PR routing |
 | REQ-G5 | Allowlist: `madebydamo/neo`, `heimcloud/*`, explicit plugins | Config |
 | REQ-G6 | Rate-limit / fingerprint; no secrets in PR bodies | Code review |
-| REQ-G7 | Hermes skill `heimcloud-ops-ingest` on lab machines; bearer from `ops/ingest.token` | Skill published + smoke POST |
-| REQ-G8 | Nightly update / activate / dependency failures → auto incident | `superviseUpdates` + failure drill |
+| REQ-G7 | Lab machines POST to ops with bearer from `ops/ingest.token` (credentials plugin tip `github:heimcloud/credentials`, not a pinned SHA). Prefer deterministic `neo-heimcloud-ops-report` oneshot; Hermes skill `heimcloud-ops-ingest` optional | Token present + smoke/oneshot POST |
+| REQ-G8 | Nightly update / activate / dependency failures → auto incident | `neo-heimcloud-ops-report` oneshot on failure (+ `superviseUpdates` notify); pipeline-failure-probe drill |
 | REQ-G9 | Lab boxes on neo **`master`** for testing (not long-lived feature branches) | Flake input ref |
+
+## Deploy policy (Heimcloud org)
+
+- **`main` tip is production.** No separate staging gate / ready-for-prod step.
+- Ops (and other heimcloud plugins) deploy when **Fleet activates** the flake tip on the target box.
+- Prefer flake refs like `github:heimcloud/credentials` / `github:heimcloud/ops` (branch tip), not `...@deadbeef` pins in smoke docs.
 
 ## H. Infra / fleet
 
 | ID | Requirement | Verify |
 |----|-------------|--------|
 | REQ-H1 | `heimcloud.site` DNS → streamproxy VPS (already configured) | DNS lookup |
-| REQ-H2 | Lab: hattori, thatch for staging; agwanti hands-off unless asked | Fleet policy |
+| REQ-H2 | Lab/test boxes: hattori, thatch; agwanti hands-off unless asked. Heimcloud `main` tip is production (no separate staging gate) | Fleet policy |
 | REQ-H3 | Future: xAI token resale only; rsync.net reseller; AirVPN reseller TBD; Hostkey for public-IP VPSes | Backlog — not blocking |
 
 ## I. Agent team
@@ -120,8 +126,8 @@ IDs are stable (`REQ-…`) for linking test runs.
 1. `curl -sS https://shop.heimcloud.site/` → 200  
 2. `curl -sS https://ops.heimcloud.site/health` → ingest+github configured  
 3. Stripe Test checkout kit → paid + SQLite customer/order  
-4. Gitea `customers/KAKJWG9RM5` & `W4ZGSG7SYJ` private + deploy keys  
-5. Hermes on hattori/thatch: force `heimcloud-ops-ingest` → new ops incident  
+4. Gitea `customers/<lab-slug-a>` & `<lab-slug-b>` private + deploy keys  
+5. Lab hattori/thatch: `neo-heimcloud-ops-report` / pipeline-failure-probe → new ops incident (credentials flake = `github:heimcloud/credentials` tip)  
 6. Neo flake input on lab = `master`
 
 ---
