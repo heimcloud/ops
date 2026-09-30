@@ -44,6 +44,7 @@
         "queue"
         "queue/triage"
         "queue/fix"
+        "queue/push"
         "queue/processing"
         "queue/done"
         "queue/failed"
@@ -72,12 +73,19 @@
           "HOME=${hermesState}"
           "HERMES_HOME=${hermesHome}"
           "HERMES_MANAGED=true"
+          # Rust builds for neo cli changes: shared target dir outside the clone
+          # (never committed), openssl-sys via pkg-config/explicit dirs.
+          "CARGO_TARGET_DIR=${hermesState}/.cache/heimcloud-ops-cargo-target"
+          "PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig"
+          "OPENSSL_LIB_DIR=${getLib pkgs.openssl}/lib"
+          "OPENSSL_INCLUDE_DIR=${pkgs.openssl.dev}/include"
         ]
         ++ optional triageOn "OPS_AUTOFIX_TRIAGE=1"
         ++ optional fixOn "OPS_AUTOFIX_FIX=1";
 
       workerPath =
         [workerPkg pkgs.nodejs_22 pkgs.git pkgs.gh pkgs.openssh pkgs.sqlite pkgs.bash pkgs.coreutils pkgs.util-linux]
+        ++ af.extraPackages
         ++ hermesUnitPath
         ++ ["/run/current-system/sw" "/etc/profiles/per-user/hermes"];
 
@@ -99,6 +107,9 @@
         # Shared group: the container runs as core uid:gid; hermes joins that gid.
         # hermes already has passwordless sudo on Neo, so this grants nothing new.
         users.users.hermes.extraGroups = [coreGroup];
+        # Hermes's terminal tool rebuilds PATH from the NixOS profiles, so the
+        # toolchain must be in the hermes user profile too (not only the unit PATH).
+        users.users.hermes.packages = af.extraPackages;
 
         environment.systemPackages = [workerPkg];
 
@@ -129,7 +140,7 @@
           pathConfig = {
             PathExistsGlob =
               optional triageOn "${queueRoot}/triage/*.json"
-              ++ optional fixOn "${queueRoot}/fix/*.json";
+              ++ optionals fixOn ["${queueRoot}/fix/*.json" "${queueRoot}/push/*.json"];
             Unit = "heimcloud-ops-worker.service";
           };
         };
@@ -165,9 +176,11 @@
           };
         };
 
-        # Push a fix that ended ready_no_token once the token exists, without a
-        # second Hermes run: systemctl start heimcloud-ops-worker-push@<job>.service
-        # (<job> = the job scratch dir name printed in the incident event).
+        # Push a saved fix (ready_no_token / push_failed, or a legacy scratch clone
+        # without push-pending.json) without a second Hermes run:
+        #   systemctl start heimcloud-ops-worker-push@<job>.service
+        # <job> = scratch dir name under ${hermesState}/workspace/autofix (fix-<id>-<ts>),
+        # also shown as "job" in the incident event. Admin "Retry push" = queue/push.
         systemd.services."heimcloud-ops-worker-push@" = mkIf fixOn {
           description = "Heimcloud Ops autofix: push saved fix %i";
           wants = optional hasMaterialize "heimcloud-autofix-materialize-token.service";

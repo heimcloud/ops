@@ -27,7 +27,10 @@ export function resultsDir() {
 
 const TRUE = ["1", "true", "yes", "on"];
 
-/** Host worker for this job kind is installed (autofix.<kind>.enable via Nix env). */
+/**
+ * Host worker for this job kind is installed (autofix.<kind>.enable via Nix env).
+ * "push" (retry pushing a saved fix) is handled by the fix worker.
+ */
 export function isAutofixKindEnabled(kind) {
   const key = kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX";
   return TRUE.includes(String(process.env[key] || "").toLowerCase());
@@ -158,6 +161,48 @@ export function enqueueJob(kind, incident) {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const name = `${incident.id}-${ts}.json`;
   const dest = path.join(dir, name);
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o660 });
+  fs.renameSync(tmp, dest);
+  return { path: dest, job };
+}
+
+/** Scratch job name of a saved fix: fix-<incident id>-<suffix>. */
+export const PUSH_JOB_RE = /^fix-(\d+)-[A-Za-z0-9-]+$/;
+
+/**
+ * Retry pushing a saved fix (push-pending state in the worker scratch dir)
+ * without a new Hermes run. Payload carries only the incident id + job name.
+ */
+export function enqueuePushJob(incident, jobName) {
+  const m = PUSH_JOB_RE.exec(String(jobName || ""));
+  if (!m || Number(m[1]) !== Number(incident.id)) {
+    throw new QueueError("invalid_push_job", `No saved fix job found for incident #${incident.id}.`);
+  }
+  if (!isAutofixKindEnabled("push")) {
+    throw new QueueError(
+      "autofix_disabled",
+      "Autofix fix is not enabled on this host (neo.services.ops.autofix.enable + autofix.fix.enable); no worker would push the saved fix.",
+    );
+  }
+  const pending = findPendingJobs("push", incident.id);
+  if (pending.length) {
+    throw new QueueError(
+      "already_queued",
+      `A push job for incident #${incident.id} is already queued or running (${path.basename(pending[0])}).`,
+    );
+  }
+  const job = {
+    job_version: 1,
+    kind: "push",
+    incident_id: incident.id,
+    job: jobName,
+    enqueued_at: new Date().toISOString(),
+  };
+  const dir = queueDir("push");
+  ensureDir(dir);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.join(dir, `${incident.id}-${ts}.json`);
   const tmp = `${dest}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o660 });
   fs.renameSync(tmp, dest);

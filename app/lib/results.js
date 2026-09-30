@@ -170,16 +170,19 @@ export function applyResult(result) {
     return;
   }
 
-  // fix result
-  const attempt = nextFixAttemptNumber(id);
-  addFixAttempt(id, {
-    attempt,
-    branch: result.branch,
-    result: result.status || "unknown",
-    evidence_path: result.evidence_path,
-    compare_url: result.compare_url,
-    meta: result,
-  });
+  // fix result. Only Hermes fix attempts get a fix_attempts row; token /
+  // push outcomes (and push-only retries) are events, not attempts.
+  if (countsAsHermesAttempt(result)) {
+    const attempt = nextFixAttemptNumber(id);
+    addFixAttempt(id, {
+      attempt,
+      branch: result.branch,
+      result: result.status || "unknown",
+      evidence_path: result.evidence_path,
+      compare_url: result.compare_url,
+      meta: result,
+    });
+  }
 
   const patch = {};
   if (result.branch) patch.draft_branch = result.branch;
@@ -192,6 +195,40 @@ export function applyResult(result) {
   patch.status = fixStatusToIncidentStatus(result.status);
   if (Object.keys(patch).length) updateIncident(id, patch);
   addIncidentEvent(id, "fix_result", result.summary || result.status || "Fix result", result);
+}
+
+const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed"]);
+
+/** Hermes fix attempt (vs. token wait / push failure / push-only retry). */
+export function countsAsHermesAttempt(result) {
+  if (!result) return false;
+  if (result.via === "push-pending") return false;
+  return !NON_ATTEMPT_STATUSES.has(result.status);
+}
+
+/**
+ * Saved-fix job name for the admin "Retry push" button, or null.
+ * Latest fix_result must be ready_no_token / push_failed, or the legacy
+ * "git push to fork failed" needs_human (job derived from the evidence path).
+ */
+export function pushRetryJob(incident, latestFixEvent) {
+  if (!incident || !["needs_human", "triaged"].includes(incident.status)) return null;
+  const meta = latestFixEvent?.meta;
+  if (!meta) return null;
+  const legacy = meta.status === "needs_human" && /^git push to fork failed/.test(String(meta.summary || ""));
+  if (!["ready_no_token", "push_failed"].includes(meta.status) && !legacy) return null;
+  let job = typeof meta.job === "string" ? meta.job : "";
+  if (!job) {
+    for (const p of [meta.pending_path, meta.patch_path, meta.evidence_path]) {
+      const m = /\/autofix\/([^/]+)\//.exec(String(p || ""));
+      if (m) {
+        job = m[1];
+        break;
+      }
+    }
+  }
+  const m = /^fix-(\d+)-[A-Za-z0-9-]+$/.exec(job);
+  return m && Number(m[1]) === Number(incident.id) ? job : null;
 }
 
 /**
@@ -210,6 +247,7 @@ export function fixStatusToIncidentStatus(st) {
       return "pr_opened";
     case "no_token":
     case "ready_no_token":
+    case "push_failed":
     case "disabled":
       // Nothing was pushed: back to triaged (fix is committed locally in the
       // job scratch dir and waits for the fork-push token).

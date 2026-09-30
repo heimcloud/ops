@@ -3,6 +3,7 @@
   flake.modules.nixos.ops-option = {
     config,
     lib,
+    pkgs,
     ...
   }:
     with lib;
@@ -161,6 +162,16 @@
                       default = 2700;
                       description = "Per Hermes call timeout in seconds (fix runs up to 40 turns).";
                       rank = 58;
+                    };
+                    extraPackages = mkOption {
+                      type = types.listOf types.package;
+                      # Neo CLI (cli/, crane build: pkg-config + openssl, nixpkgs rustc; no
+                      # rust-toolchain file) so Hermes can cargo check/test cli changes.
+                      default = with pkgs; [cargo rustc clippy rustfmt stdenv.cc pkg-config openssl openssl.dev gnumake];
+                      defaultText = literalExpression "with pkgs; [cargo rustc clippy rustfmt stdenv.cc pkg-config openssl openssl.dev gnumake]";
+                      # Packages are not settable from settings.toml; hide from the Neo web UI.
+                      internal = true;
+                      description = "Extra tools on the autofix worker/Hermes PATH (also installed for the hermes user so Hermes's terminal tool sees them).";
                     };
                     redactExtraSlugsFile = mkOption {
                       type = types.nullOr types.str;

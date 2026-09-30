@@ -15,14 +15,16 @@ import {
   getClasses,
   getStatuses,
   listFixAttempts,
+  getLatestIncidentEvent,
 } from "./db.js";
 import {
   enqueueJob,
+  enqueuePushJob,
   isAutofixKindEnabled,
   getForkPushTokenState,
   NO_TOKEN_WARNING,
 } from "./queue.js";
-import { ingestResultsDir } from "./results.js";
+import { ingestResultsDir, pushRetryJob } from "./results.js";
 import {
   getGithubTokenConfigured,
   getAllowlist,
@@ -215,6 +217,17 @@ export function createAdminRouter() {
         </form>`
             : ""
         }
+        ${(() => {
+          const job = isAutofixKindEnabled("push") ? pushRetryJob(incident, getLatestIncidentEvent(id, "fix_result")) : null;
+          return job
+            ? `<form method="post" action="${base}/incidents/${id}/retry-push" class="card" onsubmit="return confirm('Retry pushing the saved fix for incident #${id}?');">
+          <input type="hidden" name="job" value="${escapeHtml(job)}" />
+          <p><strong>Retry push</strong> pushes the fix already committed on the host (job <code>${escapeHtml(job)}</code>) to the fork,
+             re-runs the gates and the lab test, and prepares the compare link. No new Hermes run; does not use a fix attempt.</p>
+          <button class="btn" type="submit">Retry push</button>
+        </form>`
+            : "";
+        })()}
         ${
           isAutofixKindEnabled("fix")
             ? `<form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Enqueue fix job for incident #${id}?');">
@@ -369,6 +382,28 @@ export function createAdminRouter() {
   }
 
   router.post("/incidents/:id/start-fix", enqueueHandler("fix"));
+  router.post("/incidents/:id/retry-push", (req, res) => {
+    const base = req.adminBase;
+    if (refuseMutations(res, base)) return;
+    const id = Number(req.params.id);
+    const incident = getIncident(id);
+    if (!incident) return res.status(404).send("Not found");
+    try {
+      // Job name comes from the DB, never from the form (form value is display only).
+      const job = pushRetryJob(incident, getLatestIncidentEvent(id, "fix_result"));
+      if (!job) throw new Error(`Incident #${id} has no saved fix waiting for a push.`);
+      const { path: jobPath } = enqueuePushJob(incident, job);
+      addIncidentEvent(id, "push_enqueued", `Push retry enqueued for saved fix ${job} (no Hermes run)`, {
+        job,
+        job_file: jobPath.split("/").pop(),
+        job_kind: "push",
+      });
+      return res.redirect(303, `${base}/incidents/${id}?msg=${encodeURIComponent("Push retry enqueued")}`);
+    } catch (err) {
+      console.error("[admin] retry-push", err.code || "", err.message);
+      return res.redirect(303, `${base}/incidents/${id}?err=${encodeURIComponent(err.message || "Retry push failed")}`);
+    }
+  });
   router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
 
   // Silence unused import warning for getDb if tree-shaken oddly — keep for parity / future

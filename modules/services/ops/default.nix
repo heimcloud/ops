@@ -55,6 +55,7 @@
         "${opsAppdata}/queue"
         "${opsAppdata}/queue/triage"
         "${opsAppdata}/queue/fix"
+        "${opsAppdata}/queue/push"
         "${opsAppdata}/queue/processing"
         "${opsAppdata}/queue/done"
         "${opsAppdata}/queue/failed"

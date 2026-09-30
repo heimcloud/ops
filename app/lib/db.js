@@ -315,6 +315,21 @@ export function getIncident(id) {
   return getDb().prepare(`SELECT * FROM incidents WHERE id = ?`).get(id);
 }
 
+/** Most recent event of one kind (meta parsed), or null. */
+export function getLatestIncidentEvent(incidentId, kind) {
+  const row = getDb()
+    .prepare(`SELECT * FROM incident_events WHERE incident_id = ? AND kind = ? ORDER BY id DESC LIMIT 1`)
+    .get(incidentId, kind);
+  if (!row) return null;
+  let meta = null;
+  try {
+    meta = row.meta_json ? JSON.parse(row.meta_json) : null;
+  } catch {
+    meta = null;
+  }
+  return { ...row, meta };
+}
+
 export function listIncidentEvents(incidentId, { limit = 100 } = {}) {
   const lim = Math.min(Math.max(Number(limit) || 100, 1), 500);
   return getDb()

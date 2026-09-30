@@ -20,7 +20,11 @@ The worker prepares a fresh partial clone under `$HOME/workspace/autofix/<job>/n
 - Minimal diff. Never touch deny-listed paths when the lab host shares the ops host: `nix/services/ops`, `nix/services/hermes`, `nix/services/swag`, `nix/modules/core`.
 - No identifiers in branch name, commit messages, or file contents you add (no customer slug, hostname, IP, email, home path, slug-bearing plugin URL). Any 10-character upper-case token blocks the push.
 - If the prompt includes a previous lab-test failure, fix forward with a new commit on the same branch.
-- Run available evals/format checks if present (e.g. `nix-instantiate --parse` on changed files); otherwise note what was skipped in `summary`.
+- Check what you changed, when the tools are available (`command -v`):
+  - `cli/` (Rust): `cd cli && cargo check` and `cargo test` (the worker sets `CARGO_TARGET_DIR` outside the clone; never commit `target/`). Add `--offline` only if crates are already cached.
+  - `*.nix`: `nix-instantiate --parse <file>` for every changed file.
+  - If a check cannot run (tool missing, crates.io unreachable, build needs network), that is a note in `summary`, **not** a failure: still commit and report `ready_to_push`, stating exactly which checks ran, passed, or were skipped and why.
+  - A check that runs and fails because of your change must be fixed before you report `ready_to_push`.
 
 ## Output
 

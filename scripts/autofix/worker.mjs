@@ -29,7 +29,8 @@ import { buildCompareUrl } from "./compare.js";
 
 const TRUE = ["1", "true", "yes", "on"];
 const FALSE = ["0", "false", "no", "off"];
-const KINDS = ["triage", "fix"];
+const KINDS = ["triage", "fix", "push"];
+const JOB_NAME_RE = /^fix-(\d+)-[A-Za-z0-9-]+$/;
 const BRANCH_RE = /^(fix|ops)\/[A-Za-z0-9._/-]+$/;
 const CLASSES = ["software", "human_config", "unknown"];
 
@@ -153,6 +154,7 @@ function mkdirs(cfg) {
 }
 
 export function enabledKinds(cfg) {
+  // push (retry a saved fix) rides on autofix.fix.enable.
   return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : cfg.fixOn));
 }
 
@@ -230,13 +232,14 @@ export function recoverStale(cfg) {
   let n = 0;
   for (const f of names) {
     if (!f.endsWith(".json")) continue;
-    const m = /^(triage|fix)-(\d+)-/.exec(f);
+    const m = /^(triage|fix|push)-(\d+)-/.exec(f);
     const full = path.join(dir, f);
     if (m) {
       writeResult(cfg, full, {
-        kind: m[1],
+        kind: m[1] === "push" ? "fix" : m[1],
         incident_id: Number(m[2]),
-        status: m[1] === "triage" ? "triage_failed" : "needs_human",
+        status: m[1] === "triage" ? "triage_failed" : m[1] === "push" ? "push_failed" : "needs_human",
+        ...(m[1] === "push" ? { via: "push-pending", push_error: "interrupted" } : {}),
         summary: "Worker was interrupted (timeout/kill) while processing this job; re-enqueue from the admin UI.",
       });
     }
@@ -600,6 +603,28 @@ export function savePending(cfg, scratch, neoDir, state, slugs) {
   return pending;
 }
 
+/**
+ * One-line, non-sensitive push error class. Raw git output (URLs, helper
+ * messages) never leaves the worker log.
+ */
+export function classifyPushError(text) {
+  const t = String(text || "");
+  if (/could not read (Username|Password)|Authentication failed|terminal prompts disabled|HTTP (401|403)|Permission to .* denied|invalid credentials|403 Forbidden/i.test(t)) {
+    return { class: "auth", message: "fork rejected the credentials or none were offered (check heimcloud-autofix-env / token)" };
+  }
+  if (/Could not resolve host|timed out|Connection (refused|reset)|Failed to connect|network is unreachable|ETIMEDOUT|unable to access/i.test(t)) {
+    return { class: "network", message: "could not reach GitHub" };
+  }
+  if (/\[rejected\]|\[remote rejected\]|non-fast-forward|protected branch|pre-receive hook declined|shallow update not allowed/i.test(t)) {
+    return { class: "rejected", message: "fork refused the ref update" };
+  }
+  return { class: "unknown", message: "git push failed (see worker journal)" };
+}
+
+function retryHint(job) {
+  return `Retry: admin "Retry push" on the incident, or systemctl start heimcloud-ops-worker-push@${job}.service`;
+}
+
 /** Push HEAD to the fork branch, build the compare link, run the lab test. */
 function pushAndLab(cfg, neoDir, branch, klass) {
   // Fork branch namespace fix/*|ops/* is owned by this loop: force keeps
@@ -610,7 +635,9 @@ function pushAndLab(cfg, neoDir, branch, klass) {
     { env: gitEnv(), timeout: 900_000 },
   );
   if (push.status !== 0) {
-    return { pushed: false, summary: `git push to fork failed: ${tail(push.stderr || push.stdout || push.error, 500)}` };
+    // Journal only, with any URL userinfo stripped; never in results/DB.
+    log(`git push failed: ${tail(String(push.stderr || push.error || "").replace(/:\/\/[^@\s/]+@/g, "://***@"), 300)}`);
+    return { pushed: false, error: classifyPushError(`${push.stderr}\n${push.stdout}\n${push.error || ""}`) };
   }
   return { pushed: true, compare_url: buildCompareUrl(branch, { base: cfg.baseRef }), lab: labTest(cfg, branch, klass || "default") };
 }
@@ -671,37 +698,55 @@ export function handleFix(cfg, job, ctx) {
       return res;
     }
 
-    // Token is only needed from here on. Without it the fix is kept locally.
-    const token = tokenAvailable(cfg);
-    if (!token.ok) {
-      const pending = savePending(cfg, ctx.scratch, neoDir, {
+    // Token is only needed from here on. Without it (or if the push fails)
+    // the fix is kept locally and can be pushed later without Hermes.
+    const jobName = path.basename(ctx.scratch);
+    const keep = () =>
+      savePending(cfg, ctx.scratch, neoDir, {
         kind: "fix",
         incident_id: job.incident_id,
+        job: jobName,
         branch,
         class: job.class,
+        severity: job.severity,
+        report_hash: job.report_hash,
         base_ref: cfg.baseRef,
         base_sha: baseSha,
         pr_title: prTitle,
         pr_body: prBody,
       }, slugs);
+    const kept = (pending) => ({
+      ...common,
+      branch,
+      job: jobName,
+      pr_title: prTitle,
+      pr_body: prBody,
+      lab: "deferred_until_push",
+      patch_path: pending.patch_path,
+      pending_path: path.join(ctx.scratch, PENDING_FILE),
+      head_sha: pending.head_sha,
+    });
+    const token = tokenAvailable(cfg);
+    if (!token.ok) {
       return {
-        ...common,
+        ...kept(keep()),
         status: "ready_no_token",
-        branch,
-        pr_title: prTitle,
-        pr_body: prBody,
-        lab: "deferred_until_push",
-        patch_path: pending.patch_path,
-        pending_path: path.join(ctx.scratch, PENDING_FILE),
-        head_sha: pending.head_sha,
         summary:
           `Fix branch ${branch} is committed locally (${gate.commits} commit(s)) and passed deny-list + redaction gates; ` +
-          `waiting for the fork-push token (${token.reason}). Push later (no Hermes rerun): systemctl start heimcloud-ops-worker-push@${path.basename(ctx.scratch)}.service`,
+          `waiting for the fork-push token (${token.reason}). ${retryHint(jobName)}`,
       };
     }
 
     const pushed = pushAndLab(cfg, neoDir, branch, job.class);
-    if (!pushed.pushed) return { ...common, branch, status: "needs_human", summary: pushed.summary };
+    if (!pushed.pushed) {
+      // Not a Hermes failure: no retry loop, attempt budget untouched.
+      return {
+        ...kept(keep()),
+        status: "push_failed",
+        push_error: pushed.error.class,
+        summary: `Fix branch ${branch} is committed locally; push to the fork failed (${pushed.error.class}: ${pushed.error.message}). ${retryHint(jobName)}`,
+      };
+    }
     last = { ...common, branch, compare_url: pushed.compare_url, pr_title: prTitle, pr_body: prBody };
     const lab = pushed.lab;
     if (lab.skipped) {
@@ -728,48 +773,172 @@ export function handleFix(cfg, job, ctx) {
   };
 }
 
+function readJsonMaybe(...files) {
+  for (const f of files) {
+    try {
+      return JSON.parse(fs.readFileSync(f, "utf8"));
+    } catch {
+      /* next */
+    }
+  }
+  return null;
+}
+
 /**
- * `heimcloud-ops-worker --push-pending <job scratch dir>`: push a fix saved as
- * ready_no_token once the token exists. Re-runs the gates (slug list may have
- * grown), never calls Hermes, writes a normal fix result for the app to ingest.
+ * Recovery for jobs that ended before push-pending.json existed (e.g. an old
+ * "git push to fork failed" needs_human): rebuild it from the scratch clone.
+ * branch = current branch; base = recorded base_sha from the job's result,
+ * else merge-base with the upstream base ref. Gates run again in pushPending.
+ */
+export function rebuildPending(cfg, scratch) {
+  const name = path.basename(scratch);
+  const m = JOB_NAME_RE.exec(name);
+  if (!m) throw new Error(`not a fix job scratch dir: ${name}`);
+  const neoDir = path.join(scratch, "neo");
+  if (!fs.existsSync(path.join(neoDir, ".git"))) {
+    throw new Error(`no ${PENDING_FILE} and no scratch clone in ${scratch}`);
+  }
+  const jobFile = readJsonMaybe(
+    path.join(cfg.queue, "done", `${name}.json`),
+    path.join(cfg.queue, "failed", `${name}.json`),
+  ) || {};
+  const prior = readJsonMaybe(
+    path.join(cfg.results, `${name}.ingested.json`),
+    path.join(cfg.results, `${name}.json`),
+    path.join(cfg.results, `${name}.rejected.json`),
+  ) || {};
+  const incidentId = Number(jobFile.incident_id || prior.incident_id || m[1]);
+  const baseRef = prior.base_ref || cfg.baseRef;
+  const branch = git(neoDir, ["symbolic-ref", "--short", "HEAD"]).stdout.trim();
+  if (!BRANCH_RE.test(branch)) throw new Error(`scratch clone is not on a fix/* or ops/* branch (${branch || "detached"})`);
+
+  let baseSha = "";
+  if (prior.base_sha && git(neoDir, ["cat-file", "-e", `${prior.base_sha}^{commit}`]).status === 0) {
+    baseSha = prior.base_sha;
+  } else {
+    const f = git(neoDir, ["fetch", "-q", "origin", baseRef], { timeout: 600_000, unsetEnv: ["GH_TOKEN", "GITHUB_TOKEN"] });
+    const mb = f.status === 0 ? git(neoDir, ["merge-base", "HEAD", "FETCH_HEAD"]) : { status: 1, stdout: "" };
+    baseSha = mb.status === 0 ? mb.stdout.trim() : "";
+    if (!baseSha) throw new Error(`cannot determine base commit (no recorded base_sha, merge-base with ${baseRef} failed)`);
+  }
+  git(neoDir, ["remote", "remove", "fork"]);
+  git(neoDir, ["remote", "add", "fork", cfg.forkUrl]);
+  git(neoDir, ["config", "user.name", GIT_IDENTITY.name]);
+  git(neoDir, ["config", "user.email", GIT_IDENTITY.email]);
+  const slugs = knownSlugs(cfg);
+  const severity = jobFile.severity || "unspecified";
+  const state = {
+    kind: "fix",
+    incident_id: incidentId,
+    job: name,
+    branch,
+    class: jobFile.class || "default",
+    severity,
+    report_hash: jobFile.report_hash || prior.report_hash || "",
+    base_ref: baseRef,
+    base_sha: baseSha,
+    pr_title: prior.pr_title || `ops: incident #${incidentId} (${severity})`,
+    pr_body:
+      prior.pr_body ||
+      [
+        `# Heimcloud Ops incident #${incidentId}`,
+        "",
+        `report_hash: \`${jobFile.report_hash || ""}\``,
+        "",
+        "Automated fix (recovered from the worker scratch clone).",
+        "",
+        "Opened manually from the compare link — **do not auto-merge**.",
+        "",
+      ].join("\n"),
+    recovered: true,
+  };
+  const gate = gateCommits({ ...cfg, baseRef }, neoDir, baseSha, { branch, prTitle: state.pr_title, prBody: state.pr_body, slugs });
+  if (!gate.ok) {
+    const err = new Error(`recovered clone failed the gates: ${gate.result.status}: ${gate.result.summary}`);
+    err.gate = gate.result;
+    throw err;
+  }
+  return savePending({ ...cfg, baseRef }, scratch, neoDir, state, slugs);
+}
+
+/**
+ * Push a saved fix (ready_no_token / push_failed / recovered clone) without a
+ * second Hermes run. Used by the `push` queue kind (admin "Retry push") and by
+ * `heimcloud-ops-worker --push-pending <dir>` (heimcloud-ops-worker-push@<job>).
+ * Re-runs identity/deny-list/redaction gates (slug list may have grown).
+ * Never throws for token/push problems: those keep the pending state.
  */
 export function pushPending(cfg, scratch) {
+  // push@ unit and the push queue kind use different worker locks; serialise per job.
+  const lockPath = path.join(scratch, ".push.lock");
+  let fd = null;
+  try {
+    fd = fs.existsSync(scratch) ? tryLock(lockPath) : null;
+  } catch {
+    fd = null;
+  }
+  if (fd == null && fs.existsSync(scratch)) {
+    const m = JOB_NAME_RE.exec(path.basename(scratch));
+    return { kind: "fix", via: "push-pending", job: path.basename(scratch), incident_id: Number(m?.[1] || 0), status: "push_failed", push_error: "busy", summary: "Another push for this saved fix is running; try again when it finished." };
+  }
+  try {
+    return pushPendingLocked(cfg, scratch);
+  } finally {
+    if (fd != null) unlock(fd, lockPath);
+  }
+}
+
+function pushPendingLocked(cfg, scratch) {
   const pendingPath = path.join(scratch, PENDING_FILE);
-  const p = JSON.parse(fs.readFileSync(pendingPath, "utf8"));
-  const baseRes = { kind: "fix", incident_id: p.incident_id, base_ref: p.base_ref, base_sha: p.base_sha, branch: p.branch, via: "push-pending" };
+  const jobName = path.basename(scratch);
+  let p;
+  try {
+    p = fs.existsSync(pendingPath) ? JSON.parse(fs.readFileSync(pendingPath, "utf8")) : rebuildPending(cfg, scratch);
+  } catch (err) {
+    const m = JOB_NAME_RE.exec(jobName);
+    return {
+      kind: "fix",
+      via: "push-pending",
+      job: jobName,
+      incident_id: Number(m?.[1] || 0),
+      ...(err.gate || { status: "needs_human", summary: `cannot push saved fix: ${err.message}` }),
+    };
+  }
+  const baseRes = { kind: "fix", via: "push-pending", job: jobName, incident_id: p.incident_id, base_ref: p.base_ref, base_sha: p.base_sha, branch: p.branch, pending_path: pendingPath, patch_path: p.patch_path };
   const cfgP = { ...cfg, baseRef: p.base_ref || cfg.baseRef };
-  const neoDir = p.neo_dir;
-  let result;
+  const neoDir = p.neo_dir || path.join(scratch, "neo");
   const head = fs.existsSync(neoDir) ? git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() : "";
   if (head !== p.head_sha) {
     // Scratch clone gone or moved: rebuild from the saved patch.
     const clone = cloneNeo(cfgP, neoDir);
-    if (!clone.ok) throw new Error(`clone for patch replay failed: ${clone.error}`);
-    git(neoDir, ["checkout", "-q", p.base_sha]);
-    const am = git(neoDir, ["am", "--committer-date-is-author-date", p.patch_path]);
-    if (am.status !== 0) throw new Error(`git am failed: ${tail(am.stderr, 300)}`);
+    const am = clone.ok
+      ? (git(neoDir, ["checkout", "-q", p.base_sha]), git(neoDir, ["am", "--committer-date-is-author-date", p.patch_path]))
+      : { status: 1 };
+    if (!clone.ok || am.status !== 0) {
+      return { ...baseRes, status: "push_failed", push_error: "replay", summary: `Saved patch could not be replayed onto ${p.base_ref} (${clone.ok ? "git am failed" : "clone failed"}). ${retryHint(jobName)}` };
+    }
     git(neoDir, ["remote", "remove", "fork"]);
     git(neoDir, ["remote", "add", "fork", cfgP.forkUrl]);
   }
   const slugs = knownSlugs(cfgP);
   const gate = gateCommits(cfgP, neoDir, p.base_sha, { branch: p.branch, prTitle: p.pr_title, prBody: p.pr_body, slugs });
   if (!gate.ok) {
-    result = { ...baseRes, ...gate.result };
-  } else if (!tokenAvailable(cfgP).ok) {
-    throw new Error("fork-push token still unavailable; nothing pushed");
-  } else {
-    const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class);
-    if (!pushed.pushed) result = { ...baseRes, status: "needs_human", summary: pushed.summary };
-    else {
-      const common = { ...baseRes, compare_url: pushed.compare_url, pr_title: p.pr_title, pr_body: p.pr_body };
-      if (pushed.lab.skipped) result = { ...common, status: "awaiting_lab_test", lab: "skipped", summary: "Saved fix pushed; compare link ready. Lab test skipped (not installed) — test manually." };
-      else if (pushed.lab.ok) result = { ...common, status: "compare_ready", lab: "passed", summary: "Saved fix pushed; lab test passed." };
-      else result = { ...common, compare_url: undefined, status: "needs_human", lab: "failed", summary: `Saved fix pushed but lab test failed (no Hermes retry in push-pending mode): ${tail(redactIdentifyingDetails(pushed.lab.output, { knownSlugs: slugs }), 500)}` };
-    }
+    fs.renameSync(pendingPath, `${pendingPath}.blocked`);
+    return { ...baseRes, ...gate.result, pending_path: undefined };
   }
-  const out = writeResult(cfgP, path.join(scratch, `push-${path.basename(scratch)}.json`), result);
+  const token = tokenAvailable(cfgP);
+  if (!token.ok) {
+    return { ...baseRes, status: "ready_no_token", summary: `Fix branch ${p.branch} still waiting for the fork-push token (${token.reason}). ${retryHint(jobName)}` };
+  }
+  const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class);
+  if (!pushed.pushed) {
+    return { ...baseRes, status: "push_failed", push_error: pushed.error.class, summary: `Push to the fork failed again (${pushed.error.class}: ${pushed.error.message}). ${retryHint(jobName)}` };
+  }
   fs.renameSync(pendingPath, `${pendingPath}.done`);
-  return { result, path: out };
+  const common = { ...baseRes, pending_path: undefined, compare_url: pushed.compare_url, pr_title: p.pr_title, pr_body: p.pr_body };
+  if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; compare link ready. Lab test skipped (not installed) — test manually.` };
+  if (pushed.lab.ok) return { ...common, status: "compare_ready", lab: "passed", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; lab test passed.` };
+  return { ...common, compare_url: undefined, status: "needs_human", lab: "failed", summary: `Saved fix pushed but lab test failed (no Hermes retry in push mode): ${tail(redactIdentifyingDetails(pushed.lab.output, { knownSlugs: slugs }), 500)}` };
 }
 
 // ---------------------------------------------------------------- main
@@ -786,14 +955,21 @@ export function processOne(cfg, entry) {
     if (!job || !Number(job.incident_id)) throw new Error("job without incident_id");
     log(`${entry.kind} incident ${job.incident_id} (${entry.name})`);
     const ctx = { scratch, slugs: knownSlugs(cfg) };
-    result = entry.kind === "triage" ? handleTriage(cfg, job, ctx) : handleFix(cfg, job, ctx);
+    if (entry.kind === "push") {
+      const jm = JOB_NAME_RE.exec(String(job.job || ""));
+      if (!jm || Number(jm[1]) !== Number(job.incident_id)) throw new Error("push job needs a matching fix job name");
+      result = pushPending(cfg, path.join(cfg.scratchRoot, job.job));
+    } else {
+      result = entry.kind === "triage" ? handleTriage(cfg, job, ctx) : handleFix(cfg, job, ctx);
+    }
   } catch (err) {
     bucket = "failed";
     const m = /^(\d+)-/.exec(entry.name);
     result = {
-      kind: entry.kind,
+      kind: entry.kind === "push" ? "fix" : entry.kind,
       incident_id: Number(job?.incident_id || (m && m[1]) || 0),
-      status: entry.kind === "triage" ? "triage_failed" : "needs_human",
+      status: entry.kind === "triage" ? "triage_failed" : entry.kind === "push" ? "push_failed" : "needs_human",
+      ...(entry.kind === "push" ? { via: "push-pending" } : {}),
       summary: `worker error: ${err.message || err}`,
     };
   }
@@ -843,9 +1019,13 @@ export function main(argv = process.argv.slice(2)) {
       return 1;
     }
     try {
-      const { result } = pushPending(cfg, path.resolve(dir));
+      const scratch = path.resolve(dir);
+      const result = pushPending(cfg, scratch);
+      if (result.incident_id) {
+        writeResult(cfg, path.join(scratch, `push-${path.basename(scratch)}-${Date.now()}.json`), result);
+      }
       log(`push-pending incident ${result.incident_id}: ${result.status}`);
-      return 0;
+      return ["compare_ready", "awaiting_lab_test"].includes(result.status) ? 0 : 1;
     } catch (err) {
       console.error(`heimcloud-ops-worker: push-pending failed: ${err.message || err}`);
       return 1;
