@@ -210,8 +210,14 @@ export function needsHumanInput(incident, events = [], attempts = []) {
   const fix = latestEvent(events, ["fix_result"]);
   const triageEnq = latestEvent(events, ["triage_enqueued"]);
   const fixEnq = latestEvent(events, ["fix_enqueued", "push_enqueued"]);
-  const triageBusy = Boolean(triageEnq && (!triage || triageEnq.id > triage.id));
-  const fixBusy = Boolean(fixEnq && (!fix || fixEnq.id > fix.id));
+  // A job cancelled while still pending never produces a result: its
+  // job_cancelled event (meta.job_kind) ends the busy window instead.
+  const cancelledOf = (kinds) =>
+    latestEvent(events.filter((e) => e.kind === "job_cancelled" && kinds.includes(metaOf(e)?.job_kind)), ["job_cancelled"]);
+  const triageEnd = [triage, cancelledOf(["triage"])].filter(Boolean).sort((x, y) => y.id - x.id)[0];
+  const fixEnd = [fix, cancelledOf(["fix", "push"])].filter(Boolean).sort((x, y) => y.id - x.id)[0];
+  const triageBusy = Boolean(triageEnq && (!triageEnd || triageEnq.id > triageEnd.id));
+  const fixBusy = Boolean(fixEnq && (!fixEnd || fixEnq.id > fixEnd.id));
   const fm = fix?.meta || null;
   const nAttempts = Math.max(attempts.length, Number(fm?.attempts) || 0);
 

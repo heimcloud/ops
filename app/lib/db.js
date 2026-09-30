@@ -485,3 +485,32 @@ export function listFixAttemptsForIncidents(ids) {
     .all(JSON.stringify(list));
   return groupByIncident(rows);
 }
+
+/**
+ * Cheap change watermarks for live updates: max event / attempt ids and the
+ * latest incident update. Every mutation path bumps at least one of them.
+ */
+export function getWatermarks() {
+  const r = getDb()
+    .prepare(
+      `SELECT (SELECT COALESCE(MAX(id), 0) FROM incident_events) AS ev,
+              (SELECT COALESCE(MAX(id), 0) FROM fix_attempts) AS fa,
+              (SELECT COALESCE(MAX(updated_at), '') FROM incidents) AS up,
+              (SELECT COUNT(*) FROM incidents) AS n`,
+    )
+    .get();
+  return { ev: Number(r.ev), fa: Number(r.fa), up: String(r.up || ""), n: Number(r.n) };
+}
+
+/** Incident ids touched after the given watermarks (capped). */
+export function incidentIdsChangedSince(w, limit = 200) {
+  const rows = getDb()
+    .prepare(
+      `SELECT incident_id AS id FROM incident_events WHERE id > ?
+       UNION SELECT incident_id FROM fix_attempts WHERE id > ?
+       UNION SELECT id FROM incidents WHERE updated_at > ?
+       LIMIT ?`,
+    )
+    .all(Number(w.ev) || 0, Number(w.fa) || 0, String(w.up || ""), limit + 1);
+  return rows.map((r) => Number(r.id));
+}

@@ -59,6 +59,7 @@
         "${opsAppdata}/queue/processing"
         "${opsAppdata}/queue/done"
         "${opsAppdata}/queue/failed"
+        "${opsAppdata}/queue/control"
         "${opsAppdata}/results"
       ];
       ensureExchangeDirs = pkgs.writeShellScript "heimcloud-ops-ensure-dirs" ''

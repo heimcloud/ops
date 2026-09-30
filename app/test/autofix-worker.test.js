@@ -439,18 +439,25 @@ test("disabled kinds are left in the queue untouched", () => {
   process.env.OPS_AUTOFIX_FIX = "1";
 });
 
-test("stale lock from a dead pid is reclaimed; interrupted jobs are failed, not re-run", () => {
+test("stale lock from a dead pid is reclaimed; a job interrupted twice is quarantined, not re-run", () => {
   const lock = process.env.OPS_AUTOFIX_LOCK;
   fs.mkdirSync(path.dirname(lock), { recursive: true });
   fs.writeFileSync(lock, "999999");
   const stale = path.join(data, "queue", "processing", "fix-21-2026-01-01T00-00-00-000Z.json");
-  fs.writeFileSync(stale, "{}");
+  // Second claim died too (claims counter written by the worker on claim).
+  fs.writeFileSync(stale, JSON.stringify({ kind: "fix", incident_id: 21, _claims: 2 }));
   W.main([]);
   assert.equal(fs.existsSync(lock), false);
   const r = JSON.parse(fs.readFileSync(path.join(data, "results", path.basename(stale)), "utf8"));
   assert.equal(r.status, "needs_human");
-  assert.match(r.summary, /interrupted/);
+  assert.match(r.summary, /crashed worker/);
   assert.ok(fs.existsSync(path.join(data, "queue", "failed", path.basename(stale))));
+  const reason = JSON.parse(fs.readFileSync(path.join(data, "queue", "failed", "fix-21-2026-01-01T00-00-00-000Z.reason.json"), "utf8"));
+  assert.equal(reason.code, "crashed_worker");
+  const st = JSON.parse(fs.readFileSync(path.join(data, "queue", "worker-status.json"), "utf8"));
+  assert.ok(st.issues.some((i) => i.code === "stale_lock"));
+  assert.ok(st.issues.some((i) => i.code === "poison_quarantined"));
+  assert.equal(st.state, "idle");
 });
 
 test("extractJson picks the last valid object from noisy output", () => {

@@ -93,6 +93,34 @@ Old triage results without `verdict` are mapped from `class` + `fixable` (human_
 
 **Anonymization**: every displayed text field on the board, drawer and `board.json` goes through `app/lib/redact.js` with the DB slugs + `OPS_REDACT_EXTRA_SLUGS`, plus a display-only username rule. Unit suffixes like `.service` stay readable. `customer_repo_slug` and `plugin_urls` are never rendered there. Links are only shown for `https://github.com/…` URLs that come through redaction unchanged. `app/test/board-admin.test.js` seeds synthetic identifiers and asserts that none of them reach the HTML or the JSON.
 
+### Live updates, worker panel, queue
+
+**Live updates** (`app/lib/live.js`, `app/public/js/live.js`). The server computes a revision from DB watermarks (max event / fix-attempt / `updated_at` / count) plus an fs signature of the queue dirs, `queue/control/*`, `queue/worker-status.json` and `queue/systemd-status.json`.
+- `GET /admin/events` (SSE) sends `retry: 3000`, then a `hello` (or a catch-up `change` when `Last-Event-ID` is stale).
+- It sends `event: change` with the changed incident ids and `worker: true|false` whenever the revision moves (checked every `OPS_LIVE_TICK_MS`, default 1.5 s, one shared ticker).
+- It also sends a `: hb` comment plus `event: ping` every `OPS_LIVE_HEARTBEAT_MS` (15 s).
+- Headers: `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`, so nginx/SWAG do not buffer the stream. The 15 s heartbeat stays well below SWAG's `proxy_read_timeout` (240 s).
+- The client falls back to polling `GET /admin/live.json` every 5 s (15 s in a hidden tab) with `If-None-Match` (304 when unchanged) when EventSource is missing, errors 4×, or goes silent. It retries SSE every 2 min.
+- On a change it fetches `/admin/cards?ids=…` and `/admin/worker.json` and patches the page. It never replaces a card being dragged or with a pending move/focused control (those are flushed after `dragend`/blur). An open drawer is refreshed in place, keeping its scroll position, open `<details>` and `<pre>` scroll.
+- The header shows **Live** / **Reconnecting** / **Polling**.
+
+**Worker panel** (board strip + `/admin/queue`) reads `queue/worker-status.json` (written atomically by the host worker at every stage transition and every `OPS_AUTOFIX_HEARTBEAT_SEC`, default 30 s, while Hermes runs). It shows:
+- the state: Running / Idle / Paused / **Stale** (running but heartbeat older than `OPS_WORKER_STALE_SEC`, default 300 s) / Not reporting;
+- the current job: kind, incident, stage `cloning`/`hermes n/m`/`checks`/`push`/`lab`, started + elapsed, claims, cancel requested;
+- the last run result + time, fork-push token (bool), Hermes/lab timeouts;
+- systemd health from `queue/systemd-status.json`, written by the root `heimcloud-ops-worker-kick` timer: the path unit is watching, service state, start-limit-hit / failed, stale report, last watchdog action;
+- recent worker issues (poison quarantine, requeue after crash, stale lock, Hermes timeout, unwritable results, malformed job, cancelled).
+
+**Queue** (`/admin/queue`, `/admin/queue.json`). Pending jobs are shown in claim order: priority (high/normal/low) → manual order → kind (push › triage › fix) → enqueue time. Processing, recent failed (with reason) and recent done (with result) are listed too. Controls (JSON or form POSTs, same-origin, 403 under `ADMIN_READ_ONLY`):
+
+| Action | Effect | Event |
+|--------|--------|-------|
+| Priority select / ⤒ ↑ ↓ | writes `queue/control/priority.json` atomically; the worker re-reads it before every claim | `job_priority` / `job_reordered` |
+| Cancel (pending) | renames the job to `queue/failed/` + `*.reason.json`; a pending fix returns the incident `fixing → triaged` | `job_cancelled` |
+| Cancel running job | writes `queue/control/cancel-<job>`; the worker checks it between stages and its supervisor polls it during clone/Hermes/lab, then SIGTERM → SIGKILL to the child's process group; incident gets a `cancelled` / `triage_cancelled` result (fix → `triaged`) | `job_cancel_requested`, then the result |
+| Retry (failed) | re-enqueues a fresh job of the same kind (refused for resolved/closed incidents); the failed file is marked retried | `{kind}_enqueued` "retry of failed job …" |
+| Pause / Resume | `queue/control/paused.json`; the worker checks it between jobs and never kills a running job | — |
+
 ## Admin Start fix
 
 **Start fix** (board card, drawer, or incident page) enqueues a host fix job (status → `fixing`) and does **not** open a GitHub PR or commit into the target repo. Coded fixes come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → compare link); Damo opens the upstream PR in the GitHub web UI. **No auto-merge.**

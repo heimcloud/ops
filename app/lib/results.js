@@ -156,7 +156,7 @@ export function applyResult(result) {
     const klass = result.class || incident.class;
     // Only promote open → triaged; never pull a fixing/testing incident back.
     const status =
-      result.status !== "triage_failed" && incident.status === "open"
+      !["triage_failed", "triage_cancelled"].includes(result.status) && incident.status === "open"
         ? "triaged"
         : incident.status;
     updateIncident(id, {
@@ -197,7 +197,7 @@ export function applyResult(result) {
   addIncidentEvent(id, "fix_result", result.summary || result.status || "Fix result", result);
 }
 
-const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed"]);
+const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed", "cancelled"]);
 
 /** Hermes fix attempt (vs. token wait / push failure / push-only retry). */
 export function countsAsHermesAttempt(result) {
@@ -249,8 +249,10 @@ export function fixStatusToIncidentStatus(st) {
     case "ready_no_token":
     case "push_failed":
     case "disabled":
+    case "cancelled":
       // Nothing was pushed: back to triaged (fix is committed locally in the
-      // job scratch dir and waits for the fork-push token).
+      // job scratch dir and waits for the fork-push token, or the admin
+      // cancelled the run).
       return "triaged";
     default:
       // needs_human, redaction_blocked, denied, lab_failed, failed, error, …

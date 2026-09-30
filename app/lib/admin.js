@@ -39,6 +39,10 @@ import {
   NO_TOKEN_WARNING,
 } from "./queue.js";
 import { ingestResultsDir, pushRetryJob } from "./results.js";
+import { registerQueueRoutes } from "./admin-queue.js";
+import { workerModel, queueModel } from "./worker-state.js";
+import { renderWorkerPanel } from "./worker-view.js";
+import { currentRevision, encodeRev } from "./live.js";
 import {
   getAllowlist,
   isRepoAllowed,
@@ -117,6 +121,11 @@ export function createAdminRouter() {
     safeIngest();
     const base = req.adminBase;
     const filters = parseFilters(req.query);
+    const caps = capabilities();
+    const redact = displayRedactor();
+    const w = workerModel({ redact, caps });
+    const q = queueModel({ redact, caps, worker: w });
+    const rev = encodeRev(currentRevision());
     const { cards, counts } = boardData();
     res.type("html").send(
       adminLayout({
@@ -130,9 +139,11 @@ export function createAdminRouter() {
           counts,
           filters,
           base,
-          caps: capabilities(),
+          caps: { ...caps, runningJob: w.job },
           status: { token: tokenLabel(), allowlist: getAllowlist() },
           flash: `${readOnlyBanner()}${flash(req.query)}`,
+          panel: renderWorkerPanel(w, q, { base, caps, variant: "board" }),
+          rev,
         }),
       }),
     );
@@ -429,6 +440,16 @@ export function createAdminRouter() {
   });
   router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
 
+  registerQueueRoutes(router, {
+    readOnly: ADMIN_READ_ONLY,
+    capabilities,
+    displayRedactor,
+    cardsFor,
+    wantsJson,
+    flash,
+    readOnlyBanner,
+  });
+
   // Silence unused import warning for getDb if tree-shaken oddly — keep for parity / future
   void getDb;
 
@@ -505,11 +526,36 @@ function drawerModel(id) {
   return buildDrawerModel(incident, listIncidentEvents(id, { limit: 500 }), listFixAttempts(id), displayRedactor());
 }
 
+function runningCaps() {
+  const caps = capabilities();
+  try {
+    return { ...caps, runningJob: workerModel({ caps }).job };
+  } catch {
+    return caps;
+  }
+}
+
 function cardPayload(id, base) {
   const incident = getIncident(id);
   if (!incident) return {};
   const card = buildCardModel(incident, listIncidentEvents(id, { limit: 500 }), listFixAttempts(id), displayRedactor());
-  return { incident: { id: card.id, status: card.status, class: card.klass }, card, card_html: renderCard(card, base, capabilities()) };
+  return { incident: { id: card.id, status: card.status, class: card.klass }, card, card_html: renderCard(card, base, runningCaps()) };
+}
+
+/** Rendered cards for live patches: { cards: [{id, status, column, needed, html}], need_total }. */
+function cardsFor(ids, base, caps) {
+  const all = ids === "all";
+  const incidents = all ? listIncidents({ limit: 500 }) : ids.map((id) => getIncident(id)).filter(Boolean);
+  const list = incidents.map((i) => i.id);
+  const events = listEventsForIncidents(list);
+  const attempts = listFixAttemptsForIncidents(list);
+  const redact = displayRedactor();
+  const now = new Date();
+  const cards = incidents.map((i) => {
+    const c = buildCardModel(i, events.get(i.id) || [], attempts.get(i.id) || [], redact, { now });
+    return { id: c.id, status: c.status, column: c.column, needed: c.needed, html: renderCard(c, base, caps) };
+  });
+  return { cards, full: all };
 }
 
 /** Redirect target: board (return_to=board) or the staff incident page. */

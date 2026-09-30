@@ -3,7 +3,8 @@
 # Exchange dirs (queue/*, results) are created by the ops module for every host
 # (owner = Neo core uid, group = Neo core gid, 2770 setgid). Here we only:
 #  - add hermes to the Neo core group so the worker can claim jobs / write results;
-#  - install the path + oneshot worker units and the two Hermes skills.
+#  - install the path + oneshot worker units and the two Hermes skills;
+#  - install the root kick timer (self-lockout watchdog, see below).
 {self, ...}: {
   flake.modules.nixos.ops-autofix = {
     config,
@@ -48,6 +49,7 @@
         "queue/processing"
         "queue/done"
         "queue/failed"
+        "queue/control"
         "results"
       ];
       # Runs as root (ExecStartPre=+) so a root-owned leftover never blocks the worker.
@@ -134,13 +136,18 @@
 
         # Container writes /data/queue/<kind>/*.json == ${queueRoot}/<kind>/*.json on the host.
         # Only watch enabled kinds; the worker also ignores disabled kinds.
+        # PathChanged (edge: a job file appears) instead of PathExistsGlob (level):
+        # with the queue paused, or a job the worker leaves pending, a level trigger
+        # re-fires as soon as the oneshot exits and hits the start limit, which
+        # fails the path unit too (self-lockout). The worker drains until empty;
+        # heimcloud-ops-worker-kick.timer covers anything enqueued while it exits.
         systemd.paths.heimcloud-ops-worker = mkIf workerOn {
           description = "Watch Heimcloud Ops autofix queue";
           wantedBy = ["multi-user.target"];
           pathConfig = {
-            PathExistsGlob =
-              optional triageOn "${queueRoot}/triage/*.json"
-              ++ optionals fixOn ["${queueRoot}/fix/*.json" "${queueRoot}/push/*.json"];
+            PathChanged =
+              optional triageOn "${queueRoot}/triage"
+              ++ optionals fixOn ["${queueRoot}/fix" "${queueRoot}/push"];
             Unit = "heimcloud-ops-worker.service";
           };
         };
@@ -157,6 +164,11 @@
           path = workerPath;
           unitConfig = {
             ConditionPathExists = [opsAppdata];
+            # Default is 5 starts / 10 s: a burst of Start triage clicks against an
+            # idle worker could trip it. The worker exits 0 on per-job errors, so
+            # the unit only fails on real breakage; the kick timer resets it.
+            StartLimitIntervalSec = 120;
+            StartLimitBurst = 30;
           };
           serviceConfig = {
             Type = "oneshot";
@@ -173,6 +185,40 @@
             Environment = workerEnv;
             # Required (fail-closed): without extra slugs the redaction gate is weaker.
             EnvironmentFile = mkIf (af.redactExtraSlugsFile != null) [af.redactExtraSlugsFile];
+          };
+        };
+
+        # Self-lockout watchdog (root, every 2 min): reset-failed on a failed /
+        # start-limited worker path or service while jobs are pending, restart the
+        # path watch if it is down, start the worker when jobs wait and the queue is
+        # not paused, and report unit health to queue/systemd-status.json for the
+        # admin worker panel. Only systemctl + that one file; no job handling.
+        systemd.services.heimcloud-ops-worker-kick = mkIf workerOn {
+          description = "Heimcloud Ops autofix worker watchdog";
+          path = [workerPkg pkgs.nodejs_22 config.systemd.package];
+          unitConfig.ConditionPathExists = [opsAppdata];
+          serviceConfig = {
+            Type = "oneshot";
+            UMask = "0027";
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            ExecStart = "${workerPkg}/bin/heimcloud-ops-worker --kick";
+            Environment =
+              [
+                "OPS_DATA_DIR=${opsAppdata}"
+                "OPS_SYSTEMCTL_BIN=${config.systemd.package}/bin/systemctl"
+              ]
+              ++ optional triageOn "OPS_AUTOFIX_TRIAGE=1"
+              ++ optional fixOn "OPS_AUTOFIX_FIX=1";
+          };
+        };
+        systemd.timers.heimcloud-ops-worker-kick = mkIf workerOn {
+          description = "Heimcloud Ops autofix worker watchdog";
+          wantedBy = ["timers.target"];
+          timerConfig = {
+            OnBootSec = "2min";
+            OnUnitActiveSec = "2min";
+            AccuracySec = "15s";
           };
         };
 

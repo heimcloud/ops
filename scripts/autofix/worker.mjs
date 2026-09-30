@@ -17,8 +17,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   redactIdentifyingDetails,
   findIdentifierHits,
@@ -26,6 +26,19 @@ import {
   mergeKnownSlugs,
 } from "./redact.js";
 import { buildCompareUrl } from "./compare.js";
+import {
+  listPending,
+  readPause,
+  cancelFile,
+  cancelRequested,
+  reasonFile,
+  atomicWriteJson,
+  controlDir,
+} from "./queue-control.js";
+
+const WORKER_FILE = fileURLToPath(import.meta.url);
+/** A job whose run died this many times (claims without a finish) is quarantined. */
+export const POISON_CLAIMS = 2;
 
 const TRUE = ["1", "true", "yes", "on"];
 const FALSE = ["0", "false", "no", "off"];
@@ -63,7 +76,12 @@ export function config() {
     hermesBin: e.HERMES_BIN || "hermes",
     envBin: e.OPS_AUTOFIX_ENV_BIN || "heimcloud-autofix-env",
     labBin: e.OPS_AUTOFIX_LAB_TEST_BIN || "heimcloud-lab-test",
-    hermesTimeoutMs: Math.max(60, Number(e.OPS_AUTOFIX_HERMES_TIMEOUT_SEC || 2700)) * 1000,
+    hermesTimeoutMs: Math.max(1, Number(e.OPS_AUTOFIX_HERMES_TIMEOUT_SEC || 2700)) * 1000,
+    // Heartbeat into worker-status.json while a long child (Hermes, clone, lab) runs.
+    heartbeatMs: Math.max(200, Number(e.OPS_AUTOFIX_HEARTBEAT_SEC || 30) * 1000),
+    // SIGTERM -> SIGKILL grace for a timed-out / cancelled process group.
+    killGraceMs: Math.max(100, Number(e.OPS_AUTOFIX_KILL_GRACE_SEC || 10) * 1000),
+    cancelPollMs: Math.max(50, Number(e.OPS_AUTOFIX_CANCEL_POLL_MS || 2000)),
     labTimeoutMs: Math.max(60, Number(e.OPS_AUTOFIX_LAB_TIMEOUT_SEC || 1800)) * 1000,
     scratchRoot: e.OPS_AUTOFIX_SCRATCH || path.join(os.homedir(), "workspace", "autofix"),
     forkUrl: e.OPS_AUTOFIX_FORK_URL || "https://github.com/heimcloud/neo.git",
@@ -85,7 +103,7 @@ export function readNeoBaseRef() {
 
 // ---------------------------------------------------------------- lock
 
-export function tryLock(lockPath) {
+export function tryLock(lockPath, info = {}) {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   for (let i = 0; i < 2; i += 1) {
     try {
@@ -111,6 +129,7 @@ export function tryLock(lockPath) {
         }
       }
       if (alive) return null;
+      info.reclaimed = pid || true;
       try {
         fs.unlinkSync(lockPath);
       } catch {
@@ -142,6 +161,7 @@ function mkdirs(cfg) {
     path.join(cfg.queue, "processing"),
     path.join(cfg.queue, "done"),
     path.join(cfg.queue, "failed"),
+    controlDir(cfg.queue),
     cfg.results,
   ]) {
     try {
@@ -158,30 +178,13 @@ export function enabledKinds(cfg) {
   return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : cfg.fixOn));
 }
 
+/**
+ * Pending jobs of enabled kinds in claim order: priority (control/priority.json,
+ * written by the admin), then manual rank, then kind (push > triage > fix),
+ * then enqueue time. Re-read before every claim.
+ */
 export function listJobs(cfg) {
-  const out = [];
-  for (const kind of enabledKinds(cfg)) {
-    const dir = path.join(cfg.queue, kind);
-    let names = [];
-    try {
-      names = fs.readdirSync(dir);
-    } catch {
-      continue;
-    }
-    for (const f of names) {
-      if (!f.endsWith(".json") || f.includes(".tmp-")) continue;
-      const file = path.join(dir, f);
-      let mtime = 0;
-      try {
-        mtime = fs.statSync(file).mtimeMs;
-      } catch {
-        continue;
-      }
-      out.push({ kind, name: f, file, mtime });
-    }
-  }
-  out.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
-  return out;
+  return listPending(cfg.queue, enabledKinds(cfg));
 }
 
 /** Atomic claim: rename into queue/processing. Returns processing path or null. */
@@ -196,8 +199,10 @@ export function claimJob(cfg, job) {
   }
 }
 
-function finish(cfg, processingFile, bucket) {
-  const dest = path.join(cfg.queue, bucket, path.basename(processingFile));
+function finish(cfg, processingFile, bucket, reason = null) {
+  const name = path.basename(processingFile);
+  const dir = path.join(cfg.queue, bucket);
+  const dest = path.join(dir, name);
   try {
     fs.renameSync(processingFile, dest);
   } catch {
@@ -207,46 +212,232 @@ function finish(cfg, processingFile, bucket) {
       /* ignore */
     }
   }
+  if (reason) {
+    // Best effort (the disk may be full): the admin queue view shows it.
+    try {
+      atomicWriteJson(reasonFile(dir, name), { ...reason, at: new Date().toISOString() });
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    fs.rmSync(cancelFile(cfg.queue, name), { force: true });
+  } catch {
+    /* ignore */
+  }
 }
 
 export function writeResult(cfg, processingFile, result) {
   fs.mkdirSync(cfg.results, { recursive: true });
   const dest = path.join(cfg.results, path.basename(processingFile));
   const tmp = `${dest}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify({ ...result, finished_at: new Date().toISOString() }, null, 2), {
-    mode: 0o660,
-  });
-  fs.renameSync(tmp, dest);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ ...result, finished_at: new Date().toISOString() }, null, 2), {
+      mode: 0o660,
+    });
+    fs.renameSync(tmp, dest);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
   return dest;
 }
 
-/** A previous run died mid-job (lock is ours now, so anything here is stale). */
+/** Result/bucket bookkeeping that must never throw out of the job loop. */
+function safeWriteResult(cfg, processingFile, result) {
+  if (!result?.incident_id) return { ok: true };
+  try {
+    writeResult(cfg, processingFile, result);
+    return { ok: true };
+  } catch (err) {
+    const code = err.code || "error";
+    log(`cannot write result for ${path.basename(processingFile)}: ${code}`);
+    addIssue(cfg, "results_unwritable", `Result for incident #${result.incident_id} could not be written (${code}); job moved to failed.`, {
+      incident_id: result.incident_id,
+      job: path.basename(processingFile),
+    });
+    return { ok: false, code };
+  }
+}
+
+function failureStatus(kind) {
+  return kind === "triage" ? "triage_failed" : kind === "push" ? "push_failed" : "needs_human";
+}
+
+function failureResult(kind, incidentId, summary, extra = {}) {
+  return {
+    kind: kind === "push" ? "fix" : kind,
+    incident_id: incidentId,
+    status: failureStatus(kind),
+    ...(kind === "push" ? { via: "push-pending" } : {}),
+    summary,
+    ...extra,
+  };
+}
+
+/**
+ * Jobs left in processing/ by a run that died (lock is ours now, so anything
+ * here is stale). Claims are counted in the job file: the first crash puts the
+ * job back into its queue, the POISON_CLAIMS-th quarantines it in failed/
+ * ("crashed worker") so one bad job cannot crash-loop the worker.
+ */
 export function recoverStale(cfg) {
   const dir = path.join(cfg.queue, "processing");
   let names = [];
   try {
     names = fs.readdirSync(dir);
   } catch {
-    return 0;
+    return { requeued: 0, quarantined: 0, failed: 0 };
   }
-  let n = 0;
+  const out = { requeued: 0, quarantined: 0, failed: 0 };
   for (const f of names) {
-    if (!f.endsWith(".json")) continue;
-    const m = /^(triage|fix|push)-(\d+)-/.exec(f);
+    if (!f.endsWith(".json") || f.includes(".tmp-")) continue;
     const full = path.join(dir, f);
-    if (m) {
-      writeResult(cfg, full, {
-        kind: m[1] === "push" ? "fix" : m[1],
-        incident_id: Number(m[2]),
-        status: m[1] === "triage" ? "triage_failed" : m[1] === "push" ? "push_failed" : "needs_human",
-        ...(m[1] === "push" ? { via: "push-pending", push_error: "interrupted" } : {}),
-        summary: "Worker was interrupted (timeout/kill) while processing this job; re-enqueue from the admin UI.",
+    try {
+      const m = /^(triage|fix|push)-((\d+)-[A-Za-z0-9-]+\.json)$/.exec(f);
+      let job = null;
+      try {
+        job = JSON.parse(fs.readFileSync(full, "utf8"));
+      } catch {
+        job = null;
+      }
+      const incidentId = Number(job?.incident_id || m?.[3] || 0);
+      if (!m || !job || typeof job !== "object") {
+        if (m) safeWriteResult(cfg, full, failureResult(m[1], incidentId, "Worker was interrupted on a malformed job file; re-enqueue from the admin UI."));
+        finish(cfg, full, "failed", { code: "malformed_job", reason: "malformed job JSON (interrupted)" });
+        addIssue(cfg, "malformed_job", `Malformed job ${f} moved to failed.`, { job: f });
+        out.failed += 1;
+        continue;
+      }
+      const kind = m[1];
+      const claims = Math.max(1, Number(job._claims) || 1);
+      if (cancelRequested(cfg.queue, f)) {
+        safeWriteResult(cfg, full, cancelledResult(kind, job, "interrupted"));
+        finish(cfg, full, "failed", { code: "cancelled", reason: "cancelled by admin (worker was interrupted)" });
+        out.failed += 1;
+        continue;
+      }
+      if (claims < POISON_CLAIMS) {
+        fs.renameSync(full, path.join(cfg.queue, kind, m[2]));
+        log(`requeued interrupted ${kind} job ${m[2]} (claim ${claims}/${POISON_CLAIMS})`);
+        addIssue(cfg, "requeued_after_crash", `Interrupted ${kind} job for incident #${incidentId} was requeued once (claim ${claims}/${POISON_CLAIMS}).`, {
+          incident_id: incidentId,
+          job: f,
+        });
+        out.requeued += 1;
+        continue;
+      }
+      safeWriteResult(
+        cfg,
+        full,
+        failureResult(
+          kind,
+          incidentId,
+          `Quarantined: the worker crashed or was killed ${claims} times while processing this job (crashed worker). Re-enqueue from the admin UI once the cause is fixed.`,
+          kind === "push" ? { push_error: "interrupted", job: job.job } : {},
+        ),
+      );
+      finish(cfg, full, "failed", { code: "crashed_worker", reason: `crashed worker (${claims} claims)`, claims });
+      log(`quarantined poison ${kind} job ${m[2]} after ${claims} claims`);
+      addIssue(cfg, "poison_quarantined", `Poison ${kind} job for incident #${incidentId} quarantined after ${claims} crashed runs.`, {
+        incident_id: incidentId,
+        job: f,
       });
+      out.quarantined += 1;
+    } catch (err) {
+      log(`cannot recover ${f}: ${err.code || err.message}`);
+      addIssue(cfg, "queue_unwritable", `Stale job ${f} could not be recovered (${err.code || err.message}).`, { job: f });
     }
-    finish(cfg, full, "failed");
-    n += 1;
   }
-  return n;
+  return out;
+}
+
+// ---------------------------------------------------------------- status
+
+/**
+ * queue/worker-status.json: the only channel from the host worker to the admin
+ * UI (the app runs in a container and shares just the exchange dirs). Written
+ * atomically at every stage transition and every heartbeatMs while a child
+ * runs. Keeps the v1 token fields (fork_push_token, reason, checked_at).
+ * Never contains the token, identifiers or raw log output.
+ */
+export function statusPath(cfg) {
+  return path.join(cfg.queue, "worker-status.json");
+}
+
+export function readStatus(cfg) {
+  try {
+    const st = JSON.parse(fs.readFileSync(statusPath(cfg), "utf8"));
+    return st && typeof st === "object" ? st : {};
+  } catch {
+    return {};
+  }
+}
+
+let statusWarned = false;
+export function updateStatus(cfg, patch, { heartbeat = true } = {}) {
+  const now = new Date().toISOString();
+  const next = { ...readStatus(cfg), ...patch, version: 2, updated_at: now };
+  if (heartbeat) next.heartbeat_at = now;
+  for (const [k, v] of Object.entries(next)) if (v === undefined) delete next[k];
+  try {
+    atomicWriteJson(statusPath(cfg), next);
+    statusWarned = false;
+  } catch (err) {
+    if (!statusWarned) console.error(`heimcloud-ops-worker: cannot write ${statusPath(cfg)}: ${err.code || err.message}`);
+    statusWarned = true;
+  }
+  return next;
+}
+
+const MAX_ISSUES = 20;
+/** Lockout / recovery notes shown in the admin worker panel (newest first). */
+export function addIssue(cfg, code, message, extra = {}) {
+  const st = readStatus(cfg);
+  const issues = Array.isArray(st.issues) ? st.issues : [];
+  const entry = { code, message: redactIdentifyingDetails(message, { knownSlugs: [] }), at: new Date().toISOString(), ...extra };
+  updateStatus(cfg, { issues: [entry, ...issues].slice(0, MAX_ISSUES) }, { heartbeat: false });
+}
+
+/** Stage transition of the running job (+ cancel checkpoint unless disabled). */
+let currentJob = null;
+export function stage(cfg, name, extra = {}, { checkCancel = true } = {}) {
+  if (!currentJob) return;
+  currentJob = { ...currentJob, stage: name, stage_at: new Date().toISOString(), ...extra };
+  updateStatus(cfg, { state: "running", pid: process.pid, job: currentJob });
+  if (checkCancel && cancelRequested(cfg.queue, currentJob.processing)) throw new JobCancelled(name);
+}
+
+export class JobCancelled extends Error {
+  constructor(stageName) {
+    super(`cancelled by admin during ${stageName}`);
+    this.stage = stageName;
+  }
+}
+
+/** Result for a job cancelled from the admin: leaves the incident in a sane status. */
+export function cancelledResult(kind, job, stageName) {
+  const incidentId = Number(job?.incident_id || 0);
+  const at = stageName ? ` during ${stageName}` : "";
+  if (kind === "triage") {
+    return { kind: "triage", incident_id: incidentId, status: "triage_cancelled", summary: `Triage cancelled by admin${at}.` };
+  }
+  if (kind === "push") {
+    return {
+      kind: "fix",
+      via: "push-pending",
+      incident_id: incidentId,
+      job: job?.job,
+      status: "push_failed",
+      push_error: "cancelled",
+      summary: `Push cancelled by admin${at}; the saved fix is kept (Retry push when ready).`,
+    };
+  }
+  return { kind: "fix", incident_id: incidentId, status: "cancelled", summary: `Fix cancelled by admin${at}; nothing was pushed.` };
 }
 
 // ---------------------------------------------------------------- helpers
@@ -254,6 +445,7 @@ export function recoverStale(cfg) {
 export function run(cmd, args, opts = {}) {
   const env = { ...process.env, ...(opts.env || {}) };
   for (const k of opts.unsetEnv || []) delete env[k];
+  if (opts.supervise) return runSupervised(cmd, args, { ...opts, env });
   const r = spawnSync(cmd, args, {
     encoding: "utf8",
     env,
@@ -267,6 +459,139 @@ export function run(cmd, args, opts = {}) {
     stderr: r.stderr || "",
     error: r.error ? r.error.code || r.error.message : null,
   };
+}
+
+const SUPERVISE_MARK = "@@heimcloud-ops-supervise ";
+
+/**
+ * Long children (Hermes, clone, push, lab) run under a small supervisor process
+ * (`worker.mjs --supervise <spec>`), because spawnSync's timeout only kills the
+ * direct child: the supervisor starts the command in its OWN process group,
+ * writes heartbeats into worker-status.json, polls the admin cancel flag, and on
+ * timeout/cancel sends SIGTERM to the whole group, then SIGKILL after a grace.
+ * Returns the run() shape; error is "ETIMEDOUT" or "CANCELLED" for those cases.
+ */
+export function runSupervised(cmd, args, opts = {}) {
+  const sup = opts.supervise || {};
+  const timeoutMs = opts.timeout || 600_000;
+  const spec = {
+    cmd,
+    args,
+    timeoutMs,
+    graceMs: sup.graceMs || 10_000,
+    pollMs: sup.pollMs || 2000,
+    heartbeatMs: sup.heartbeatMs || 30_000,
+    statusFile: sup.statusFile || null,
+    cancelFile: sup.cancelFile || null,
+  };
+  const r = spawnSync(process.execPath, [WORKER_FILE, "--supervise", JSON.stringify(spec)], {
+    encoding: "utf8",
+    env: opts.env || process.env,
+    cwd: opts.cwd || process.cwd(),
+    // Last resort only; the supervisor enforces timeoutMs itself.
+    timeout: timeoutMs + spec.graceMs + 60_000,
+    killSignal: "SIGTERM",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  let stderr = r.stderr || "";
+  let outcome = null;
+  const at = stderr.lastIndexOf(SUPERVISE_MARK);
+  if (at >= 0) {
+    try {
+      outcome = JSON.parse(stderr.slice(at + SUPERVISE_MARK.length).split("\n")[0]);
+    } catch {
+      outcome = null;
+    }
+    stderr = stderr.slice(0, at);
+  }
+  let error = r.error ? r.error.code || r.error.message : null;
+  if (outcome?.outcome === "timeout") error = "ETIMEDOUT";
+  else if (outcome?.outcome === "cancelled") error = "CANCELLED";
+  else if (outcome?.outcome === "spawn_error") error = outcome.error || "spawn_error";
+  return {
+    status: outcome && outcome.outcome === "exit" ? outcome.code : outcome ? null : r.status,
+    stdout: r.stdout || "",
+    stderr,
+    error,
+    killed_group: Boolean(outcome?.killed_group),
+  };
+}
+
+function superviseOpts(cfg, { cancel = true } = {}) {
+  return {
+    graceMs: cfg.killGraceMs,
+    pollMs: cfg.cancelPollMs,
+    heartbeatMs: cfg.heartbeatMs,
+    statusFile: statusPath(cfg),
+    cancelFile: cancel && currentJob ? cancelFile(cfg.queue, currentJob.processing) : null,
+  };
+}
+
+/** Entry for `--supervise <spec json>` (see runSupervised). */
+export function superviseMain(specJson) {
+  const spec = JSON.parse(specJson);
+  let outcome = null;
+  let killedGroup = false;
+  let done = false;
+  let child;
+  const killGroup = (sig) => {
+    try {
+      process.kill(-child.pid, sig);
+      killedGroup = true;
+    } catch {
+      /* group already gone */
+    }
+  };
+  const stop = (why) => {
+    if (outcome || done) return;
+    outcome = why;
+    killGroup("SIGTERM");
+    setTimeout(() => killGroup("SIGKILL"), spec.graceMs).unref();
+  };
+  const end = (res) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    clearInterval(poll);
+    process.stderr.write(`\n${SUPERVISE_MARK}${JSON.stringify({ ...res, killed_group: killedGroup })}\n`, () => {
+      process.exit(res.outcome === "exit" && Number.isInteger(res.code) ? res.code : 1);
+    });
+  };
+  let lastBeat = Date.now();
+  const beat = () => {
+    if (!spec.statusFile || Date.now() - lastBeat < spec.heartbeatMs) return;
+    lastBeat = Date.now();
+    try {
+      const st = JSON.parse(fs.readFileSync(spec.statusFile, "utf8"));
+      st.heartbeat_at = new Date().toISOString();
+      atomicWriteJson(spec.statusFile, st);
+    } catch {
+      /* best effort */
+    }
+  };
+  try {
+    child = spawn(spec.cmd, spec.args, { stdio: ["ignore", "inherit", "inherit"], detached: true });
+  } catch (err) {
+    end({ outcome: "spawn_error", error: err.code || err.message });
+    return;
+  }
+  const timer = setTimeout(() => stop("timeout"), spec.timeoutMs);
+  const poll = setInterval(() => {
+    if (spec.cancelFile && fs.existsSync(spec.cancelFile)) stop("cancelled");
+    beat();
+  }, spec.pollMs);
+  child.on("error", (err) => end({ outcome: "spawn_error", error: err.code || err.message }));
+  child.on("exit", (code, signal) => {
+    // Leader gone: take down anything it left behind in its group.
+    killGroup(outcome ? "SIGKILL" : "SIGTERM");
+    end(outcome ? { outcome, code, signal } : { outcome: "exit", code, signal });
+  });
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(sig, () => {
+      killGroup("SIGKILL");
+      process.exit(143);
+    });
+  }
 }
 
 function gitEnv() {
@@ -393,6 +718,7 @@ function hermesChat(cfg, skill, promptPath, { cwd, logPath }) {
   const r = run(cfg.hermesBin, hermesArgs(skill, promptPath), {
     cwd,
     timeout: cfg.hermesTimeoutMs,
+    supervise: superviseOpts(cfg),
     env: gitEnv(),
     unsetEnv: ["GH_TOKEN", "GITHUB_TOKEN", "GH_PR_TOKEN", "OPS_GITHUB_TOKEN"],
   });
@@ -407,12 +733,18 @@ function hermesChat(cfg, skill, promptPath, { cwd, logPath }) {
       /* ignore */
     }
   }
+  if (r.error === "CANCELLED") throw new JobCancelled(currentJob?.stage || "hermes");
+  if (r.error === "ETIMEDOUT") {
+    addIssue(cfg, "hermes_killed", `Hermes hit the ${Math.round(cfg.hermesTimeoutMs / 1000)} s timeout; its whole process group was killed.`, {
+      incident_id: currentJob?.incident_id,
+    });
+  }
   return r;
 }
 
 function hermesFailure(r) {
   if (r.error === "ENOENT") return "hermes CLI not found on PATH";
-  if (r.error === "ETIMEDOUT") return "hermes timed out";
+  if (r.error === "ETIMEDOUT") return "hermes timed out (process group killed)";
   if (r.error) return `hermes spawn error ${r.error}`;
   return `hermes exit ${r.status}`;
 }
@@ -439,6 +771,7 @@ export function handleTriage(cfg, job, ctx) {
     ].join("\n"),
   );
   const logPath = path.join(ctx.scratch, "triage-hermes.log");
+  stage(cfg, "hermes", { attempt: 1, max_attempts: 1 });
   const r = hermesChat(cfg, "heimcloud-ops-triage", prompt, { cwd: ctx.scratch, logPath });
   const verdict = extractJson(r.stdout) || extractJson(r.stderr);
   if (!verdict) {
@@ -509,8 +842,9 @@ function cloneNeo(cfg, neoDir) {
     const r = run(
       "git",
       ["clone", "--filter=blob:none", "--branch", ref, url, neoDir],
-      { env: gitEnv(), timeout: 900_000, unsetEnv: ["GH_TOKEN", "GITHUB_TOKEN"] },
+      { env: gitEnv(), timeout: 900_000, unsetEnv: ["GH_TOKEN", "GITHUB_TOKEN"], supervise: superviseOpts(cfg) },
     );
+    if (r.error === "CANCELLED") throw new JobCancelled("cloning");
     if (r.status === 0) return { ok: true, url, ref };
     errors.push(`${url}@${ref}: ${tail(r.stderr || r.error, 300)}`);
   }
@@ -543,7 +877,10 @@ function labTest(cfg, branch, klass = "default") {
   const which = run("bash", ["-c", 'command -v -- "$1"', "_", cfg.labBin], { timeout: 10_000 });
   const bin = which.status === 0 ? which.stdout.trim() : "";
   if (!bin) return { skipped: true };
-  const r = run(bin, [branch, klass || "default"], { timeout: cfg.labTimeoutMs });
+  stage(cfg, "lab", {}, { checkCancel: false });
+  const r = run(bin, [branch, klass || "default"], { timeout: cfg.labTimeoutMs, supervise: superviseOpts(cfg) });
+  // Already pushed: a cancel here only stops the lab test (the branch stays).
+  if (r.error === "CANCELLED") return { skipped: true, cancelled: true };
   return {
     skipped: false,
     ok: r.status === 0,
@@ -655,7 +992,7 @@ function pushAndLab(cfg, neoDir, branch, klass) {
   const push = run(
     cfg.envBin,
     ["git", "-C", neoDir, "push", "--force", "fork", `HEAD:refs/heads/${branch}`],
-    { env: gitEnv(), timeout: 900_000 },
+    { env: gitEnv(), timeout: 900_000, supervise: superviseOpts(cfg, { cancel: false }) },
   );
   if (push.status !== 0) {
     // Journal only, with any URL userinfo stripped; never in results/DB.
@@ -669,6 +1006,7 @@ export function handleFix(cfg, job, ctx) {
   const base = { kind: "fix", incident_id: job.incident_id, base_ref: cfg.baseRef };
   fs.mkdirSync(ctx.scratch, { recursive: true });
   const neoDir = path.join(ctx.scratch, "neo");
+  stage(cfg, "cloning");
   const clone = cloneNeo(cfg, neoDir);
   if (!clone.ok) {
     return { ...base, status: "needs_human", summary: `git clone failed: ${clone.error}` };
@@ -688,6 +1026,7 @@ export function handleFix(cfg, job, ctx) {
     const prompt = path.join(ctx.scratch, `fix-prompt-${attempt}.txt`);
     fs.writeFileSync(prompt, fixPrompt(job, neoDir, cfg, attempt, previousFailure));
     const logPath = path.join(ctx.scratch, `fix-hermes-${attempt}.log`);
+    stage(cfg, "hermes", { attempt, max_attempts: cfg.maxAttempts });
     const r = hermesChat(cfg, "heimcloud-ops-fix", prompt, { cwd: neoDir, logPath });
     const verdict = extractJson(r.stdout) || extractJson(r.stderr) || {};
     const common = { ...base, attempts: attempt, max_attempts: cfg.maxAttempts, base_sha: baseSha, evidence_path: logPath };
@@ -712,6 +1051,7 @@ export function handleFix(cfg, job, ctx) {
       "",
     ].join("\n");
 
+    stage(cfg, "checks");
     const gate = gateCommits(cfg, neoDir, baseSha, { branch, prTitle, prBody, slugs });
     if (!gate.ok) {
       const res = { ...common, branch, ...gate.result };
@@ -749,6 +1089,7 @@ export function handleFix(cfg, job, ctx) {
       pending_path: path.join(ctx.scratch, PENDING_FILE),
       head_sha: pending.head_sha,
     });
+    stage(cfg, "push");
     const token = tokenAvailable(cfg);
     if (!token.ok) {
       return {
@@ -777,7 +1118,9 @@ export function handleFix(cfg, job, ctx) {
         ...last,
         status: "awaiting_lab_test",
         lab: "skipped",
-        summary: `Branch pushed; compare link ready. ${cfg.labBin} is not installed, so the lab test was skipped — test manually before opening the PR.`,
+        summary: lab.cancelled
+          ? "Branch pushed; compare link ready. The lab test was cancelled by admin — test manually before opening the PR."
+          : `Branch pushed; compare link ready. ${cfg.labBin} is not installed, so the lab test was skipped — test manually before opening the PR.`,
       };
     }
     if (lab.ok) {
@@ -944,11 +1287,13 @@ function pushPendingLocked(cfg, scratch) {
     git(neoDir, ["remote", "add", "fork", cfgP.forkUrl]);
   }
   const slugs = knownSlugs(cfgP);
+  stage(cfgP, "checks");
   const gate = gateCommits(cfgP, neoDir, p.base_sha, { branch: p.branch, prTitle: p.pr_title, prBody: p.pr_body, slugs });
   if (!gate.ok) {
     fs.renameSync(pendingPath, `${pendingPath}.blocked`);
     return { ...baseRes, ...gate.result, pending_path: undefined };
   }
+  stage(cfgP, "push");
   const token = tokenAvailable(cfgP);
   if (!token.ok) {
     return { ...baseRes, status: "ready_no_token", summary: `Fix branch ${p.branch} still waiting for the fork-push token (${token.reason}). ${retryHint(jobName)}` };
@@ -959,73 +1304,277 @@ function pushPendingLocked(cfg, scratch) {
   }
   fs.renameSync(pendingPath, `${pendingPath}.done`);
   const common = { ...baseRes, pending_path: undefined, compare_url: pushed.compare_url, pr_title: p.pr_title, pr_body: p.pr_body };
-  if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; compare link ready. Lab test skipped (not installed) — test manually.` };
+  if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; compare link ready. Lab test ${pushed.lab.cancelled ? "cancelled by admin" : "skipped (not installed)"} — test manually.` };
   if (pushed.lab.ok) return { ...common, status: "compare_ready", lab: "passed", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; lab test passed.` };
   return { ...common, compare_url: undefined, status: "needs_human", lab: "failed", summary: `Saved fix pushed but lab test failed (no Hermes retry in push mode): ${tail(redactIdentifyingDetails(pushed.lab.output, { knownSlugs: slugs }), 500)}` };
 }
 
 // ---------------------------------------------------------------- main
 
+function shortSummary(s, n = 240) {
+  const t = redactIdentifyingDetails(String(s || ""), { knownSlugs: [] }).replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
 export function processOne(cfg, entry) {
   const processing = claimJob(cfg, entry);
   if (!processing) return null;
-  let job;
+  const pname = path.basename(processing);
+  const m = /^(\d+)-/.exec(entry.name);
+  const idFromName = Number((m && m[1]) || 0);
+  let job = null;
   let result;
   let bucket = "done";
+  let reason = null;
   const scratch = path.join(cfg.scratchRoot, path.basename(processing, ".json"));
+  const startedAt = new Date().toISOString();
   try {
     job = JSON.parse(fs.readFileSync(processing, "utf8"));
-    if (!job || !Number(job.incident_id)) throw new Error("job without incident_id");
-    log(`${entry.kind} incident ${job.incident_id} (${entry.name})`);
-    const ctx = { scratch, slugs: knownSlugs(cfg) };
-    if (entry.kind === "push") {
-      const jm = JOB_NAME_RE.exec(String(job.job || ""));
-      if (!jm || Number(jm[1]) !== Number(job.incident_id)) throw new Error("push job needs a matching fix job name");
-      result = pushPending(cfg, path.join(cfg.scratchRoot, job.job));
-    } else {
-      result = entry.kind === "triage" ? handleTriage(cfg, job, ctx) : handleFix(cfg, job, ctx);
-    }
+    if (!job || typeof job !== "object" || !Number(job.incident_id)) throw new Error("job without incident_id");
   } catch (err) {
+    // Malformed job: never retried, never crashes the loop.
+    job = null;
     bucket = "failed";
-    const m = /^(\d+)-/.exec(entry.name);
-    result = {
-      kind: entry.kind === "push" ? "fix" : entry.kind,
-      incident_id: Number(job?.incident_id || (m && m[1]) || 0),
-      status: entry.kind === "triage" ? "triage_failed" : entry.kind === "push" ? "push_failed" : "needs_human",
-      ...(entry.kind === "push" ? { via: "push-pending" } : {}),
-      summary: `worker error: ${err.message || err}`,
-    };
+    reason = { code: "malformed_job", reason: `malformed job JSON (${err.message})` };
+    addIssue(cfg, "malformed_job", `Malformed ${entry.kind} job ${entry.name} moved to failed.`, { job: pname });
+    result = failureResult(entry.kind, idFromName, `worker error: malformed job file (${err.message}); re-enqueue from the admin UI.`);
   }
-  if (result.incident_id) writeResult(cfg, processing, result);
-  finish(cfg, processing, bucket);
-  log(`${entry.kind} incident ${result.incident_id}: ${result.status}`);
+  if (job) {
+    // Claim counter (poison-job detection in recoverStale). Rename-based
+    // rewrite inside processing/; losing it (disk full) only weakens detection.
+    job._claims = (Number(job._claims) || 0) + 1;
+    job._claimed_at = startedAt;
+    try {
+      atomicWriteJson(processing, job);
+    } catch {
+      /* ignore */
+    }
+    currentJob = {
+      kind: entry.kind,
+      name: entry.name,
+      processing: pname,
+      incident_id: Number(job.incident_id),
+      priority: entry.priority || "normal",
+      claims: job._claims,
+      started_at: startedAt,
+      stage: "claimed",
+      stage_at: startedAt,
+    };
+    try {
+      log(`${entry.kind} incident ${job.incident_id} (${entry.name})`);
+      stage(cfg, "claimed");
+      const ctx = { scratch, slugs: knownSlugs(cfg) };
+      if (entry.kind === "push") {
+        const jm = JOB_NAME_RE.exec(String(job.job || ""));
+        if (!jm || Number(jm[1]) !== Number(job.incident_id)) throw new Error("push job needs a matching fix job name");
+        result = pushPending(cfg, path.join(cfg.scratchRoot, job.job));
+      } else {
+        result = entry.kind === "triage" ? handleTriage(cfg, job, ctx) : handleFix(cfg, job, ctx);
+      }
+    } catch (err) {
+      if (err instanceof JobCancelled) {
+        result = cancelledResult(entry.kind, job, err.stage);
+        reason = { code: "cancelled", reason: `cancelled by admin during ${err.stage}` };
+        bucket = "failed";
+        addIssue(cfg, "job_cancelled", `Running ${entry.kind} job for incident #${job.incident_id} cancelled during ${err.stage}.`, {
+          incident_id: Number(job.incident_id),
+        });
+      } else {
+        bucket = "failed";
+        reason = { code: err.code === "ENOSPC" ? "disk_full" : "worker_error", reason: `worker error: ${shortSummary(err.message || err, 160)}` };
+        result = failureResult(entry.kind, Number(job.incident_id || idFromName), `worker error: ${err.message || err}`);
+        if (err.code === "ENOSPC" || err.code === "EROFS" || err.code === "EACCES") {
+          addIssue(cfg, "results_unwritable", `Job for incident #${job.incident_id} failed writing to disk (${err.code}).`, {
+            incident_id: Number(job.incident_id),
+          });
+        }
+      }
+    }
+  }
+  if (currentJob) stage(cfg, "result", {}, { checkCancel: false });
+  const wrote = safeWriteResult(cfg, processing, result);
+  if (!wrote.ok) {
+    bucket = "failed";
+    reason = { code: "results_unwritable", reason: `result not writable (${wrote.code})` };
+  }
+  finish(cfg, processing, bucket, reason);
+  currentJob = null;
+  updateStatus(cfg, {
+    job: null,
+    last_run: {
+      finished_at: new Date().toISOString(),
+      started_at: startedAt,
+      kind: entry.kind,
+      incident_id: result?.incident_id || idFromName || null,
+      name: entry.name,
+      status: result?.status || "unknown",
+      ok: bucket === "done",
+      reason: reason?.code || null,
+      summary: shortSummary(result?.summary),
+    },
+  });
+  log(`${entry.kind} incident ${result?.incident_id}: ${result?.status}${reason ? ` (${reason.code})` : ""}`);
   return result;
 }
 
 /**
- * queue/worker-status.json: last runtime token check, read by the admin UI to
- * warn that Start fix will end ready_no_token. Never contains the token.
+ * Token check fields of queue/worker-status.json (v1 contract, read by the
+ * admin to warn that Start fix will end ready_no_token). Never the token.
  */
 export function writeWorkerStatus(cfg) {
   const t = tokenAvailable(cfg);
-  const dest = path.join(cfg.queue, "worker-status.json");
-  try {
-    const tmp = `${dest}.tmp-${process.pid}`;
-    fs.writeFileSync(
-      tmp,
-      JSON.stringify({ fork_push_token: t.ok, reason: t.ok ? null : t.reason, checked_at: new Date().toISOString() }),
-      { mode: 0o660 },
-    );
-    fs.renameSync(tmp, dest);
-  } catch (err) {
-    console.error(`heimcloud-ops-worker: cannot write ${dest}: ${err.code || err.message}`);
-  }
+  updateStatus(cfg, { fork_push_token: t.ok, reason: t.ok ? null : t.reason, checked_at: new Date().toISOString() }, { heartbeat: false });
   return t;
+}
+
+// ---------------------------------------------------------------- kick
+
+export const WORKER_UNITS = { path: "heimcloud-ops-worker.path", service: "heimcloud-ops-worker.service" };
+const SHOW_PROPS = ["LoadState", "ActiveState", "SubState", "Result", "ExecMainStatus", "NRestarts", "StateChangeTimestamp"];
+
+function systemctlShow(bin, unit) {
+  const r = run(bin, ["show", unit, "--timestamp=unix", `--property=${SHOW_PROPS.join(",")}`], { timeout: 20_000 });
+  const out = {};
+  for (const line of String(r.stdout || "").split("\n")) {
+    const k = line.indexOf("=");
+    if (k > 0) out[line.slice(0, k)] = line.slice(k + 1).trim();
+  }
+  const ts = /^@(\d+)$/.exec(out.StateChangeTimestamp || "");
+  return {
+    load_state: out.LoadState || (r.status === 0 ? "unknown" : "error"),
+    active_state: out.ActiveState || "unknown",
+    sub_state: out.SubState || "",
+    result: out.Result || "",
+    exec_main_status: out.ExecMainStatus != null && out.ExecMainStatus !== "" ? Number(out.ExecMainStatus) : null,
+    n_restarts: out.NRestarts ? Number(out.NRestarts) : 0,
+    changed_at: ts ? new Date(Number(ts[1]) * 1000).toISOString() : null,
+  };
+}
+
+function unitWedged(u) {
+  return u.active_state === "failed" || /limit-hit/.test(u.result || "");
+}
+
+/**
+ * `heimcloud-ops-worker --kick` (root, from heimcloud-ops-worker-kick.timer):
+ * self-lockout watchdog. reset-failed on wedged worker units when jobs are
+ * pending, restart the path watch if it is down, start the worker if jobs wait
+ * and it is not running (the path unit only fires on changes), and report the
+ * unit health to queue/systemd-status.json for the admin panel.
+ */
+export function kick(cfg, { systemctl = process.env.OPS_SYSTEMCTL_BIN || "systemctl", units = WORKER_UNITS } = {}) {
+  const before = { path: systemctlShow(systemctl, units.path), service: systemctlShow(systemctl, units.service) };
+  let pending = 0;
+  try {
+    pending = listJobs(cfg).length;
+  } catch {
+    pending = 0;
+  }
+  const paused = Boolean(readPause(cfg.queue));
+  const actions = [];
+  const wedged = Object.entries(before).filter(([, u]) => unitWedged(u)).map(([k]) => units[k]);
+  if (wedged.length && pending) {
+    const r = run(systemctl, ["reset-failed", ...wedged], { timeout: 20_000 });
+    actions.push({ action: "reset-failed", units: wedged, ok: r.status === 0 });
+  }
+  if (before.path.load_state === "loaded" && before.path.active_state !== "active") {
+    const r = run(systemctl, ["start", units.path], { timeout: 30_000 });
+    actions.push({ action: "start", units: [units.path], ok: r.status === 0 });
+  }
+  if (pending && !paused && ["inactive", "failed"].includes(before.service.active_state) && before.service.load_state === "loaded") {
+    const r = run(systemctl, ["start", "--no-block", units.service], { timeout: 30_000 });
+    actions.push({ action: "start", units: [units.service], ok: r.status === 0 });
+  }
+  const after = actions.length ? { path: systemctlShow(systemctl, units.path), service: systemctlShow(systemctl, units.service) } : before;
+  const file = path.join(cfg.queue, "systemd-status.json");
+  let prev = {};
+  try {
+    // Runs as root in a container-writable dir: never follow a symlink.
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      prev = JSON.parse(fs.readFileSync(fd, "utf8"));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    prev = {};
+  }
+  const now = new Date().toISOString();
+  const status = {
+    version: 1,
+    checked_at: now,
+    units: after,
+    wedged_before: wedged,
+    pending,
+    paused,
+    actions,
+    last_action_at: actions.length ? now : prev.last_action_at || null,
+    last_actions: actions.length ? actions : prev.last_actions || [],
+  };
+  try {
+    atomicWriteJson(file, status, 0o640);
+  } catch (err) {
+    console.error(`heimcloud-ops-worker: cannot write ${file}: ${err.code || err.message}`);
+  }
+  if (actions.length) log(`kick: ${actions.map((a) => `${a.action} ${a.units.join(" ")}${a.ok ? "" : " (failed)"}`).join("; ")}`);
+  return status;
+}
+
+// ---------------------------------------------------------------- entry
+
+function drain(cfg, lockInfo) {
+  const token = cfg.fixOn ? tokenAvailable(cfg) : null;
+  updateStatus(cfg, {
+    state: "running",
+    pid: process.pid,
+    run_started_at: new Date().toISOString(),
+    job: null,
+    kinds: enabledKinds(cfg),
+    hermes_timeout_sec: Math.round(cfg.hermesTimeoutMs / 1000),
+    lab_timeout_sec: Math.round(cfg.labTimeoutMs / 1000),
+    max_attempts: cfg.maxAttempts,
+    heartbeat_sec: Math.round(cfg.heartbeatMs / 1000),
+    fork_push_token: token ? token.ok : undefined,
+    reason: token ? (token.ok ? null : token.reason) : undefined,
+    checked_at: token ? new Date().toISOString() : undefined,
+  });
+  if (lockInfo.reclaimed) {
+    addIssue(cfg, "stale_lock", "Reclaimed a stale worker lock left by a dead run.");
+  }
+  const rec = recoverStale(cfg);
+  if (rec.requeued || rec.quarantined || rec.failed) {
+    log(`stale processing/: ${rec.requeued} requeued, ${rec.quarantined} quarantined, ${rec.failed} failed`);
+  }
+  let n = 0;
+  let paused = false;
+  while (n < cfg.maxJobs) {
+    // Pause is only honoured between jobs: a running job is never killed by it.
+    if (readPause(cfg.queue)) {
+      paused = true;
+      log("queue paused (control/paused.json); not claiming new jobs");
+      break;
+    }
+    const jobs = listJobs(cfg);
+    if (!jobs.length) break;
+    try {
+      processOne(cfg, jobs[0]);
+    } catch (err) {
+      // Claim/finish I/O failure (unwritable queue dirs): stop this run instead
+      // of spinning; the kick timer retries later.
+      currentJob = null;
+      log(`queue error: ${err.code || err.message}`);
+      addIssue(cfg, "queue_unwritable", `Worker stopped: queue I/O failed (${err.code || "error"}).`);
+      break;
+    }
+    n += 1;
+  }
+  if (!n && !paused) log("no jobs");
+  updateStatus(cfg, { state: paused ? "paused" : "idle", pid: undefined, job: null, run_finished_at: new Date().toISOString() });
 }
 
 export function main(argv = process.argv.slice(2)) {
   if (argv.includes("-h") || argv.includes("--help")) {
-    console.error("usage: heimcloud-ops-worker [--once] | --push-pending <job scratch dir>");
+    console.error("usage: heimcloud-ops-worker [--once] | --push-pending <job scratch dir> | --kick");
     return 2;
   }
   const cfg = config();
@@ -1056,29 +1605,41 @@ export function main(argv = process.argv.slice(2)) {
       unlock(fd, cfg.lock);
     }
   }
+  if (argv.includes("--kick")) {
+    kick(cfg);
+    return 0;
+  }
   if (!enabledKinds(cfg).length) {
     log("no job kinds enabled (OPS_AUTOFIX_TRIAGE / OPS_AUTOFIX_FIX); exiting");
     return 0;
   }
   mkdirs(cfg);
-  const fd = tryLock(cfg.lock);
+  let fd = null;
+  const lockInfo = {};
+  try {
+    fd = tryLock(cfg.lock, lockInfo);
+  } catch (err) {
+    console.error(`heimcloud-ops-worker: cannot take lock: ${err.code || err.message}`);
+    return 0;
+  }
   if (fd == null) {
     log("lock busy; another worker is running");
     return 0;
   }
   try {
-    if (cfg.fixOn) writeWorkerStatus(cfg);
-    const stale = recoverStale(cfg);
-    if (stale) log(`recovered ${stale} interrupted job(s) into queue/failed`);
-    let n = 0;
-    while (n < cfg.maxJobs) {
-      const jobs = listJobs(cfg);
-      if (!jobs.length) break;
-      processOne(cfg, jobs[0]);
-      n += 1;
+    drain(cfg, lockInfo);
+  } catch (err) {
+    // Per-job problems never fail the unit (a failed oneshot + start limit
+    // would wedge the path trigger); the panel shows the issue instead.
+    console.error(`heimcloud-ops-worker: ${err.stack || err.message || err}`);
+    try {
+      addIssue(cfg, "worker_error", `Worker run aborted: ${shortSummary(err.message || err, 160)}`);
+      updateStatus(cfg, { state: "idle", pid: undefined, job: null });
+    } catch {
+      /* ignore */
     }
-    if (!n) log("no jobs");
   } finally {
+    currentJob = null;
     unlock(fd, cfg.lock);
   }
   return 0;
@@ -1087,5 +1648,7 @@ export function main(argv = process.argv.slice(2)) {
 const invokedDirectly =
   process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
 if (invokedDirectly) {
-  process.exitCode = main();
+  const si = process.argv.indexOf("--supervise");
+  if (si >= 0) superviseMain(process.argv[si + 1]);
+  else process.exitCode = main();
 }

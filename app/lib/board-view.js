@@ -22,6 +22,7 @@ import {
   hasActiveFilters,
 } from "./board.js";
 import { resolveTargetRepo } from "./github.js";
+import { liveIndicator, renderRunLine } from "./worker-view.js";
 
 const esc = (s) => escapeHtml(s == null ? "" : s);
 
@@ -259,6 +260,7 @@ export function renderCard(card, base, caps, { hidden = false } = {}) {
         ? `<div class="kc-need" title="${esc(card.reasons.map((r) => r.label).join(" · "))}">${ICONS.alert}<span>${esc(top.label)}</span></div>`
         : ""
     }
+    ${caps.runningJob && caps.runningJob.incidentId === card.id ? renderRunLine(caps.runningJob) : ""}
     ${actions || (!caps.readOnly && card.allowedMoves.length) ? `<div class="kc-actions">${actions}${moveForm(base, card, caps)}</div>` : ""}
   </article>`;
 }
@@ -280,7 +282,7 @@ function uniqSorted(list, cmp) {
 /**
  * @param {{ cards: object[], counts: Record<string,number>, filters: object, base: string, caps: object, status: object, flash?: string }} p
  */
-export function renderBoard({ cards, counts, filters, base, caps, status, flash = "" }) {
+export function renderBoard({ cards, counts, filters, base, caps, status, flash = "", panel = "", rev = "" }) {
   const visibleCols = filters.cols ? new Set(filters.cols) : null;
   const matches = new Map(cards.map((c) => [c.id, cardMatches(c, filters)]));
   const sevs = uniqSorted(
@@ -350,6 +352,8 @@ export function renderBoard({ cards, counts, filters, base, caps, status, flash 
     workerOwned: WORKER_OWNED,
     labels: STATUS_LABELS,
     columns: COLUMNS.map((c) => ({ key: c.key, label: c.label, statuses: c.statuses })),
+    rev,
+    page: "board",
   };
   const statusBits = [
     `triage ${caps.triage ? "on" : "off"}`,
@@ -360,8 +364,10 @@ export function renderBoard({ cards, counts, filters, base, caps, status, flash 
     <div class="board-head">
       <h1>Incidents</h1>
       <p class="board-status muted">Autofix: ${statusBits.map(esc).join(" · ")}${status.allowlist ? ` · allowlist <code>${esc(status.allowlist.join(", "))}</code>` : ""}${caps.readOnly ? ` · <strong class="ro">read-only</strong>` : ""}</p>
+      ${liveIndicator()}
     </div>
     ${flash}
+    <div data-worker-slot>${panel}</div>
     ${filterBar}
     <div class="board" data-board>${columns}</div>
     <div class="drawer-backdrop" data-drawer-backdrop hidden></div>
@@ -370,6 +376,8 @@ export function renderBoard({ cards, counts, filters, base, caps, status, flash 
     </aside>
     <div class="toasts" aria-live="polite" aria-atomic="false" data-toasts></div>
     <script type="application/json" id="board-config">${JSON.stringify(cfg).replace(/</g, "\\u003c")}</script>
+    <script type="application/json" id="live-config">${JSON.stringify({ base, rev, page: "board", readOnly: Boolean(caps.readOnly), now: Date.now() }).replace(/</g, "\\u003c")}</script>
+    <script src="/js/live.js" defer></script>
     <script src="/js/board.js" defer></script>
   </div>`;
 }

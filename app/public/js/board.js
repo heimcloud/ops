@@ -98,7 +98,7 @@
     if (!body) return;
     if (card.parentElement !== body) body.prepend(card);
   }
-  function replaceCard(oldCard, html) {
+  function replaceCard(oldCard, html, { flash = true } = {}) {
     if (!html) return oldCard;
     const tpl = document.createElement("template");
     tpl.innerHTML = html.trim();
@@ -112,10 +112,13 @@
         target.prepend(fresh);
       }
     } else target.prepend(fresh);
+    if (oldCard && oldCard.classList.contains("selected")) fresh.classList.add("selected");
     wireCard(fresh);
     applyFilters(state, { persist: false });
-    fresh.classList.add("flash");
-    setTimeout(() => fresh.classList.remove("flash"), 900);
+    if (flash) {
+      fresh.classList.add("flash");
+      setTimeout(() => fresh.classList.remove("flash"), 900);
+    }
     return fresh;
   }
   function cardById(id) {
@@ -244,6 +247,7 @@
       dragCard = null;
       lastDenied = null;
       clearZones();
+      flushDeferred();
     });
   }
 
@@ -517,6 +521,151 @@
 
   function wireCard() {
     /* delegated handlers; hook kept for future per-card setup */
+  }
+
+  // ------------------------------------------------------- live updates
+  // Cards the user is interacting with (dragging, optimistic move in flight,
+  // focus in its Move-to select) are never replaced under them: their update
+  // is deferred until the interaction ends.
+  const deferred = new Set();
+  let deferredDrawer = false;
+  function busy(card) {
+    if (!card) return false;
+    if (card === dragCard || card.classList.contains("pending") || card.classList.contains("is-drag")) return true;
+    const a = document.activeElement;
+    return Boolean(a && card.contains(a) && a.matches("select, input, textarea"));
+  }
+  function flushDeferred() {
+    if (deferred.size) {
+      const ids = [...deferred];
+      deferred.clear();
+      patchCards(ids);
+    }
+    if (deferredDrawer && openId) {
+      deferredDrawer = false;
+      refreshDrawerLive(openId);
+    }
+  }
+  root.addEventListener("focusout", () => setTimeout(flushDeferred, 0));
+
+  async function patchCards(ids) {
+    const q = ids === "all" ? "all" : [...new Set(ids.map(String))].join(",");
+    if (!q) return;
+    let data;
+    try {
+      const r = await fetch(`${cfg.base}/cards?ids=${encodeURIComponent(q)}`, { credentials: "same-origin", headers: { accept: "application/json" } });
+      if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
+      data = await r.json();
+    } catch {
+      return;
+    }
+    const seen = new Set();
+    for (const c of data.cards || []) {
+      seen.add(String(c.id));
+      const old = cardById(c.id);
+      if (busy(old)) {
+        deferred.add(String(c.id));
+        continue;
+      }
+      // "all" = resync: only flash cards that actually moved/changed state.
+      const changed = !old || old.dataset.status !== c.status || old.dataset.needed !== (c.needed ? "1" : "0");
+      replaceCard(old, c.html, { flash: ids !== "all" || changed });
+    }
+    if (data.full) {
+      board.querySelectorAll(".kcard").forEach((el) => {
+        if (!seen.has(el.dataset.id) && !busy(el)) el.remove();
+      });
+    }
+    decorateRunning(lastJob);
+    updateCounts();
+  }
+
+  async function refreshDrawerLive(id) {
+    const a = document.activeElement;
+    if (a && drawer.contains(a) && a.matches("select, input, textarea")) {
+      deferredDrawer = true;
+      return;
+    }
+    let html;
+    try {
+      const r = await fetch(`${cfg.base}/incidents/${id}/drawer?fragment=1`, { credentials: "same-origin" });
+      if (!r.ok) return;
+      html = await r.text();
+    } catch {
+      return;
+    }
+    if (String(openId) !== String(id) || drawer.hidden) return;
+    // Keep the reader where they are: scroll offset + expanded <details>.
+    const top = drawer.scrollTop;
+    const open = [...drawerInner.querySelectorAll("details")].map((d) => d.open);
+    const pres = [...drawerInner.querySelectorAll("pre")].map((p) => p.scrollTop);
+    drawerInner.innerHTML = html;
+    drawerInner.querySelectorAll("details").forEach((d, i) => {
+      if (i < open.length) d.open = open[i];
+    });
+    drawerInner.querySelectorAll("pre").forEach((p, i) => {
+      if (i < pres.length) p.scrollTop = pres[i];
+    });
+    drawer.scrollTop = top;
+  }
+
+  const slot = root.querySelector("[data-worker-slot]");
+  let lastJob = null;
+  function decorateRunning(job) {
+    board.querySelectorAll(".kc-run").forEach((el) => {
+      if (!job || el.closest(".kcard")?.dataset.id !== String(job.incidentId)) el.remove();
+    });
+    if (!job || !job.incidentId) return;
+    const card = cardById(job.incidentId);
+    if (!card) return;
+    let el = card.querySelector(".kc-run");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "kc-run";
+      el.dataset.run = "";
+      el.innerHTML = `<i class="dot" aria-hidden="true"></i><span></span><span class="mono"></span>`;
+      const actions = card.querySelector(".kc-actions");
+      card.insertBefore(el, actions || null);
+    }
+    el.children[1].textContent = `${job.kind} · ${job.stageText}`;
+    el.children[2].dataset.elapsedFrom = job.startedAt || "";
+  }
+  async function refreshWorker() {
+    if (!slot) return;
+    try {
+      const r = await fetch(`${cfg.base}/worker.json`, { credentials: "same-origin", headers: { accept: "application/json" } });
+      if (!r.ok || !(r.headers.get("content-type") || "").includes("json")) return;
+      const data = await r.json();
+      const a = document.activeElement;
+      const refocus = a && slot.contains(a) ? a.closest("form")?.getAttribute("action") : null;
+      slot.innerHTML = data.worker_html;
+      if (refocus) slot.querySelector(`form[action="${CSS.escape(refocus)}"] button`)?.focus({ preventScroll: true });
+      lastJob = data.job;
+      decorateRunning(lastJob);
+    } catch {
+      /* next change retries */
+    }
+  }
+  if (slot) {
+    const wp = slot.querySelector("[data-worker-panel]");
+    if (wp && wp.dataset.jobIncident) {
+      lastJob = { incidentId: Number(wp.dataset.jobIncident), kind: wp.dataset.jobKind || "", stageText: wp.dataset.jobStage, startedAt: Number(wp.dataset.jobStarted) || null };
+    }
+    slot.addEventListener("click", (ev) => {
+      const link = ev.target.closest("[data-open]");
+      if (!link || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button !== 0) return;
+      ev.preventDefault();
+      openCard(link.dataset.open);
+    });
+  }
+  if (window.OpsLive) {
+    window.OpsLive.on((p) => {
+      if (p.incidents === "all" || (Array.isArray(p.incidents) && p.incidents.length)) {
+        patchCards(p.incidents);
+        if (openId && (p.incidents === "all" || p.incidents.map(String).includes(String(openId)))) refreshDrawerLive(openId);
+      }
+      if (p.worker) refreshWorker();
+    });
   }
   syncHash();
 })();

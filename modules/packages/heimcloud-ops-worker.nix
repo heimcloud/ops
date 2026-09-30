@@ -10,6 +10,7 @@
       cp ${../../scripts/autofix/worker.mjs} $out/worker.mjs
       cp ${../../scripts/autofix/redact.js} $out/redact.js
       cp ${../../scripts/autofix/compare.js} $out/compare.js
+      cp ${../../scripts/autofix/queue-control.js} $out/queue-control.js
     '';
     heimcloud-ops-worker = pkgs.writeShellApplication {
       name = "heimcloud-ops-worker";

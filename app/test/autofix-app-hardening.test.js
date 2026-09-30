@@ -139,8 +139,8 @@ test("triage result only promotes open incidents", () => {
   assert.equal(getIncident(inc2.id).status, "testing");
 });
 
-test("worker copies of redact.js / compare.js are byte-identical to app/lib", () => {
-  for (const f of ["redact.js", "compare.js"]) {
+test("worker copies of redact.js / compare.js / queue-control.js are byte-identical to app/lib", () => {
+  for (const f of ["redact.js", "compare.js", "queue-control.js"]) {
     const a = fs.readFileSync(path.join(repo, "app", "lib", f), "utf8");
     const b = fs.readFileSync(path.join(repo, "scripts", "autofix", f), "utf8");
     assert.equal(a, b, `${f} drifted: cp app/lib/${f} scripts/autofix/${f}`);
@@ -153,8 +153,15 @@ test("Nix path unit watches the host dir the container writes to", () => {
   assert.match(def, /"\$\{opsAppdata\}:\/data"/, "container /data = host opsAppdata");
   assert.match(def, /OPS_DATA_DIR = "\/data"/);
   assert.match(af, /queueRoot = "\$\{opsAppdata\}\/queue"/);
-  assert.match(af, /"\$\{queueRoot\}\/fix\/\*\.json"/);
-  assert.match(af, /"\$\{queueRoot\}\/triage\/\*\.json"/);
+  // PathChanged on the kind dirs (not PathExistsGlob: a paused or disabled
+  // queue with jobs would re-trigger in a loop and hit the start limit).
+  assert.match(af, /PathChanged =/);
+  assert.doesNotMatch(af, /PathExistsGlob =/);
+  assert.match(af, /"\$\{queueRoot\}\/fix"/);
+  assert.match(af, /"\$\{queueRoot\}\/triage"/);
+  assert.match(af, /heimcloud-ops-worker-kick/);
+  assert.match(af, /StartLimitIntervalSec/);
+  for (const f of [def, af]) assert.match(f, /"queue\/control"|queue\/control"/, "control dir is an exchange dir");
   assert.equal(path.relative(tmpDir, queueDir("fix")), path.join("queue", "fix"));
   // Exchange dirs must never be created root-owned again.
   assert.doesNotMatch(def, /mkdir -p \$\{opsAppdata\}\/queue/);
