@@ -8,7 +8,7 @@ Repo: <https://github.com/heimcloud/ops>
 
 1. **`POST /api/incidents`** — protected by `OPS_INGEST_SECRET` (`Authorization: Bearer …` or `X-Ops-Secret`). Idempotent on `report_hash`.
 2. **SQLite WAL** (`PRAGMA journal_mode=WAL`) at `OPS_DB_PATH` (default `/data/ops.sqlite`).
-3. **Admin UI** at `/admin` — list incidents, set class/status, **Start fix** records intent (fix PRs come from the tested-branch loop; see design doc).
+3. **Admin UI** at `/admin` — kanban board of incidents (drag and drop status, "needs my input" badges, detail drawer, filters); **Start triage / Start fix / Retry push** enqueue host jobs (fix PRs come from the tested-branch loop; see design doc).
 
 ## Schema
 
@@ -20,7 +20,7 @@ Repo: <https://github.com/heimcloud/ops>
 | `report_hash` | TEXT UNIQUE — idempotent ingest key |
 | `neo_version`, `plugin_urls`, `unit`, `logs_excerpt` | TEXT |
 | `customer_repo_slug`, `severity`, `target_hint`, `target_repo` | TEXT |
-| `status` | `open` \| `triaged` \| `pr_opened` \| `resolved` \| `closed` |
+| `status` | `open` \| `triaged` \| `fixing` \| `testing` \| `needs_human` \| `pr_opened` \| `resolved` \| `closed` |
 | `class` | `software` \| `human_config` \| `unknown` |
 | `draft_pr_url`, `draft_pr_number`, `draft_branch` | tested branch / PR preparation metadata |
 | `created_at`, `updated_at` | ISO text |
@@ -54,9 +54,48 @@ curl -sS -X POST "http://localhost:3000/api/incidents" \
 
 Bearer also works: `-H "Authorization: Bearer $OPS_INGEST_SECRET"`.
 
+## Admin board
+
+`/admin` is a server-rendered kanban board, progressively enhanced by `app/public/js/board.js` (vanilla JS, no framework, no CDN/fonts; CSS in `app/public/css/board.css`, light + dark via `prefers-color-scheme`). Without JS every card still has working forms.
+
+**Columns** (= lifecycle status): Open · Triaged · Fixing · Testing · Needs human · Awaiting PR (`pr_opened`) · Done (`resolved` + `closed`, tagged on the card). Column headers carry the per-status counts that used to be tiles, plus how many cards in the column need input. Fixing/Testing are marked worker-owned.
+
+**Moving cards**: drag and drop (native HTML5) or the **Move to…** select on each card/drawer (keyboard + touch). Moves are optimistic and roll back on error. They go through the existing update path `POST /admin/incidents/:id` (form, or JSON with `Content-Type: application/json`), which checks the transition table below (409 + message otherwise), refuses stale moves (`expect_from`), and always writes an `admin_update` event `status X -> Y` with `meta.from` / `meta.to`. All admin POSTs require same-origin (`Sec-Fetch-Site`, or `Origin` = Host when that header is missing). `ADMIN_READ_ONLY` removes drag handles, menus and buttons, and the server answers 403.
+
+| From | Allowed manual targets |
+|------|------------------------|
+| open | triaged, needs_human, resolved, closed |
+| triaged | open, needs_human, resolved, closed |
+| fixing | needs_human (unstick a dead job) |
+| testing | pr_opened (manual lab test passed), needs_human, triaged, resolved, closed |
+| needs_human | triaged, resolved, closed |
+| pr_opened | triaged, needs_human, resolved, closed |
+| resolved | open, triaged, closed |
+| closed | open, triaged, resolved |
+
+Nothing can be moved *into* `fixing` / `testing` by hand: **Start fix** and the worker results set those.
+
+**Needs my input** (`needsHumanInput()` in `app/lib/board.js`, pure + unit-tested) uses only the incident row, its latest `triage_result` / `fix_result` payloads, `*_enqueued` events and `fix_attempts`. Nothing is flagged while a triage/fix/push job queued after the last result is still pending.
+
+| Status | Condition | Badge → action |
+|--------|-----------|----------------|
+| open | no triage result / `triage_failed` | Not triaged yet / Triage failed → Start triage |
+| open, triaged | triage `verdict` `uncertain`, or `confidence` < 0.6 | Triage unsure → Start fix / Mark config error & close |
+| open, triaged | verdict `config_error` / `not_actionable` / `code_fix` | Mark config error & close / Close / Start fix |
+| triaged | latest fix result `ready_no_token` / `push_failed` | Push pending / Push failed → Retry push |
+| testing | no `passed`/`failed` lab result (lab skipped) | Lab test needed → Open compare link |
+| needs_human | `lab: failed` / `redaction_blocked` / `denied` / Hermes gave up after retries / other | reason + worker summary → Start fix / Close |
+| pr_opened | `compare_url` set | Open the PR from the compare link → Open compare link / Mark resolved |
+
+Old triage results without `verdict` are mapped from `class` + `fixable` (human_config → config_error, software+fixable → code_fix, software+!fixable → not_actionable, unknown → uncertain).
+
+**Filters**: column visibility, severity, class, unit, target repo, *Needs my input*, and free-text search (over redacted fields only). State lives in the URL query (wins) and `localStorage`. **Drawer**: click a card (`#incident-13` is linkable) for the redacted summary, events timeline (newest first, Europe/Zurich), fix attempts, lab result, compare link, draft branch and actions. The older per-incident page (`/admin/incidents/:id`, raw staff view with class/target edit) is still linked from the drawer.
+
+**Anonymization**: every displayed text field on the board, drawer and `board.json` goes through `app/lib/redact.js` with the DB slugs + `OPS_REDACT_EXTRA_SLUGS`, plus a display-only username rule. Unit suffixes like `.service` stay readable. `customer_repo_slug` and `plugin_urls` are never rendered there. Links are only shown for `https://github.com/…` URLs that come through redaction unchanged. `app/test/board-admin.test.js` seeds synthetic identifiers and asserts that none of them reach the HTML or the JSON.
+
 ## Admin Start fix
 
-On an incident detail page, **Start fix** records intent (status → `triaged`) and does **not** open a GitHub PR or commit into the target repo. Coded fixes come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → compare link); Damo opens the upstream PR in the GitHub web UI. **No auto-merge.**
+**Start fix** (board card, drawer, or incident page) enqueues a host fix job (status → `fixing`) and does **not** open a GitHub PR or commit into the target repo. Coded fixes come from the lab-tested loop described in [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md) (local Hermes → fork branch → lab test → compare link); Damo opens the upstream PR in the GitHub web UI. **No auto-merge.**
 
 Outbound GitHub text is built only from incident #, `report_hash`, unit, severity, class, `neo_version`, and a redacted logs excerpt (`app/lib/redact.js`, plus `OPS_REDACT_EXTRA_SLUGS`).
 

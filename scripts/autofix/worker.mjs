@@ -464,8 +464,31 @@ export function handleTriage(cfg, job, ctx) {
       ? verdict.target_repo
       : "madebydamo/neo",
     fixable: Boolean(verdict.fixable),
+    ...triageVerdictFields(verdict),
     evidence_path: logPath,
   };
+}
+
+const TRIAGE_VERDICTS = ["code_fix", "config_error", "not_actionable", "uncertain"];
+
+/**
+ * verdict / confidence from the triage skill output contract (optional: old
+ * skill outputs omit them and the admin derives a verdict from class/fixable).
+ * confidence is normalized to 0..1 (accepts 0.8, "80%", 80, high|medium|low).
+ */
+export function triageVerdictFields(v) {
+  const out = {};
+  if (TRIAGE_VERDICTS.includes(v?.verdict)) out.verdict = v.verdict;
+  const words = { high: 0.9, medium: 0.6, low: 0.3 };
+  const raw = v?.confidence;
+  let c = typeof raw === "string" && Object.hasOwn(words, raw.trim().toLowerCase())
+    ? words[raw.trim().toLowerCase()]
+    : Number(String(raw ?? "").replace(/%$/, ""));
+  if (raw != null && raw !== "" && Number.isFinite(c) && c >= 0) {
+    if (c > 1) c /= 100;
+    out.confidence = Math.round(Math.min(c, 1) * 100) / 100;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- fix

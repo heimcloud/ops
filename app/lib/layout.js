@@ -1,4 +1,4 @@
-export function adminLayout({ title, body, basePath = "/admin", readOnly = false, lang = "en" }) {
+export function adminLayout({ title, body, basePath = "/admin", readOnly = false, lang = "en", wide = false, head = "" }) {
   const base = String(basePath || "/admin").replace(/\/$/, "") || "/admin";
   const ro = readOnly
     ? `<span class="example-tag" title="Mutating forms disabled">read-only</span>`
@@ -9,9 +9,12 @@ export function adminLayout({ title, body, basePath = "/admin", readOnly = false
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${title} · Ops Admin · Heimcloud</title>
+  <meta name="color-scheme" content="${wide ? "dark light" : "dark"}" />
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/css/ops.css" />
+  ${head}
 </head>
-<body>
+<body${wide ? ` class="wide"` : ""}>
   <header class="site-header">
     <a class="logo" href="${base}/">Heimcloud Ops</a>
     <nav>

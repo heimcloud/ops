@@ -44,7 +44,7 @@ for a in "$@"; do [ "$prev" = -s ] && skill="$a"; prev="$a"; done
 mode="\${FAKE_HERMES_MODE:-ok}"
 if [ "$skill" = heimcloud-ops-triage ]; then
   echo 'thinking {not json}'
-  echo '{"class":"software","severity":"warning","summary":"engine list stale","target_repo":"madebydamo/neo","fixable":true}'
+  echo '{"class":"software","severity":"warning","summary":"engine list stale","target_repo":"madebydamo/neo","fixable":true,"verdict":"code_fix","confidence":"85%"}'
   exit 0
 fi
 git switch -q -c fix/searxng-engines 2>/dev/null || git switch -q fix/searxng-engines
@@ -125,9 +125,18 @@ test("triage job: claimed, Hermes JSON parsed, result written, job moved to done
   const r = result("triage", name);
   assert.equal(r.status, "triaged");
   assert.equal(r.class, "software");
+  assert.equal(r.verdict, "code_fix");
+  assert.equal(r.confidence, 0.85);
   assert.ok(fs.existsSync(path.join(data, "queue", "done", `triage-${name}`)));
   assert.equal(fs.readdirSync(path.join(data, "queue", "triage")).length, 0);
   assert.equal(fs.readFileSync(path.join(tmp, "hermes-env"), "utf8").includes("GH_TOKEN"), false, "ambient token stripped");
+});
+
+test("triageVerdictFields: new contract fields validated, old outputs yield none", () => {
+  assert.deepEqual(W.triageVerdictFields({ verdict: "uncertain", confidence: 0.4 }), { verdict: "uncertain", confidence: 0.4 });
+  assert.deepEqual(W.triageVerdictFields({ verdict: "maybe", confidence: "low" }), { confidence: 0.3 });
+  assert.deepEqual(W.triageVerdictFields({ class: "software", fixable: true }), {});
+  assert.deepEqual(W.triageVerdictFields({ confidence: "n/a" }), {});
 });
 
 test("fix job: branch pushed to fork with pinned identity, compare link against base ref", () => {

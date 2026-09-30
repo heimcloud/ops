@@ -452,3 +452,36 @@ export function nextFixAttemptNumber(incidentId) {
     .get(incidentId);
   return Number(row?.n || 0) + 1;
 }
+
+function groupByIncident(rows) {
+  const out = new Map();
+  for (const r of rows) {
+    if (!out.has(r.incident_id)) out.set(r.incident_id, []);
+    out.get(r.incident_id).push(r);
+  }
+  return out;
+}
+
+/** All events for many incidents in one query → Map(incident_id → rows ASC). */
+export function listEventsForIncidents(ids) {
+  const list = [...new Set((ids || []).map(Number).filter(Boolean))];
+  if (!list.length) return new Map();
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM incident_events WHERE incident_id IN (SELECT value FROM json_each(?)) ORDER BY id ASC`,
+    )
+    .all(JSON.stringify(list));
+  return groupByIncident(rows);
+}
+
+/** All fix attempts for many incidents → Map(incident_id → rows by attempt). */
+export function listFixAttemptsForIncidents(ids) {
+  const list = [...new Set((ids || []).map(Number).filter(Boolean))];
+  if (!list.length) return new Map();
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM fix_attempts WHERE incident_id IN (SELECT value FROM json_each(?)) ORDER BY incident_id, attempt ASC`,
+    )
+    .all(JSON.stringify(list));
+  return groupByIncident(rows);
+}
