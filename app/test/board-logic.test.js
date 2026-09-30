@@ -163,7 +163,7 @@ test("needsHumanInput: needs_human after retries / redaction_blocked / denied sh
 
 test("needsHumanInput: fixing / resolved / closed need nothing", () => {
   for (const s of ["fixing", "resolved", "closed"]) {
-    assert.deepEqual(B.needsHumanInput(inc(s), [ev("fix_result", { status: "needs_human" })], []), { needed: false, reasons: [] });
+    assert.deepEqual(B.needsHumanInput(inc(s), [ev("fix_result", { status: "needs_human" })], []), { needed: false, reasons: [], labQueued: false });
   }
 });
 

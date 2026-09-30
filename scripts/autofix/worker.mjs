@@ -35,6 +35,15 @@ import {
   atomicWriteJson,
   controlDir,
 } from "./queue-control.js";
+import {
+  validateCheckPlan,
+  defaultChecks,
+  isValidBranch,
+  isValidInstance,
+  keepUnitNames,
+  normalizeLabReport,
+  checkLabel,
+} from "./lab-checks.js";
 
 const WORKER_FILE = fileURLToPath(import.meta.url);
 /** A job whose run died this many times (claims without a finish) is quarantined. */
@@ -42,7 +51,7 @@ export const POISON_CLAIMS = 2;
 
 const TRUE = ["1", "true", "yes", "on"];
 const FALSE = ["0", "false", "no", "off"];
-const KINDS = ["triage", "fix", "push"];
+const KINDS = ["triage", "fix", "push", "lab"];
 const JOB_NAME_RE = /^fix-(\d+)-[A-Za-z0-9-]+$/;
 const BRANCH_RE = /^(fix|ops)\/[A-Za-z0-9._/-]+$/;
 const CLASSES = ["software", "human_config", "unknown"];
@@ -83,6 +92,14 @@ export function config() {
     killGraceMs: Math.max(100, Number(e.OPS_AUTOFIX_KILL_GRACE_SEC || 10) * 1000),
     cancelPollMs: Math.max(50, Number(e.OPS_AUTOFIX_CANCEL_POLL_MS || 2000)),
     labTimeoutMs: Math.max(60, Number(e.OPS_AUTOFIX_LAB_TIMEOUT_SEC || 1800)) * 1000,
+    // Automated lab stage (lab job kind + root heimcloud-ops-labtest@ unit).
+    labAuto: TRUE.includes(String(e.OPS_AUTOFIX_LAB || "").toLowerCase()),
+    labUnitPrefix: /^[a-z0-9-]+$/.test(e.OPS_AUTOFIX_LAB_UNIT || "") ? e.OPS_AUTOFIX_LAB_UNIT : "heimcloud-ops-labtest",
+    labStateDir: e.OPS_AUTOFIX_LAB_STATE_DIR || "/var/lib/heimcloud-ops-labtest",
+    labWaitMs: Math.max(1, Number(e.OPS_AUTOFIX_LAB_WAIT_SEC || 7200)) * 1000,
+    labPlanTimeoutMs: Math.max(1, Number(e.OPS_AUTOFIX_LAB_PLAN_TIMEOUT_SEC || 600)) * 1000,
+    labPollMs: Math.max(10, Number(e.OPS_AUTOFIX_LAB_POLL_MS || 3000)),
+    systemctlBin: e.OPS_SYSTEMCTL_BIN || "systemctl",
     scratchRoot: e.OPS_AUTOFIX_SCRATCH || path.join(os.homedir(), "workspace", "autofix"),
     forkUrl: e.OPS_AUTOFIX_FORK_URL || "https://github.com/heimcloud/neo.git",
     upstreamUrl: e.OPS_AUTOFIX_UPSTREAM_URL || "https://github.com/madebydamo/neo.git",
@@ -174,8 +191,8 @@ function mkdirs(cfg) {
 }
 
 export function enabledKinds(cfg) {
-  // push (retry a saved fix) rides on autofix.fix.enable.
-  return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : cfg.fixOn));
+  // push (retry a saved fix) rides on autofix.fix.enable; lab needs fix + lab automation.
+  return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : k === "lab" ? cfg.fixOn && cfg.labAuto : cfg.fixOn));
 }
 
 /**
@@ -265,15 +282,15 @@ function safeWriteResult(cfg, processingFile, result) {
 }
 
 function failureStatus(kind) {
-  return kind === "triage" ? "triage_failed" : kind === "push" ? "push_failed" : "needs_human";
+  return kind === "triage" ? "triage_failed" : kind === "push" ? "push_failed" : kind === "lab" ? "lab_error" : "needs_human";
 }
 
 function failureResult(kind, incidentId, summary, extra = {}) {
   return {
-    kind: kind === "push" ? "fix" : kind,
+    kind: kind === "push" || kind === "lab" ? "fix" : kind,
     incident_id: incidentId,
     status: failureStatus(kind),
-    ...(kind === "push" ? { via: "push-pending" } : {}),
+    ...(kind === "push" ? { via: "push-pending" } : kind === "lab" ? { via: "lab", lab: "error" } : {}),
     summary,
     ...extra,
   };
@@ -298,7 +315,7 @@ export function recoverStale(cfg) {
     if (!f.endsWith(".json") || f.includes(".tmp-")) continue;
     const full = path.join(dir, f);
     try {
-      const m = /^(triage|fix|push)-((\d+)-[A-Za-z0-9-]+\.json)$/.exec(f);
+      const m = /^(triage|fix|push|lab)-((\d+)-[A-Za-z0-9-]+\.json)$/.exec(f);
       let job = null;
       try {
         job = JSON.parse(fs.readFileSync(full, "utf8"));
@@ -435,6 +452,19 @@ export function cancelledResult(kind, job, stageName) {
       status: "push_failed",
       push_error: "cancelled",
       summary: `Push cancelled by admin${at}; the saved fix is kept (Retry push when ready).`,
+    };
+  }
+  if (kind === "lab") {
+    // The branch is pushed; nothing was activated (cancel never interrupts an activation).
+    return {
+      kind: "fix",
+      via: "lab",
+      incident_id: incidentId,
+      branch: job?.branch,
+      compare_url: job?.compare_url,
+      status: "awaiting_lab_test",
+      lab: "cancelled",
+      summary: `Lab test cancelled by admin${at} before activation; the branch stays pushed. Retry the lab job or test manually.`,
     };
   }
   return { kind: "fix", incident_id: incidentId, status: "cancelled", summary: `Fix cancelled by admin${at}; nothing was pushed.` };
@@ -851,7 +881,7 @@ function cloneNeo(cfg, neoDir) {
   return { ok: false, error: errors.join(" | ") };
 }
 
-function fixPrompt(job, neoDir, cfg, attempt, previousFailure) {
+function fixPrompt(job, neoDir, cfg, attempt, previousFailure, continueBranch = "") {
   return [
     `Fix Ops incident #${job.incident_id} in the neo clone at ${neoDir} (attempt ${attempt}/${cfg.maxAttempts}).`,
     `Base neo ref the host runs: ${cfg.baseRef} (already checked out; branch from here).`,
@@ -866,6 +896,9 @@ function fixPrompt(job, neoDir, cfg, attempt, previousFailure) {
     "",
     ...(previousFailure
       ? ["Previous attempt failed the lab test. Evidence (redacted tail):", previousFailure, ""]
+      : []),
+    ...(continueBranch
+      ? [`Branch ${continueBranch} (the previous attempt) is checked out: fix forward with a NEW commit on it and keep the branch name.`, ""]
       : []),
     `Create branch fix/<topic> or ops/incident-${job.incident_id} and COMMIT the change (git identity is preset; do not change git config).`,
     "Minimal change. No identifiers. Do NOT push and do NOT open a PR; the worker pushes after its redaction gate.",
@@ -986,7 +1019,7 @@ function retryHint(job) {
 }
 
 /** Push HEAD to the fork branch, build the compare link, run the lab test. */
-function pushAndLab(cfg, neoDir, branch, klass) {
+function pushAndLab(cfg, neoDir, branch, klass, { skipLab = false } = {}) {
   // Fork branch namespace fix/*|ops/* is owned by this loop: force keeps
   // re-runs of the same incident idempotent.
   const push = run(
@@ -999,7 +1032,8 @@ function pushAndLab(cfg, neoDir, branch, klass) {
     log(`git push failed: ${tail(String(push.stderr || push.error || "").replace(/:\/\/[^@\s/]+@/g, "://***@"), 300)}`);
     return { pushed: false, error: classifyPushError(`${push.stderr}\n${push.stdout}\n${push.error || ""}`) };
   }
-  return { pushed: true, compare_url: buildCompareUrl(branch, { base: cfg.baseRef }), lab: labTest(cfg, branch, klass || "default") };
+  const compare_url = buildCompareUrl(branch, { base: cfg.baseRef });
+  return { pushed: true, compare_url, lab: skipLab ? null : labTest(cfg, branch, klass || "default") };
 }
 
 export function handleFix(cfg, job, ctx) {
@@ -1020,11 +1054,22 @@ export function handleFix(cfg, job, ctx) {
   const baseSha = git(neoDir, ["rev-parse", "HEAD"]).stdout.trim();
   const slugs = ctx.slugs;
 
-  let previousFailure = "";
+  // Lab retry (enqueued by a failed lab job): continue on the pushed branch
+  // with the redacted lab evidence; the attempt budget carries over.
+  const startAttempt = Math.max(1, Math.floor(Number(job.attempt) || 1));
+  let continueBranch = "";
+  if (startAttempt > 1 && isValidBranch(job.branch)) {
+    const f = git(neoDir, ["fetch", "--quiet", "fork", `+refs/heads/${job.branch}:refs/remotes/fork/${job.branch}`]);
+    if (f.status === 0 && git(neoDir, ["checkout", "-q", "-B", job.branch, `fork/${job.branch}`]).status === 0) continueBranch = job.branch;
+  }
+  let previousFailure = typeof job.lab_failure === "string" ? tail(redactIdentifyingDetails(job.lab_failure, { knownSlugs: slugs }), 3000) : "";
   let last = null;
-  for (let attempt = 1; attempt <= cfg.maxAttempts; attempt += 1) {
+  if (startAttempt > cfg.maxAttempts) {
+    return { ...base, attempts: startAttempt - 1, max_attempts: cfg.maxAttempts, status: "needs_human", lab: "failed", summary: `Lab test failed after ${cfg.maxAttempts} attempt(s): ${tail(previousFailure, 500)}` };
+  }
+  for (let attempt = startAttempt; attempt <= cfg.maxAttempts; attempt += 1) {
     const prompt = path.join(ctx.scratch, `fix-prompt-${attempt}.txt`);
-    fs.writeFileSync(prompt, fixPrompt(job, neoDir, cfg, attempt, previousFailure));
+    fs.writeFileSync(prompt, fixPrompt(job, neoDir, cfg, attempt, previousFailure, attempt === startAttempt ? continueBranch : ""));
     const logPath = path.join(ctx.scratch, `fix-hermes-${attempt}.log`);
     stage(cfg, "hermes", { attempt, max_attempts: cfg.maxAttempts });
     const r = hermesChat(cfg, "heimcloud-ops-fix", prompt, { cwd: neoDir, logPath });
@@ -1101,7 +1146,7 @@ export function handleFix(cfg, job, ctx) {
       };
     }
 
-    const pushed = pushAndLab(cfg, neoDir, branch, job.class);
+    const pushed = pushAndLab(cfg, neoDir, branch, job.class, { skipLab: cfg.labAuto });
     if (!pushed.pushed) {
       // Not a Hermes failure: no retry loop, attempt budget untouched.
       return {
@@ -1112,6 +1157,31 @@ export function handleFix(cfg, job, ctx) {
       };
     }
     last = { ...common, branch, compare_url: pushed.compare_url, pr_title: prTitle, pr_body: prBody };
+    if (cfg.labAuto) {
+      // Automated lab stage: a separate lab job (shown in the queue) runs the
+      // root lab unit. No compare link until it passes.
+      const lab = enqueueLab(cfg, job, {
+        branch,
+        fix_job: jobName,
+        attempt,
+        compare_url: pushed.compare_url,
+        pr_title: prTitle,
+        pr_body: prBody,
+        base_sha: baseSha,
+        head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim(),
+      });
+      return {
+        ...common,
+        branch,
+        job: jobName,
+        pr_title: prTitle,
+        pr_body: prBody,
+        status: "lab_queued",
+        lab: "queued",
+        lab_job: lab.instance,
+        summary: `Branch ${branch} pushed to the fork (attempt ${attempt}/${cfg.maxAttempts}); automated lab test queued.`,
+      };
+    }
     const lab = pushed.lab;
     if (lab.skipped) {
       return {
@@ -1137,6 +1207,266 @@ export function handleFix(cfg, job, ctx) {
     lab: "failed",
     summary: `Lab test failed after ${cfg.maxAttempts} attempt(s): ${tail(previousFailure, 500)}`,
   };
+}
+
+// ---------------------------------------------------------------- lab
+
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+function jobStamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+/** Enqueue a job file for the worker itself (lab / lab-retry fix), atomically. */
+function enqueueSelf(cfg, kind, incidentId, payload) {
+  const dir = path.join(cfg.queue, kind);
+  fs.mkdirSync(dir, { recursive: true });
+  let name = `${incidentId}-${jobStamp()}.json`;
+  for (let i = 0; fs.existsSync(path.join(dir, name)) && i < 5; i += 1) {
+    sleepSync(2);
+    name = `${incidentId}-${jobStamp()}.json`;
+  }
+  atomicWriteJson(path.join(dir, name), { job_version: 1, kind, incident_id: incidentId, enqueued_at: new Date().toISOString(), enqueued_by: "worker", ...payload });
+  return { name, instance: `${kind}-${name.replace(/\.json$/, "")}` };
+}
+
+export function enqueueLab(cfg, job, fields) {
+  const incidentId = Number(job.incident_id);
+  return enqueueSelf(cfg, "lab", incidentId, {
+    report_hash: job.report_hash,
+    unit: job.unit,
+    severity: job.severity,
+    class: job.class,
+    neo_version: job.neo_version,
+    logs_excerpt: job.logs_excerpt,
+    max_attempts: cfg.maxAttempts,
+    ...fields,
+  });
+}
+
+/** Deterministic, redacted failure evidence fed back to Hermes on a lab retry. */
+export function labFailureText(report, slugs) {
+  const r = normalizeLabReport(report) || { checks: [], evidence: [], reason: "" };
+  const redact = keepUnitNames((t) => redactIdentifyingDetails(t, { knownSlugs: slugs }));
+  const lines = [
+    `Lab test verdict: ${r.verdict}${r.failedStage ? ` (stage ${r.failedStage})` : ""}: ${r.reason}`,
+    ...r.checks.filter((c) => c.ok === false).map((c) => `FAILED ${c.label}: ${c.detail}`),
+    ...(r.evidence.length ? ["Evidence:", ...r.evidence] : []),
+  ];
+  return tail(redact(lines.join("\n")), 3000);
+}
+
+/**
+ * Hermes (skill heimcloud-ops-labtest) derives incident-specific checks from
+ * the incident and the diff; the plan is validated against the whitelist. No
+ * usable plan → deterministic default (incident unit active).
+ */
+export function planLabChecks(cfg, job, ctx) {
+  const notes = [];
+  const slugs = ctx.slugs;
+  fs.mkdirSync(ctx.scratch, { recursive: true });
+  let files = [];
+  const clone = path.join(cfg.scratchRoot, String(job.fix_job || "x"), "neo");
+  if (/^fix-\d+-[A-Za-z0-9-]+$/.test(String(job.fix_job || "")) && job.base_sha && fs.existsSync(clone)) {
+    const d = git(clone, ["diff", "--name-only", `${job.base_sha}..HEAD`]);
+    if (d.status === 0) files = d.stdout.split("\n").filter(Boolean).slice(0, 60);
+  }
+  const prompt = path.join(ctx.scratch, "lab-plan-prompt.txt");
+  fs.writeFileSync(
+    prompt,
+    [
+      `Plan the lab-test checks for Ops incident #${job.incident_id} (fix branch ${job.branch}).`,
+      `unit: ${job.unit}`,
+      `severity: ${job.severity}`,
+      `class: ${job.class}`,
+      "",
+      "logs_excerpt (redacted):",
+      job.logs_excerpt || "(none)",
+      "",
+      "changed files:",
+      ...(files.length ? files : ["(unknown)"]),
+      "",
+      "Respond with the JSON check plan only.",
+    ].join("\n"),
+  );
+  stage(cfg, "planning");
+  const r = hermesChat({ ...cfg, hermesTimeoutMs: cfg.labPlanTimeoutMs }, "heimcloud-ops-labtest", prompt, {
+    cwd: ctx.scratch,
+    logPath: path.join(ctx.scratch, "lab-plan-hermes.log"),
+  });
+  const raw = extractJson(r.stdout) || extractJson(r.stderr);
+  const plan = raw ? validateCheckPlan(raw) : { checks: [], errors: [`Hermes produced no plan (${hermesFailure(r)})`] };
+  for (const e of plan.errors.slice(0, 6)) notes.push(redactIdentifyingDetails(e, { knownSlugs: slugs }));
+  if (plan.checks.length) return { checks: plan.checks, source: "hermes", notes };
+  notes.push("using the default check (incident unit active)");
+  return { checks: defaultChecks(job.unit), source: "default", notes };
+}
+
+function unitState(cfg, unit) {
+  const r = run(cfg.systemctlBin, ["show", "-p", "ActiveState", "--value", unit], { timeout: 30_000 });
+  return r.status === 0 ? r.stdout.trim() : "unknown";
+}
+
+function readLabFile(cfg, instance, name) {
+  try {
+    const fd = fs.openSync(path.join(cfg.labStateDir, instance, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size > 1024 * 1024) return null;
+      return JSON.parse(fs.readFileSync(fd, "utf8"));
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lab job: plan checks (Hermes), start the root lab unit for this job, follow
+ * its progress into worker-status.json, map the verdict. Cancel is passed to
+ * the runner through the same cancel flag; the runner only honours it before
+ * activation, so the worker never interrupts an activation.
+ */
+export function handleLab(cfg, job, ctx) {
+  const instance = path.basename(ctx.processing, ".json");
+  const attempt = Math.max(1, Math.floor(Number(job.attempt) || 1));
+  const maxAttempts = Math.max(1, Number(job.max_attempts) || cfg.maxAttempts);
+  const base = {
+    kind: "fix",
+    via: "lab",
+    incident_id: Number(job.incident_id),
+    branch: job.branch,
+    job: job.fix_job,
+    lab_job: instance,
+    attempts: attempt,
+    max_attempts: maxAttempts,
+  };
+  const err = (summary, extra = {}) => ({ ...base, status: "lab_error", lab: "error", summary, _bucket: "failed", _reason: { code: "lab_error", reason: summary.slice(0, 160) }, ...extra });
+  if (!isValidInstance(instance) || !isValidBranch(job.branch)) return err("lab job has an invalid name or branch");
+  const unit = `${cfg.labUnitPrefix}@${instance}.service`;
+
+  let report = readLabFile(cfg, instance, "result.json");
+  let plan = null;
+  if (!report || unitState(cfg, unit) === "active") {
+    report = null;
+    plan = planLabChecks(cfg, job, ctx);
+    try {
+      const cur = JSON.parse(fs.readFileSync(ctx.processing, "utf8"));
+      atomicWriteJson(ctx.processing, { ...cur, lab_checks: plan.checks, lab_plan: { source: plan.source, notes: plan.notes } });
+    } catch (e) {
+      return err(`could not write the lab spec (${e.code || e.message})`);
+    }
+    stage(cfg, "lab", { lab_stage: "starting", lab_step: null, lab_steps: null });
+    const st = run(cfg.systemctlBin, ["start", "--no-block", unit], { timeout: 60_000 });
+    if (st.status !== 0) {
+      return err(`could not start ${cfg.labUnitPrefix}@ (${tail(st.stderr || st.error || `exit ${st.status}`, 200).trim()}); is the polkit rule installed?`);
+    }
+    const deadline = Date.now() + cfg.labWaitMs;
+    let goneSince = 0;
+    let lastKey = "";
+    let lastBeat = 0;
+    for (;;) {
+      sleepSync(cfg.labPollMs);
+      const status = readLabFile(cfg, instance, "status.json");
+      if (status && currentJob) {
+        // Mirror runner progress; write on change or once per heartbeat only.
+        const p = { lab_stage: String(status.stage || "").slice(0, 30), lab_step: Number(status.step) || null, lab_steps: Number(status.steps) || null };
+        const key = JSON.stringify(p);
+        if (key !== lastKey || Date.now() - lastBeat >= cfg.heartbeatMs) {
+          stage(cfg, "lab", p, { checkCancel: false });
+          lastKey = key;
+          lastBeat = Date.now();
+        }
+      }
+      report = readLabFile(cfg, instance, "result.json");
+      const state = unitState(cfg, unit);
+      const running = ["active", "activating", "deactivating", "reloading"].includes(state);
+      if (report && !running) break;
+      if (!running) {
+        goneSince ||= Date.now();
+        if (Date.now() - goneSince > Math.max(10_000, 4 * cfg.labPollMs)) break;
+      } else goneSince = 0;
+      if (Date.now() > deadline) {
+        return err(`lab unit still running after ${Math.round(cfg.labWaitMs / 1000)} s; its watchdog rolls the host back at its deadline`);
+      }
+    }
+    if (!report) {
+      const wd = readLabFile(cfg, instance, "watchdog.json");
+      return err(`lab unit ended without a result${wd?.fired ? ` (watchdog rolled back: restored=${Boolean(wd.restored)})` : ""}`);
+    }
+  }
+
+  const slugs = ctx.slugs;
+  const redact = keepUnitNames((t) => redactIdentifyingDetails(t, { knownSlugs: slugs }));
+  const norm = normalizeLabReport(report);
+  const lab_report = {
+    ...report,
+    plan_source: plan?.source || report.plan_source,
+    plan_notes: plan?.notes || report.plan_notes || [],
+    reason: redact(report.reason || ""),
+    evidence: (report.evidence || []).slice(0, 30).map((l) => redact(l)),
+    checks: (report.checks || []).slice(0, 40).map((c) => ({ ...c, label: redact(c.label || checkLabel(c)), detail: redact(c.detail || "") })),
+  };
+  const counts = `${norm.passed}/${norm.checks.length} checks passed`;
+  const gen = norm.generation.before != null ? `, generation ${norm.generation.before} → lab → ${norm.generation.after ?? "?"}${norm.generation.restored ? " (restored)" : ""}` : "";
+  const withReport = { ...base, lab_report, evidence_path: path.join(cfg.labStateDir, instance, "result.json") };
+
+  if (report.rollback_unverified) {
+    return {
+      ...withReport,
+      status: "needs_human",
+      lab: "error",
+      summary: `ROLLBACK NOT VERIFIED after the lab test: check the host now. ${redact(report.reason || "")}`.slice(0, 600),
+      _bucket: "failed",
+      _reason: { code: "rollback_unverified", reason: "lab rollback not verified" },
+    };
+  }
+  if (norm.verdict === "pass") {
+    return {
+      ...withReport,
+      status: "compare_ready",
+      lab: "passed",
+      compare_url: job.compare_url,
+      pr_title: job.pr_title,
+      pr_body: job.pr_body,
+      summary: `Lab test passed (${counts}${gen}); open the compare link to create the upstream PR.`,
+    };
+  }
+  if (norm.verdict === "cancelled") {
+    return { ...cancelledResult("lab", job, report.failed_stage || "lab"), ...withReport, status: "awaiting_lab_test", lab: "cancelled", compare_url: job.compare_url, _bucket: "failed", _reason: { code: "cancelled", reason: "lab test cancelled before activation" } };
+  }
+  if (norm.verdict === "fail") {
+    const failure = labFailureText(lab_report, slugs);
+    if (attempt < maxAttempts) {
+      const next = enqueueSelf(cfg, "fix", Number(job.incident_id), {
+        report_hash: job.report_hash,
+        unit: job.unit,
+        severity: job.severity,
+        class: job.class,
+        neo_version: job.neo_version,
+        logs_excerpt: job.logs_excerpt,
+        attempt: attempt + 1,
+        branch: job.branch,
+        lab_failure: failure,
+      });
+      return {
+        ...withReport,
+        status: "lab_retry",
+        lab: "failed",
+        retry_job: next.instance,
+        summary: `Lab test failed (${counts}${gen}): ${redact(report.reason || "")}. Retrying the fix with this evidence (attempt ${attempt + 1}/${maxAttempts}).`.slice(0, 700),
+      };
+    }
+    return {
+      ...withReport,
+      status: "needs_human",
+      lab: "failed",
+      compare_url: undefined,
+      summary: `Lab test failed after ${attempt} attempt(s) (${counts}${gen}): ${redact(report.reason || "")}`.slice(0, 700),
+    };
+  }
+  return err(`Lab test error: ${redact(report.reason || "unknown")}`.slice(0, 500), { lab_report });
 }
 
 function readJsonMaybe(...files) {
@@ -1298,12 +1628,26 @@ function pushPendingLocked(cfg, scratch) {
   if (!token.ok) {
     return { ...baseRes, status: "ready_no_token", summary: `Fix branch ${p.branch} still waiting for the fork-push token (${token.reason}). ${retryHint(jobName)}` };
   }
-  const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class);
+  const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class, { skipLab: cfgP.labAuto });
   if (!pushed.pushed) {
     return { ...baseRes, status: "push_failed", push_error: pushed.error.class, summary: `Push to the fork failed again (${pushed.error.class}: ${pushed.error.message}). ${retryHint(jobName)}` };
   }
   fs.renameSync(pendingPath, `${pendingPath}.done`);
   const common = { ...baseRes, pending_path: undefined, compare_url: pushed.compare_url, pr_title: p.pr_title, pr_body: p.pr_body };
+  if (cfgP.labAuto) {
+    const lab = enqueueLab(cfgP, { incident_id: p.incident_id, report_hash: p.report_hash, severity: p.severity, class: p.class }, {
+      branch: p.branch,
+      fix_job: p.job || path.basename(scratch),
+      attempt: Math.max(1, Number(p.attempt) || 1),
+      compare_url: pushed.compare_url,
+      pr_title: p.pr_title,
+      pr_body: p.pr_body,
+      base_sha: p.base_sha,
+      // What was pushed (a replayed patch gets a new commit id).
+      head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() || p.head_sha,
+    });
+    return { ...common, compare_url: undefined, status: "lab_queued", lab: "queued", lab_job: lab.instance, summary: `Saved fix pushed to heimcloud/neo ${p.branch}; automated lab test queued.` };
+  }
   if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; compare link ready. Lab test ${pushed.lab.cancelled ? "cancelled by admin" : "skipped (not installed)"} — test manually.` };
   if (pushed.lab.ok) return { ...common, status: "compare_ready", lab: "passed", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; lab test passed.` };
   return { ...common, compare_url: undefined, status: "needs_human", lab: "failed", summary: `Saved fix pushed but lab test failed (no Hermes retry in push mode): ${tail(redactIdentifyingDetails(pushed.lab.output, { knownSlugs: slugs }), 500)}` };
@@ -1369,7 +1713,18 @@ export function processOne(cfg, entry) {
         if (!jm || Number(jm[1]) !== Number(job.incident_id)) throw new Error("push job needs a matching fix job name");
         result = pushPending(cfg, path.join(cfg.scratchRoot, job.job));
       } else {
-        result = entry.kind === "triage" ? handleTriage(cfg, job, ctx) : handleFix(cfg, job, ctx);
+        result =
+          entry.kind === "triage"
+            ? handleTriage(cfg, job, ctx)
+            : entry.kind === "lab"
+              ? handleLab(cfg, job, { ...ctx, processing })
+              : handleFix(cfg, job, ctx);
+      }
+      if (result && result._bucket) {
+        bucket = result._bucket;
+        reason = result._reason || null;
+        delete result._bucket;
+        delete result._reason;
       }
     } catch (err) {
       if (err instanceof JobCancelled) {

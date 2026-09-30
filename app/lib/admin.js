@@ -34,6 +34,8 @@ import {
 import {
   enqueueJob,
   enqueuePushJob,
+  enqueueLabRetry,
+  labRetrySource,
   isAutofixKindEnabled,
   getForkPushTokenState,
   NO_TOKEN_WARNING,
@@ -438,6 +440,31 @@ export function createAdminRouter() {
       return res.redirect(303, backTo(req, base, id, "err", message));
     }
   });
+  router.post("/incidents/:id/retry-lab", (req, res) => {
+    const base = req.adminBase;
+    const json = wantsJson(req);
+    if (ADMIN_READ_ONLY && json) return res.status(403).json({ ok: false, error: "read_only", message: "Admin is read-only (ADMIN_READ_ONLY)." });
+    if (refuseMutations(res, base)) return;
+    const id = Number(req.params.id);
+    const incident = getIncident(id);
+    if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
+    try {
+      // The lab job comes from the DB (latest lab fix_result) + its failed/ file, never from the form.
+      const src = labRetrySource(incident, getLatestIncidentEvent(id, "fix_result"), getLatestIncidentEvent(id, "job_cancelled"));
+      if (!src) throw Object.assign(new Error(`Incident #${id} has no failed lab test to retry.`), { status: 409, code: "no_lab_job" });
+      const { path: jobPath } = enqueueLabRetry(incident, src.job);
+      const file = jobPath.split("/").pop();
+      if (incident.status !== "testing") updateIncident(id, { status: "testing" });
+      addIncidentEvent(id, "lab_enqueued", `Lab test re-enqueued (retry of ${src.name})`, { job_file: file, job_kind: "lab", retry_of: src.name });
+      if (json) return res.json({ ok: true, message: "Lab test re-enqueued", ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "msg", "Lab test re-enqueued"));
+    } catch (err) {
+      console.error("[admin] retry-lab", err.code || "", err.message);
+      const message = err.message || "Retry lab failed";
+      if (json) return res.status(err.status || 500).json({ ok: false, error: err.code || "retry_lab_failed", message, ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "err", message));
+    }
+  });
   router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
 
   registerQueueRoutes(router, {
@@ -495,6 +522,7 @@ function capabilities() {
     triage: isAutofixKindEnabled("triage"),
     fix: isAutofixKindEnabled("fix"),
     push: isAutofixKindEnabled("push"),
+    lab: isAutofixKindEnabled("lab"),
   };
 }
 

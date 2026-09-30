@@ -8,6 +8,7 @@
  * Every free-text field is passed through the display redactor by the caller
  * (models carry raw strings only in *Raw fields that are never rendered).
  */
+import { LAB_STAGE_LABELS, labPhase } from "./lab-checks.js";
 import fs from "node:fs";
 import path from "node:path";
 import { getDataDir } from "./queue.js";
@@ -32,6 +33,7 @@ import {
 
 export const STAGE_LABELS = {
   claimed: "Starting",
+  planning: "Planning lab checks",
   cloning: "Cloning neo",
   hermes: "Hermes",
   checks: "Gates / checks",
@@ -173,6 +175,14 @@ export function workerModel({ redact = (s) => s, now = Date.now(), caps = {} } =
   if (jobModel) {
     jobModel.elapsedSec = jobModel.startedAt ? (now - jobModel.startedAt) / 1000 : null;
     jobModel.stageText = `${jobModel.stageLabel}${jobModel.stage === "hermes" && jobModel.attempt ? ` ${jobModel.attempt}/${jobModel.maxAttempts || "?"}` : ""}`;
+    if (jobModel.stage === "lab" && Object.hasOwn(LAB_STAGE_LABELS, job.lab_stage)) {
+      // Root lab runner progress mirrored by the worker: "lab · Checks 3/8".
+      const n = Number(job.lab_step);
+      const m = Number(job.lab_steps);
+      jobModel.labStage = job.lab_stage;
+      jobModel.labPhase = labPhase(job.lab_stage);
+      jobModel.stageText = `${LAB_STAGE_LABELS[job.lab_stage]}${job.lab_stage === "checks" && n > 0 && m > 0 ? ` ${Math.min(n, m)}/${m}` : ""}`;
+    }
     jobModel.startedLabel = zurichShort(jobModel.startedAt, now);
   }
   const lr = st.last_run && typeof st.last_run === "object" ? st.last_run : null;
@@ -258,7 +268,7 @@ export function workerModel({ redact = (s) => s, now = Date.now(), caps = {} } =
 }
 
 function isProcessingName(n) {
-  const m = /^(triage|fix|push)-(.+)$/.exec(String(n || ""));
+  const m = /^(triage|fix|push|lab)-(.+)$/.exec(String(n || ""));
   return Boolean(m && isValidJobName(m[2]));
 }
 
@@ -318,7 +328,7 @@ export function queueModel({ redact = (s) => s, now = Date.now(), caps = {}, rec
   try {
     for (const f of fs.readdirSync(path.join(root, "processing"))) {
       if (!f.endsWith(".json") || f.includes(".tmp-") || !isProcessingName(f)) continue;
-      const m = /^(triage|fix|push)-((\d+)-.+)$/.exec(f);
+      const m = /^(triage|fix|push|lab)-((\d+)-.+)$/.exec(f);
       const job = readJson(path.join(root, "processing", f)) || {};
       const claimedAt = parseTime(job._claimed_at);
       const running = worker?.job?.processing === f ? worker.job : null;
@@ -340,7 +350,7 @@ export function queueModel({ redact = (s) => s, now = Date.now(), caps = {}, rec
   }
   const finished = (bucket) =>
     listBucket(bucket, recent).map(({ f, mtime }) => {
-      const m = /^(triage|fix|push)-((\d+)-.+)$/.exec(f);
+      const m = /^(triage|fix|push|lab)-((\d+)-.+)$/.exec(f);
       const reason = readJson(reasonFile(path.join(root, bucket), f));
       const res = resultFor(f);
       return {
@@ -373,6 +383,7 @@ export function queueModel({ redact = (s) => s, now = Date.now(), caps = {}, rec
       triage: pending.filter((j) => j.kind === "triage").length,
       fix: pending.filter((j) => j.kind === "fix").length,
       push: pending.filter((j) => j.kind === "push").length,
+      lab: pending.filter((j) => j.kind === "lab").length,
       processing: processing.length,
       failed24h: failed.filter((j) => j.finishedAt >= dayAgo && !j.retriedAt).length,
     },
@@ -467,7 +478,7 @@ export function requestCancelRunning(processingName) {
   }
   fs.mkdirSync(controlDir(root), { recursive: true });
   atomicWriteJson(cancelFile(root, processingName), { requested_at: new Date().toISOString() });
-  const m = /^(triage|fix|push)-(\d+)-/.exec(processingName);
+  const m = /^(triage|fix|push|lab)-(\d+)-/.exec(processingName);
   return { kind: m[1], incidentId: Number(m[2]) };
 }
 
@@ -479,9 +490,9 @@ export function failedJobInfo(failedName) {
   if (!fs.existsSync(file)) throw new QueueActionError("not_failed", "That failed job no longer exists.", 404);
   const reason = readJson(reasonFile(path.join(root, "failed"), failedName));
   if (reason?.retried_at) throw new QueueActionError("already_retried", "That job was already retried.");
-  const m = /^(triage|fix|push)-(\d+)-/.exec(failedName);
+  const m = /^(triage|fix|push|lab)-(\d+)-/.exec(failedName);
   const job = readJson(file);
-  return { kind: m[1], incidentId: Number(m[2]), pushJob: m[1] === "push" ? String(job?.job || "") : null };
+  return { kind: m[1], incidentId: Number(m[2]), pushJob: m[1] === "push" ? String(job?.job || "") : null, job };
 }
 
 export function markRetried(failedName, newJobFile) {

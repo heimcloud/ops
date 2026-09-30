@@ -91,6 +91,7 @@ export const ACTIONS = {
   start_triage: "Start triage",
   start_fix: "Start fix",
   retry_push: "Retry push",
+  retry_lab: "Retry lab test",
   open_compare: "Open compare link",
   mark_config_error: "Mark config error & close",
   mark_resolved: "Mark resolved",
@@ -202,20 +203,25 @@ function pushReason(fixMeta, job) {
  * @param {object[]} attempts fix_attempts rows
  * @returns {{ needed: boolean, reasons: {code:string,label:string,action:string|null,actions:string[],detail?:string}[] }}
  */
-export function needsHumanInput(incident, events = [], attempts = []) {
+export function needsHumanInput(incident, events = [], attempts = [], opts = {}) {
+  // Automated lab stage enabled on the host (autofix.lab.enable): a queued /
+  // running lab test is worker progress, not a human task.
+  const labAuto = opts.labAuto !== false;
   const reasons = [];
-  if (!incident) return { needed: false, reasons };
+  // Testing with an automated lab job queued/running: progress, not a task.
+  let labQueued = false;
+  if (!incident) return { needed: false, reasons, labQueued };
   const status = incident.status;
   const triage = latestEvent(events, ["triage_result"]);
   const fix = latestEvent(events, ["fix_result"]);
   const triageEnq = latestEvent(events, ["triage_enqueued"]);
-  const fixEnq = latestEvent(events, ["fix_enqueued", "push_enqueued"]);
+  const fixEnq = latestEvent(events, ["fix_enqueued", "push_enqueued", "lab_enqueued"]);
   // A job cancelled while still pending never produces a result: its
   // job_cancelled event (meta.job_kind) ends the busy window instead.
   const cancelledOf = (kinds) =>
     latestEvent(events.filter((e) => e.kind === "job_cancelled" && kinds.includes(metaOf(e)?.job_kind)), ["job_cancelled"]);
   const triageEnd = [triage, cancelledOf(["triage"])].filter(Boolean).sort((x, y) => y.id - x.id)[0];
-  const fixEnd = [fix, cancelledOf(["fix", "push"])].filter(Boolean).sort((x, y) => y.id - x.id)[0];
+  const fixEnd = [fix, cancelledOf(["fix", "push", "lab"])].filter(Boolean).sort((x, y) => y.id - x.id)[0];
   const triageBusy = Boolean(triageEnq && (!triageEnd || triageEnq.id > triageEnd.id));
   const fixBusy = Boolean(fixEnq && (!fixEnd || fixEnq.id > fixEnd.id));
   const fm = fix?.meta || null;
@@ -241,14 +247,52 @@ export function needsHumanInput(incident, events = [], attempts = []) {
       break;
     }
     case "testing": {
-      if (fixBusy) break;
+      if (fixBusy) {
+        labQueued = fixEnq.kind === "lab_enqueued";
+        break;
+      }
+      const labCancel = cancelledOf(["lab"]);
+      if (labCancel && (!fix || labCancel.id > fix.id)) {
+        reasons.push(
+          reason(
+            "lab_cancelled",
+            "Lab test cancelled",
+            ["retry_lab", ...(incident.compare_url ? ["open_compare"] : [])],
+            "The lab job was cancelled before it ran. Retry it, or test the branch manually and move the card to Awaiting PR.",
+          ),
+        );
+        break;
+      }
+      if (fm && ["lab_queued", "lab_retry"].includes(fm.status) && labAuto) {
+        labQueued = true;
+        break;
+      }
+      if (fm?.lab === "cancelled" && fm.via === "lab") {
+        reasons.push(
+          reason(
+            "lab_cancelled",
+            "Lab test cancelled",
+            ["retry_lab", ...(incident.compare_url ? ["open_compare"] : [])],
+            "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to Awaiting PR.",
+          ),
+        );
+        break;
+      }
+      if (fm?.status === "lab_error") {
+        reasons.push(reason("lab_error", "Lab test error", ["retry_lab", "open_compare"], fm.summary));
+        break;
+      }
       if (!fm || !["passed", "failed"].includes(fm.lab)) {
         reasons.push(
           reason(
             "awaiting_lab_test",
             "Lab test needed",
             incident.compare_url ? ["open_compare"] : [],
-            "No lab result on the host (lab test skipped). Test the branch manually, then move the card to Awaiting PR.",
+            fm?.lab === "cancelled"
+              ? "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to Awaiting PR."
+              : fm?.status === "lab_queued"
+                ? "A lab job is queued but automated lab testing is off on the host. Test the branch manually, then move the card to Awaiting PR."
+                : "No lab result on the host (lab test skipped). Test the branch manually, then move the card to Awaiting PR.",
           ),
         );
       }
@@ -263,6 +307,8 @@ export function needsHumanInput(incident, events = [], attempts = []) {
         reasons.push(reason("redaction_blocked", "Redaction gate blocked the push", ["start_fix", "close"], fm.summary));
       } else if (fm?.status === "denied") {
         reasons.push(reason("denied", "Diff touches a deny-listed path", ["start_fix", "close"], fm.summary));
+      } else if (fm?.lab === "error" && /ROLLBACK NOT VERIFIED/.test(String(fm.summary || ""))) {
+        reasons.push(reason("rollback_unverified", "Lab rollback NOT verified: check the host", ["mark_resolved"], fm.summary));
       } else if (fm?.lab === "failed") {
         reasons.push(
           reason("lab_failed", `Lab test failed${nAttempts ? ` after ${nAttempts} attempt(s)` : ""}`, ["start_fix", "close"], fm.summary),
@@ -306,7 +352,7 @@ export function needsHumanInput(incident, events = [], attempts = []) {
       // fixing (worker owns it), resolved, closed
       break;
   }
-  return { needed: reasons.length > 0, reasons };
+  return { needed: reasons.length > 0, reasons, labQueued };
 }
 
 // ------------------------------------------------------------- redaction

@@ -83,7 +83,9 @@ Nothing can be moved *into* `fixing` / `testing` by hand: **Start fix** and the 
 | open, triaged | triage `verdict` `uncertain`, or `confidence` < 0.6 | Triage unsure → Start fix / Mark config error & close |
 | open, triaged | verdict `config_error` / `not_actionable` / `code_fix` | Mark config error & close / Close / Start fix |
 | triaged | latest fix result `ready_no_token` / `push_failed` | Push pending / Push failed → Retry push |
-| testing | no `passed`/`failed` lab result (lab skipped) | Lab test needed → Open compare link |
+| testing | no `passed`/`failed` lab result (lab skipped, or automated lab off) — **no badge** while an automated lab job is queued/running (`OPS_AUTOFIX_LAB`) | Lab test needed → Open compare link |
+| testing | automated lab `lab_error` / lab job cancelled | Lab test error / Lab test cancelled → Retry lab |
+| needs_human | lab rollback not verified | Lab rollback NOT verified: check the host |
 | needs_human | `lab: failed` / `redaction_blocked` / `denied` / Hermes gave up after retries / other | reason + worker summary → Start fix / Close |
 | pr_opened | `compare_url` set | Open the PR from the compare link → Open compare link / Mark resolved |
 
@@ -180,7 +182,7 @@ Client reporting (not this repo): credentials tip `github:heimcloud/credentials`
 
 Host-side loop: queue → local Hermes → fork branch → compare link. Design: [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md).
 
-Fleet enable (hattori):
+Fleet enable (ops host):
 
 1. Credentials: set `[services.credentials.ops] autofixForkPushToken` (fine-grained, `heimcloud/neo` contents:write). Materializes `/run/heimcloud-autofix/github-token`.
 2. Ops settings:
@@ -205,4 +207,20 @@ enable = true
 3. EnvironmentFile contents (0600) at that path: `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`. Fleet must create it or docker `--env-file` fails.
 4. Activate. Confirm no worker units when `autofix.enable = false`. Confirm docker-ops has `OPS_REDACT_EXTRA_SLUGS` set (do not print the value).
 5. Admin **Start fix** enqueues a job; worker runs as `hermes`, pushes the fork branch, and posts a compare link. Damo opens the upstream PR from the incident page in the GitHub web UI.
+
+### Automated lab stage (opt-in)
+
+```toml
+[services.ops.autofix.lab]
+enable = true      # needs autofix.fix.enable
+# flake = "/var/neo/DATA/AppData/configuration"   # host config flake (neo-cli.configPath)
+# nixosConfiguration = "neo"                      # nixosConfigurations.<name>
+# input = "neo"                                   # the input overridden with the fix branch
+# flakeUrl = "github:heimcloud/neo/{branch}"      # public fork, unauthenticated
+# lockWaitSec = 1800; buildTimeoutSec = 3600; activateTimeoutSec = 900; settleSec = 30; checkTimeoutSec = 60; planTimeoutSec = 600
+```
+
+After a fix branch is pushed the worker queues a **lab** job: Hermes (skill `heimcloud-ops-labtest`) plans whitelisted checks, and the worker starts the root unit `heimcloud-ops-labtest@lab-<id>-<ts>.service` (allowed for `hermes` by a polkit rule for exactly that unit pattern, verb start). The runner takes the lab lock and Neo's activation lock, builds the host flake with only `neo` overridden to the fork branch (`--no-write-lock-file`), arms an independent transient systemd rollback timer, activates with `switch-to-configuration test`, runs the generic + incident checks, **always** switches back to the recorded system, verifies the generation and byte-identical `flake.lock`/`flake.nix`/`settings.toml`, and disarms the timer. Pass → compare link (Awaiting PR); fail → Hermes retry with the redacted evidence (per `maxAttempts`), then needs_human. Details: [`docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage`](docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage).
+
+Board: the Testing card shows live lab progress (`lab · Building`, `Activating`, `Checks 3/8`, `Rolling back`, `Restored`) without a human badge; results show as "Lab passed/failed ✓n ✗m" on the card and a per-check list (generation before/after, watchdog, pins, tested commit, redacted evidence) in the drawer. `/admin/queue` lists lab jobs (claim order push › lab › triage › fix); cancel of a running lab job is honoured only before activation.
 

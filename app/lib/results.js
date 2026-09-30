@@ -9,6 +9,7 @@ import {
   addIncidentEvent,
   addFixAttempt,
   nextFixAttemptNumber,
+  updateLatestFixAttempt,
 } from "./db.js";
 import { resultsDir } from "./queue.js";
 
@@ -170,6 +171,15 @@ export function applyResult(result) {
     return;
   }
 
+  // Automated lab result: attach it to the Hermes attempt it tested (no new
+  // attempt row). A manual close/resolve while the lab ran is not undone.
+  if (result.via === "lab") {
+    updateLatestFixAttempt(id, {
+      result: LAB_ATTEMPT_RESULT[result.status] || result.status || "lab",
+      metaPatch: { lab: result.lab, lab_status: result.status, lab_report: result.lab_report || null, lab_job: result.lab_job },
+    });
+  }
+
   // fix result. Only Hermes fix attempts get a fix_attempts row; token /
   // push outcomes (and push-only retries) are events, not attempts.
   if (countsAsHermesAttempt(result)) {
@@ -192,17 +202,25 @@ export function applyResult(result) {
   if (result.pr_url) patch.draft_pr_url = result.pr_url;
   if (result.pr_number) patch.draft_pr_number = result.pr_number;
 
-  patch.status = fixStatusToIncidentStatus(result.status);
+  patch.status =
+    result.via === "lab" && ["resolved", "closed"].includes(incident.status) ? incident.status : fixStatusToIncidentStatus(result.status);
   if (Object.keys(patch).length) updateIncident(id, patch);
   addIncidentEvent(id, "fix_result", result.summary || result.status || "Fix result", result);
 }
 
 const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed", "cancelled"]);
+const LAB_ATTEMPT_RESULT = {
+  compare_ready: "lab_passed",
+  lab_retry: "lab_failed",
+  needs_human: "lab_failed",
+  lab_error: "lab_error",
+  awaiting_lab_test: "lab_cancelled",
+};
 
 /** Hermes fix attempt (vs. token wait / push failure / push-only retry). */
 export function countsAsHermesAttempt(result) {
   if (!result) return false;
-  if (result.via === "push-pending") return false;
+  if (result.via === "push-pending" || result.via === "lab") return false;
   return !NON_ATTEMPT_STATUSES.has(result.status);
 }
 
@@ -241,7 +259,12 @@ export function fixStatusToIncidentStatus(st) {
       return "fixing";
     case "awaiting_lab_test":
     case "testing":
+    case "lab_queued":
+    case "lab_error":
       return "testing";
+    case "lab_retry":
+      // Lab failed; the worker queued the next Hermes attempt itself.
+      return "fixing";
     case "pr_opened":
     case "compare_ready":
       return "pr_opened";

@@ -139,8 +139,8 @@ test("triage result only promotes open incidents", () => {
   assert.equal(getIncident(inc2.id).status, "testing");
 });
 
-test("worker copies of redact.js / compare.js / queue-control.js are byte-identical to app/lib", () => {
-  for (const f of ["redact.js", "compare.js", "queue-control.js"]) {
+test("worker copies of redact.js / compare.js / queue-control.js / lab-checks.js are byte-identical to app/lib", () => {
+  for (const f of ["redact.js", "compare.js", "queue-control.js", "lab-checks.js"]) {
     const a = fs.readFileSync(path.join(repo, "app", "lib", f), "utf8");
     const b = fs.readFileSync(path.join(repo, "scripts", "autofix", f), "utf8");
     assert.equal(a, b, `${f} drifted: cp app/lib/${f} scripts/autofix/${f}`);

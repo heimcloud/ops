@@ -11,13 +11,29 @@
       cp ${../../scripts/autofix/redact.js} $out/redact.js
       cp ${../../scripts/autofix/compare.js} $out/compare.js
       cp ${../../scripts/autofix/queue-control.js} $out/queue-control.js
+      cp ${../../scripts/autofix/lab-checks.js} $out/lab-checks.js
+      cp ${../../scripts/autofix/labtest.mjs} $out/labtest.mjs
     '';
-    heimcloud-ops-worker = pkgs.writeShellApplication {
+    worker = pkgs.writeShellApplication {
       name = "heimcloud-ops-worker";
       runtimeInputs = [pkgs.nodejs_22 pkgs.git pkgs.bash pkgs.coreutils];
       text = ''
         exec ${pkgs.nodejs_22}/bin/node ${workerSrc}/worker.mjs "$@"
       '';
+    };
+    # Root lab runner (heimcloud-ops-labtest@<job>.service only). node + the
+    # script are store paths, so its rollback watchdog does not depend on the
+    # system being tested.
+    labtest = pkgs.writeShellApplication {
+      name = "heimcloud-ops-labtest";
+      runtimeInputs = [pkgs.nodejs_22 pkgs.util-linux pkgs.coreutils];
+      text = ''
+        exec ${pkgs.nodejs_22}/bin/node ${workerSrc}/labtest.mjs "$@"
+      '';
+    };
+    heimcloud-ops-worker = pkgs.symlinkJoin {
+      name = "heimcloud-ops-worker";
+      paths = [worker labtest];
     };
   in {
     packages = {

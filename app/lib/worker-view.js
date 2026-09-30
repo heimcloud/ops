@@ -3,6 +3,7 @@
  * Models come from worker-state.js with free text already redacted; this
  * module only escapes. No job file content besides validated names/ids.
  */
+import { LAB_PHASES } from "./lab-checks.js";
 import { escapeHtml } from "./layout.js";
 import { durationLabel, agoLabel } from "./worker-state.js";
 
@@ -139,7 +140,10 @@ export function renderWorkerPanel(w, q, { base, caps, variant = "board" }) {
           cls: "danger",
           icon: I.x,
           ro,
-          confirm: `Cancel the running ${w.job.kind} job for #${w.job.incidentId}? Hermes is stopped at the next checkpoint (its process group gets SIGTERM).`,
+          confirm:
+            w.job.kind === "lab"
+              ? `Cancel the lab test for #${w.job.incidentId}? Only honoured before activation; an activation already in progress finishes and rolls back.`
+              : `Cancel the running ${w.job.kind} job for #${w.job.incidentId}? Hermes is stopped at the next checkpoint (its process group gets SIGTERM).`,
         })
       : "";
   const facts = [
@@ -156,7 +160,7 @@ export function renderWorkerPanel(w, q, { base, caps, variant = "board" }) {
         ? `<span data-hb-age>${esc(durationLabel(w.heartbeatAgeSec))}</span> ago <span class="muted small">(every ${esc(durationLabel(w.heartbeatSec))} while running, stale after ${esc(minutes(w.staleAfterSec))})</span>`
         : `<span class="muted">never</span>`,
     ]);
-    facts.push(["Limits", `lab ${esc(minutes(w.labTimeoutSec))} · ${esc(w.maxAttempts || "?")} fix attempts · kinds ${esc(w.kinds.join(", ") || "none")}`]);
+    facts.push(["Limits", `${w.kinds.includes("lab") ? "automated lab" : `lab ${esc(minutes(w.labTimeoutSec))}`} · ${esc(w.maxAttempts || "?")} fix attempts · kinds ${esc(w.kinds.join(", ") || "none")}`]);
   }
   const hbAt = w.heartbeatAt || "";
   return `<section class="wpanel ${full ? "wp-full" : "wp-board"} st-${esc(state)}" id="worker-panel" data-worker-panel data-state="${esc(w.state)}" data-display="${esc(state)}" data-hb="${hbAt}" data-stale-after="${w.staleAfterSec}" data-job-incident="${w.job?.incidentId || ""}" data-job-kind="${esc(w.job?.kind || "")}" data-job-stage="${esc(w.job ? w.job.stageText : "")}" data-job-started="${w.job?.startedAt || ""}" aria-label="Autofix worker">
@@ -234,7 +238,7 @@ export function renderQueueSections(w, q, { base, caps }) {
       <td><b>${esc(p.stageText)}</b></td>
       <td class="mono" data-elapsed-from="${p.claimedAt || ""}">${esc(durationLabel(p.elapsedSec))}</td>
       <td>${p.claims > 1 ? `<span class="warnv">claim ${p.claims}/2</span>` : "1"}</td>
-      <td class="qact">${p.cancelRequested ? `<span class="warnv">cancel requested</span>` : actionButton(base, "cancel-running", "Cancel running", { job: p.name, return_to: "queue" }, { cls: "danger", icon: I.x, ro, confirm: `Cancel the running ${p.kind} job for #${p.incidentId}? The worker stops it at the next checkpoint (Hermes' process group gets SIGTERM).` })}</td>
+      <td class="qact">${p.cancelRequested ? `<span class="warnv">cancel requested</span>` : actionButton(base, "cancel-running", "Cancel running", { job: p.name, return_to: "queue" }, { cls: "danger", icon: I.x, ro, confirm: p.kind === "lab" ? `Cancel the lab test for #${p.incidentId}? Only honoured before activation; an activation already in progress finishes and rolls back.` : `Cancel the running ${p.kind} job for #${p.incidentId}? The worker stops it at the next checkpoint (Hermes' process group gets SIGTERM).` })}</td>
     </tr>`,
   );
   const failedRows = q.failed.map(
@@ -289,5 +293,13 @@ export function renderQueuePage(w, q, { base, caps, flash = "", rev = "" }) {
 /** Small "running" strip on the card of the incident the worker is on. */
 export function renderRunLine(job) {
   if (!job) return "";
-  return `<div class="kc-run" data-run>${`<i class="dot" aria-hidden="true"></i>`}<span>${esc(job.kind)} · ${esc(job.stageText)}</span><span class="mono" data-elapsed-from="${job.startedAt || ""}">${esc(durationLabel(job.elapsedSec))}</span></div>`;
+  const steps = job.kind === "lab" && job.labPhase != null ? renderLabSteps(job.labPhase) : "";
+  return `<div class="kc-run" data-run${job.kind === "lab" ? " data-lab" : ""}>${`<i class="dot" aria-hidden="true"></i>`}<span class="kr-t">${esc(job.kind)} · ${esc(job.stageText)}</span><span class="mono" data-elapsed-from="${job.startedAt || ""}">${esc(durationLabel(job.elapsedSec))}</span>${steps}</div>`;
+}
+
+/** Lab progress stepper (Build → Watchdog → Activate → Checks → Roll back → Restored). */
+export function renderLabSteps(phase) {
+  return `<ol class="lab-steps" aria-label="Lab progress: ${esc(LAB_PHASES[phase] || "")}">${LAB_PHASES.map(
+    (p, i) => `<li class="${i < phase ? "done" : i === phase ? "cur" : ""}"${i === phase ? ` aria-current="step"` : ""}><span>${esc(p)}</span></li>`,
+  ).join("")}</ol>`;
 }

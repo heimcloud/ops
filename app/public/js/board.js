@@ -618,6 +618,7 @@
     if (!job || !job.incidentId) return;
     const card = cardById(job.incidentId);
     if (!card) return;
+    card.querySelector(".kc-labq")?.remove();
     let el = card.querySelector(".kc-run");
     if (!el) {
       el = document.createElement("div");
@@ -627,7 +628,30 @@
       const actions = card.querySelector(".kc-actions");
       card.insertBefore(el, actions || null);
     }
+    if (job.kind === "lab") el.dataset.lab = "";
+    else delete el.dataset.lab;
     el.children[1].textContent = `${job.kind} · ${job.stageText}`;
+    // Lab stepper: Build → Watchdog → Activate → Checks → Roll back → Restored.
+    let ol = el.querySelector(".lab-steps");
+    if (job.kind === "lab" && Number.isInteger(job.labPhase)) {
+      if (!ol) {
+        ol = document.createElement("ol");
+        ol.className = "lab-steps";
+        for (const name of ["Build", "Watchdog", "Activate", "Checks", "Roll back", "Restored"]) {
+          const li = document.createElement("li");
+          const s = document.createElement("span");
+          s.textContent = name;
+          li.appendChild(s);
+          ol.appendChild(li);
+        }
+        el.appendChild(ol);
+      }
+      [...ol.children].forEach((li, i) => {
+        li.className = i < job.labPhase ? "done" : i === job.labPhase ? "cur" : "";
+        if (i === job.labPhase) li.setAttribute("aria-current", "step");
+        else li.removeAttribute("aria-current");
+      });
+    } else if (ol) ol.remove();
     el.children[2].dataset.elapsedFrom = job.startedAt || "";
   }
   async function refreshWorker() {

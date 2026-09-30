@@ -32,8 +32,9 @@ const TRUE = ["1", "true", "yes", "on"];
  * "push" (retry pushing a saved fix) is handled by the fix worker.
  */
 export function isAutofixKindEnabled(kind) {
-  const key = kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX";
-  return TRUE.includes(String(process.env[key] || "").toLowerCase());
+  const on = (k) => TRUE.includes(String(process.env[k] || "").toLowerCase());
+  if (kind === "lab") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_LAB");
+  return on(kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX");
 }
 
 /**
@@ -145,7 +146,8 @@ export function enqueueJob(kind, incident) {
       `Autofix ${kind} is not enabled on this host (neo.services.ops.autofix.enable + autofix.${kind}.enable); no worker would pick up the job.`,
     );
   }
-  const pending = findPendingJobs(kind, incident.id);
+  // A fix never runs next to a lab test of the same incident.
+  const pending = [...findPendingJobs(kind, incident.id), ...(kind === "fix" ? findPendingJobs("lab", incident.id) : [])];
   if (pending.length) {
     throw new QueueError(
       "already_queued",
@@ -243,4 +245,80 @@ export function listQueuedJobs(kind) {
     .filter((f) => f.endsWith(".json") && !f.includes(".tmp-"))
     .map((f) => path.join(dir, f))
     .sort();
+}
+
+const LAB_BRANCH = /^(fix|ops)\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+
+/**
+ * Re-enqueue a lab test from a previous lab job's payload (failed/ bucket).
+ * Only whitelisted fields are copied; the plan is re-derived by the worker.
+ */
+export function enqueueLabRetry(incident, prev) {
+  if (!isAutofixKindEnabled("lab")) {
+    throw new QueueError("autofix_disabled", "Automated lab testing is not enabled on this host (autofix.lab.enable).");
+  }
+  if (!prev || Number(prev.incident_id) !== Number(incident.id)) throw new QueueError("invalid_lab_job", "The lab job does not belong to this incident.");
+  const branch = String(prev.branch || "");
+  if (!LAB_BRANCH.test(branch) || branch.includes("..")) throw new QueueError("invalid_lab_job", "The lab job has no valid fix branch.");
+  const pending = [...findPendingJobs("lab", incident.id), ...findPendingJobs("fix", incident.id)];
+  if (pending.length) throw new QueueError("already_queued", `A job for incident #${incident.id} is already queued or running (${path.basename(pending[0])}).`);
+  const pick = (k, re) => (typeof prev[k] === "string" && re.test(prev[k]) ? prev[k] : undefined);
+  const job = {
+    job_version: 1,
+    kind: "lab",
+    incident_id: incident.id,
+    report_hash: incident.report_hash,
+    unit: incident.unit,
+    severity: incident.severity,
+    class: incident.class,
+    neo_version: incident.neo_version,
+    logs_excerpt: incident.logs_excerpt,
+    branch,
+    fix_job: pick("fix_job", /^fix-\d+-[A-Za-z0-9-]+$/),
+    attempt: Math.max(1, Math.floor(Number(prev.attempt) || 1)),
+    max_attempts: Number(prev.max_attempts) || undefined,
+    compare_url: pick("compare_url", /^https:\/\/github\.com\/[^\s]+$/),
+    pr_title: typeof prev.pr_title === "string" ? prev.pr_title.slice(0, 300) : undefined,
+    pr_body: typeof prev.pr_body === "string" ? prev.pr_body.slice(0, 20000) : undefined,
+    base_sha: pick("base_sha", /^[0-9a-f]{7,64}$/),
+    head_sha: pick("head_sha", /^[0-9a-f]{7,64}$/),
+    enqueued_at: new Date().toISOString(),
+    enqueued_by: "admin",
+  };
+  const dir = queueDir("lab");
+  ensureDir(dir);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.join(dir, `${incident.id}-${ts}.json`);
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o660 });
+  fs.renameSync(tmp, dest);
+  return { path: dest, job };
+}
+
+/** Failed lab job (queue/failed/<lab_job>.json) named by the latest lab fix_result, if retryable. */
+export function labRetrySource(incident, latestFixEvent, latestCancelEvent = null) {
+  if (!incident) return null;
+  // A lab job cancelled while still pending (admin queue) never produced a
+  // result: it sits in failed/lab-<name>.json.
+  const c = latestCancelEvent?.meta;
+  if (c && c.job_kind === "lab" && (!latestFixEvent || latestCancelEvent.id > latestFixEvent.id)) {
+    const jf = String(c.job_file || "");
+    if (!/^\d+-[A-Za-z0-9-]+\.json$/.test(jf) || Number(jf.split("-")[0]) !== Number(incident.id)) return null;
+    try {
+      return { name: `lab-${jf}`, job: JSON.parse(fs.readFileSync(path.join(getDataDir(), "queue", "failed", `lab-${jf}`), "utf8")) };
+    } catch {
+      return null;
+    }
+  }
+  const m = latestFixEvent?.meta;
+  if (!m || m.via !== "lab") return null;
+  if (!(m.status === "lab_error" || (m.status === "awaiting_lab_test" && m.lab === "cancelled"))) return null;
+  const name = String(m.lab_job || "");
+  if (!/^lab-\d+-[A-Za-z0-9-]+$/.test(name) || Number(name.split("-")[1]) !== Number(incident.id)) return null;
+  const file = path.join(getDataDir(), "queue", "failed", `${name}.json`);
+  try {
+    return { name: `${name}.json`, job: JSON.parse(fs.readFileSync(file, "utf8")) };
+  } catch {
+    return null;
+  }
 }

@@ -56,6 +56,7 @@
         "${opsAppdata}/queue/triage"
         "${opsAppdata}/queue/fix"
         "${opsAppdata}/queue/push"
+        "${opsAppdata}/queue/lab"
         "${opsAppdata}/queue/processing"
         "${opsAppdata}/queue/done"
         "${opsAppdata}/queue/failed"
@@ -93,6 +94,8 @@
               # queued job would never be picked up.
               OPS_AUTOFIX_FIX = boolStr fixOn;
               OPS_AUTOFIX_TRIAGE = boolStr triageOn;
+              # Automated lab stage: queued/running lab tests are worker progress, not a human task.
+              OPS_AUTOFIX_LAB = boolStr (fixOn && af.lab.enable);
               OPS_AUTOFIX_TOKEN_CONFIGURED = boolStr tokenConfigured;
               ADMIN_ENABLED = boolStr cfg.admin.enabled;
               ADMIN_PATH = adminPath;

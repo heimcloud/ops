@@ -47,6 +47,16 @@ if [ "$skill" = heimcloud-ops-triage ]; then
   echo '{"class":"software","severity":"warning","summary":"engine list stale","target_repo":"madebydamo/neo","fixable":true,"verdict":"code_fix","confidence":"85%"}'
   exit 0
 fi
+if [ "$skill" = heimcloud-ops-labtest ]; then
+  case "\${FAKE_PLAN:-ok}" in
+    ok) echo '{"checks":[{"type":"unit_active","unit":"docker-searxng.service"},{"type":"journal_absent","unit":"docker-searxng.service","pattern":"engine x failed"},{"type":"shell","cmd":"rm -rf /"}]}' ;;
+    none) echo 'no plan today' ;;
+  esac
+  exit 0
+fi
+qf=""; prev=""
+for a in "$@"; do [ "$prev" = --query-file ] && qf="$a"; prev="$a"; done
+[ -n "$qf" ] && cp "$qf" "${tmp}/last-fix-prompt.txt"
 git switch -q -c fix/searxng-engines 2>/dev/null || git switch -q fix/searxng-engines
 case "$mode" in
   ok) echo "limiter = true  # $(date +%s%N)" >> nix/services/searxng/default.nix ;;
@@ -56,6 +66,29 @@ case "$mode" in
 esac
 git add -A && git commit -q -m "fix(searxng): drop stale engines"
 echo '{"status":"ready_to_push","branch":"fix/searxng-engines","summary":"drop stale engines","commit_message":"fix(searxng): drop stale engines"}'`,
+  );
+  // Fake systemctl standing in for the root lab unit: on start it records the
+  // spec the worker handed over and writes result.json per FAKE_LAB_VERDICT.
+  sh(
+    path.join(bin, "fake-systemctl"),
+    `echo "$*" >> "${tmp}/systemctl-calls"
+if [ "$1" = show ]; then echo inactive; exit 0; fi
+if [ "$1" = start ]; then
+  [ "\${FAKE_SYSTEMCTL_FAIL:-0}" = 1 ] && { echo "Failed to start: Access denied" >&2; exit 1; }
+  unit="$3"; inst="\${unit#heimcloud-ops-labtest@}"; inst="\${inst%.service}"
+  cp "${data}/queue/processing/$inst.json" "${tmp}/lab-spec-$inst.json"
+  d="${tmp}/labstate/$inst"; mkdir -p "$d"
+  echo '{"stage":"checks","step":2,"steps":7}' > "$d/status.json"
+  v="\${FAKE_LAB_VERDICT:-pass}"; ok=true; [ "$v" = pass ] || ok=false; unver=false; [ "$v" = unverified ] && { v=fail; unver=true; }
+  cat > "$d/result.json" <<J
+{"verdict":"$v","failed_stage":"checks","reason":"check c1 failed on 10.20.30.40","rollback_unverified":$unver,
+ "checks":[{"id":"g1","type":"activate_exit","generic":true,"ok":true,"detail":"exit 0"},{"id":"c1","type":"unit_active","unit":"docker-searxng.service","ok":$ok,"detail":"docker-searxng.service is failed; peer 10.20.30.40"}],
+ "generation":{"before":41,"after":41,"restored":true,"booted_unchanged":true},"pins":{"identical":true},"watchdog":{"armed":true,"disarmed":true}, 
+ "evidence":["journal docker-searxng.service: engine x failed at 10.20.30.40"]}
+J
+  exit 0
+fi
+exit 0`,
   );
   sh(path.join(bin, "fake-lab-test"), `echo "lab $1 $2"; [ "\${FAKE_LAB:-pass}" = pass ]`);
 
@@ -469,4 +502,134 @@ test("denyListHit matches path prefixes, not substrings in content", () => {
   const cfg = W.config();
   assert.equal(W.denyListHit(["nix/services/opsx/a.nix"], cfg), null);
   assert.equal(W.denyListHit(["nix/services/ops/a.nix"], cfg), "nix/services/ops");
+});
+
+// ---------------------------------------------------------------- automated lab stage
+
+function labEnv(on) {
+  if (on) {
+    Object.assign(process.env, {
+      OPS_AUTOFIX_LAB: "1",
+      OPS_SYSTEMCTL_BIN: path.join(bin, "fake-systemctl"),
+      OPS_AUTOFIX_LAB_STATE_DIR: path.join(tmp, "labstate"),
+      OPS_AUTOFIX_LAB_POLL_MS: "10",
+    });
+    fs.mkdirSync(path.join(data, "queue", "lab"), { recursive: true });
+  } else {
+    for (const k of ["OPS_AUTOFIX_LAB", "OPS_SYSTEMCTL_BIN", "OPS_AUTOFIX_LAB_STATE_DIR", "OPS_AUTOFIX_LAB_POLL_MS", "FAKE_LAB_VERDICT", "FAKE_PLAN", "FAKE_SYSTEMCTL_FAIL"]) delete process.env[k];
+  }
+}
+function resultsFor(kind, id) {
+  return fs
+    .readdirSync(path.join(data, "results"))
+    .filter((n) => n.startsWith(`${kind}-${id}-`) && n.endsWith(".json") && !n.endsWith(".ingested.json"))
+    .sort()
+    .map((n) => ({ name: n, ...JSON.parse(fs.readFileSync(path.join(data, "results", n), "utf8")) }));
+}
+
+test("lab stage: push enqueues a lab job; pass → compare_ready with checks; Hermes plan validated (no shell)", () => {
+  labEnv(true);
+  try {
+    process.env.FAKE_HERMES_MODE = "ok";
+    process.env.FAKE_LAB_VERDICT = "pass";
+    const name = enqueue("fix", 130);
+    W.main([]);
+    const fix = result("fix", name);
+    assert.equal(fix.status, "lab_queued", fix.summary);
+    assert.equal(fix.compare_url, undefined, "no compare link before the lab passes");
+    const [lab] = resultsFor("lab", 130);
+    assert.ok(lab, "lab job ran in the same worker run");
+    assert.equal(lab.status, "compare_ready", lab.summary);
+    assert.equal(lab.via, "lab");
+    assert.match(lab.compare_url, /compare\/dev\.\.\.heimcloud:neo:fix\/searxng-engines/);
+    assert.match(lab.summary, /2\/2 checks passed, generation 41 → lab → 41 \(restored\)/);
+    // Spec handed to the root unit: whitelisted checks only.
+    const inst = lab.lab_job;
+    assert.match(inst, /^lab-130-/);
+    const spec = JSON.parse(fs.readFileSync(path.join(tmp, `lab-spec-${inst}.json`), "utf8"));
+    assert.equal(spec.kind, "lab");
+    assert.equal(spec.branch, "fix/searxng-engines");
+    assert.match(spec.head_sha, /^[0-9a-f]{40}$/, "gated commit handed to the root runner");
+    assert.deepEqual(spec.lab_checks.map((c) => c.type), ["unit_active", "journal_absent"]);
+    assert.equal(JSON.stringify(spec).includes("rm -rf"), false);
+    assert.equal(spec.lab_plan.source, "hermes");
+    assert.ok(spec.lab_plan.notes.some((n) => /shell/.test(n)), "dropped check is noted");
+    const calls = fs.readFileSync(path.join(tmp, "systemctl-calls"), "utf8");
+    assert.match(calls, new RegExp(`start --no-block heimcloud-ops-labtest@${inst}\\.service`));
+    // Evidence redacted, unit names kept readable.
+    const ev = JSON.stringify(lab.lab_report);
+    assert.equal(ev.includes("10.20.30.40"), false);
+    assert.match(ev, /docker-searxng\.service/);
+    assert.ok(fs.existsSync(path.join(data, "queue", "done", `${inst}.json`)));
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("lab stage: failure → retry fix with redacted evidence on the same branch, then needs_human (no compare link)", () => {
+  labEnv(true);
+  try {
+    process.env.FAKE_HERMES_MODE = "ok";
+    process.env.FAKE_LAB_VERDICT = "fail";
+    enqueue("fix", 131);
+    W.main([]);
+    const fixes = resultsFor("fix", 131);
+    const labs = resultsFor("lab", 131);
+    assert.deepEqual(fixes.map((r) => r.status), ["lab_queued", "lab_queued"]);
+    assert.deepEqual(fixes.map((r) => r.attempts), [1, 2]);
+    assert.deepEqual(labs.map((r) => r.status), ["lab_retry", "needs_human"]);
+    assert.equal(labs[1].compare_url, undefined);
+    assert.match(labs[1].summary, /failed after 2 attempt/);
+    const prompt = fs.readFileSync(path.join(tmp, "last-fix-prompt.txt"), "utf8");
+    assert.match(prompt, /FAILED/);
+    assert.match(prompt, /fix\/searxng-engines/);
+    assert.equal(prompt.includes("10.20.30.40"), false, "evidence fed back to Hermes is redacted");
+    // The retry fix job continued on the pushed fork branch (2 commits on it).
+    const n = execFileSync("git", ["-C", fork, "rev-list", "--count", "dev..fix/searxng-engines"], { encoding: "utf8" }).trim();
+    assert.ok(Number(n) >= 2, `fork branch has ${n} commits`);
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("lab stage: error → lab_error in failed/; unverified rollback → needs_human; unit start refused → lab_error", () => {
+  labEnv(true);
+  try {
+    const cfg = W.config();
+    for (const [verdict, id] of [["error", 132], ["unverified", 133]]) {
+      process.env.FAKE_LAB_VERDICT = verdict;
+      W.enqueueLab(cfg, { incident_id: id, unit: "docker-searxng", report_hash: "h", class: "software" }, { branch: "fix/x", attempt: 1, compare_url: "https://github.com/madebydamo/neo/compare/dev...heimcloud:neo:fix/x?expand=1" });
+      W.main([]);
+    }
+    const [e] = resultsFor("lab", 132);
+    assert.equal(e.status, "lab_error");
+    assert.ok(fs.readdirSync(path.join(data, "queue", "failed")).some((n) => n.startsWith("lab-132-")));
+    const [u] = resultsFor("lab", 133);
+    assert.equal(u.status, "needs_human");
+    assert.match(u.summary, /ROLLBACK NOT VERIFIED/);
+
+    process.env.FAKE_SYSTEMCTL_FAIL = "1";
+    process.env.FAKE_PLAN = "none";
+    W.enqueueLab(cfg, { incident_id: 134, unit: "docker-searxng" }, { branch: "fix/x", attempt: 1 });
+    W.main([]);
+    const [d] = resultsFor("lab", 134);
+    assert.equal(d.status, "lab_error");
+    assert.match(d.summary, /polkit/);
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("lab stage: a lab job with an injected branch never reaches systemctl", () => {
+  labEnv(true);
+  try {
+    fs.rmSync(path.join(tmp, "systemctl-calls"), { force: true });
+    W.enqueueLab(W.config(), { incident_id: 135, unit: "x" }, { branch: "fix/x;reboot", attempt: 1 });
+    W.main([]);
+    const [r] = resultsFor("lab", 135);
+    assert.equal(r.status, "lab_error");
+    assert.equal(fs.existsSync(path.join(tmp, "systemctl-calls")), false);
+  } finally {
+    labEnv(false);
+  }
 });

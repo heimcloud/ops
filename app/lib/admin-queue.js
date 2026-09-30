@@ -6,7 +6,7 @@
  */
 import { adminLayout, escapeHtml } from "./layout.js";
 import { getIncident, updateIncident, addIncidentEvent, countByStatus } from "./db.js";
-import { enqueueJob, enqueuePushJob } from "./queue.js";
+import { enqueueJob, enqueuePushJob, enqueueLabRetry } from "./queue.js";
 import {
   workerModel,
   queueModel,
@@ -59,7 +59,7 @@ export function registerQueueRoutes(router, ctx) {
     res.json({
       ok: true,
       display: w.display,
-      job: w.job ? { kind: w.job.kind, incidentId: w.job.incidentId, stageText: w.job.stageText, startedAt: w.job.startedAt } : null,
+      job: w.job ? { kind: w.job.kind, incidentId: w.job.incidentId, stageText: w.job.stageText, startedAt: w.job.startedAt, labPhase: w.job.labPhase ?? null } : null,
       counts: q.counts,
       paused: Boolean(q.paused),
       worker_html: renderWorkerPanel(w, q, { base, caps, variant: full ? "full" : "board" }),
@@ -187,6 +187,9 @@ export function registerQueueRoutes(router, ctx) {
         stage,
       });
     }
+    if (out.kind === "lab") {
+      return `Cancel requested for #${out.incidentId} (lab): honoured only before activation; once the host is activating, the test finishes and rolls back.`;
+    }
     return `Cancel requested for #${out.incidentId} (${out.kind}); the worker stops at its next checkpoint.`;
   });
 
@@ -199,7 +202,15 @@ export function registerQueueRoutes(router, ctx) {
       throw new QueueActionError("incident_done", `Incident #${incident.id} is ${incident.status}; reopen it before retrying.`);
     }
     let file;
-    if (info.kind === "push") {
+    if (info.kind === "lab") {
+      file = enqueueLabRetry(incident, info.job).path.split("/").pop();
+      if (incident.status !== "testing") updateIncident(incident.id, { status: "testing" });
+      addIncidentEvent(incident.id, "lab_enqueued", `Lab test re-enqueued (retry of failed job ${name})`, {
+        job_file: file,
+        job_kind: "lab",
+        retry_of: name,
+      });
+    } else if (info.kind === "push") {
       if (!info.pushJob) throw new QueueActionError("invalid_push_job", "The failed push job has no saved fix name.");
       file = enqueuePushJob(incident, info.pushJob).path.split("/").pop();
       addIncidentEvent(incident.id, "push_enqueued", `Push retry enqueued for saved fix ${info.pushJob} (retry of failed job ${name})`, {

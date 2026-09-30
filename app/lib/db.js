@@ -436,6 +436,25 @@ export function addFixAttempt(incidentId, { attempt, branch, result, evidence_pa
   return database.prepare(`SELECT * FROM fix_attempts WHERE id = ?`).get(info.lastInsertRowid);
 }
 
+/** Merge a lab outcome into the incident's latest fix attempt row (no new attempt). */
+export function updateLatestFixAttempt(incidentId, { result, metaPatch = {} } = {}) {
+  const database = getDb();
+  const row = database
+    .prepare(`SELECT * FROM fix_attempts WHERE incident_id = ? ORDER BY attempt DESC, id DESC LIMIT 1`)
+    .get(incidentId);
+  if (!row) return null;
+  let meta = {};
+  try {
+    meta = row.meta_json ? JSON.parse(row.meta_json) : {};
+  } catch {
+    meta = {};
+  }
+  database
+    .prepare(`UPDATE fix_attempts SET result = ?, meta_json = ? WHERE id = ?`)
+    .run(result || row.result, JSON.stringify({ ...meta, ...metaPatch }), row.id);
+  return database.prepare(`SELECT * FROM fix_attempts WHERE id = ?`).get(row.id);
+}
+
 export function listFixAttempts(incidentId) {
   return getDb()
     .prepare(

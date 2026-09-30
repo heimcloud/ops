@@ -179,6 +179,100 @@
                       description = "EnvironmentFile path exporting OPS_REDACT_EXTRA_SLUGS=… (never inline secrets in nix). Defaults to neo.services.ops.redactExtraSlugsFile so one file serves docker-ops and the autofix worker.";
                       rank = 60;
                     };
+                    lab = mkOption {
+                      type = types.submodule {
+                        options = {
+                          enable = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = ''
+                              Automated lab stage (needs autofix.fix.enable). After a fix branch is
+                              pushed, a lab job builds this host's config with ONLY the neo input
+                              overridden to the fork branch, activates it (switch-to-configuration
+                              test), runs generic + Hermes-planned checks and always rolls back to the
+                              previous system. Installs the root unit heimcloud-ops-labtest@, a polkit
+                              rule letting hermes start exactly that unit, and enables polkit.
+                            '';
+                            rank = 0;
+                          };
+                          flake = mkOption {
+                            type = types.str;
+                            default = "/var/neo/DATA/AppData/configuration";
+                            description = "Host config flake the lab builds (Neo server profile configPath). Never modified; flake.lock/flake.nix/settings.toml are verified byte-identical afterwards.";
+                            rank = 10;
+                          };
+                          nixosConfiguration = mkOption {
+                            type = types.strMatching "[A-Za-z0-9_-]+";
+                            default = "neo";
+                            description = "nixosConfigurations.<name> of that flake (Neo activates .#neo).";
+                            rank = 20;
+                          };
+                          input = mkOption {
+                            type = types.strMatching "[A-Za-z0-9_-]+";
+                            default = "neo";
+                            description = "Flake input overridden to the fix branch for the test only (--override-input, --no-write-lock-file).";
+                            rank = 30;
+                          };
+                          flakeUrl = mkOption {
+                            type = types.strMatching "[A-Za-z0-9:/._+?=-]*[{]branch[}][A-Za-z0-9:/._+?=&-]*";
+                            default = "github:heimcloud/neo/{branch}";
+                            description = "Unauthenticated URL of the public fork; {branch} is replaced by the fix branch (a branch ref, never a SHA).";
+                            rank = 40;
+                          };
+                          opsHealth = mkOption {
+                            type = types.str;
+                            default = "container:ops:3000/health";
+                            description = "Generic ops health check: container:<docker name>:<port><path> (address via docker inspect) or a loopback http:// URL.";
+                            rank = 50;
+                          };
+                          hermesUnit = mkOption {
+                            type = types.str;
+                            default = "hermes-agent.service";
+                            description = "Hermes unit that must be active after activation.";
+                            rank = 55;
+                          };
+                          lockWaitSec = mkOption {
+                            type = types.ints.unsigned;
+                            default = 1800;
+                            description = "Max wait for Neo's activation lock (/run/neo/locks/system.lock) before the lab job errors.";
+                            rank = 60;
+                          };
+                          buildTimeoutSec = mkOption {
+                            type = types.ints.positive;
+                            default = 3600;
+                            description = "Build timeout (nothing is activated before the build succeeds).";
+                            rank = 61;
+                          };
+                          activateTimeoutSec = mkOption {
+                            type = types.ints.positive;
+                            default = 900;
+                            description = "switch-to-configuration timeout for the lab system and for the rollback.";
+                            rank = 62;
+                          };
+                          settleSec = mkOption {
+                            type = types.ints.unsigned;
+                            default = 30;
+                            description = "Wait after activation before checks (then up to 3 min while the system is still starting).";
+                            rank = 63;
+                          };
+                          checkTimeoutSec = mkOption {
+                            type = types.ints.unsigned;
+                            default = 60;
+                            description = "Per-check retry window (unit active, HTTP status).";
+                            rank = 64;
+                          };
+                          planTimeoutSec = mkOption {
+                            type = types.ints.positive;
+                            default = 600;
+                            description = "Timeout of the Hermes call that plans the incident checks (falls back to 'incident unit active').";
+                            rank = 65;
+                          };
+                        };
+                      };
+                      default = {};
+                      description = "Automated lab test of pushed fix branches on this host (default off).";
+                      rank = 70;
+                    };
                   };
                 };
                 default = {};

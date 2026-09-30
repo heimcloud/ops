@@ -72,7 +72,7 @@ test("read-only: no dragging, no action buttons, server refuses every mutation",
     assert.equal(JSON.parse(j.body).error, "read_only");
     const f = await request(port, "POST", `/admin/incidents/${inc.id}`, { form: { _action: "mark_resolved", return_to: "board" } });
     assert.equal(f.status, 403);
-    for (const p of ["start-fix", "start-triage", "retry-push"]) {
+    for (const p of ["start-fix", "start-triage", "retry-push", "retry-lab"]) {
       const r = await request(port, "POST", `/admin/incidents/${inc.id}/${p}`, { json: {} });
       assert.equal(r.status, 403, p);
     }

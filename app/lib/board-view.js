@@ -23,6 +23,8 @@ import {
 } from "./board.js";
 import { resolveTargetRepo } from "./github.js";
 import { liveIndicator, renderRunLine } from "./worker-view.js";
+import { isAutofixKindEnabled } from "./queue.js";
+import { normalizeLabReport } from "./lab-checks.js";
 
 const esc = (s) => escapeHtml(s == null ? "" : s);
 
@@ -54,7 +56,7 @@ export function severityClass(sev) {
  */
 export function buildCardModel(incident, events, attempts, redact, opts = {}) {
   const now = opts.now || new Date();
-  const hi = needsHumanInput(incident, events, attempts);
+  const hi = needsHumanInput(incident, events, attempts, { labAuto: opts.labAuto ?? isAutofixKindEnabled("lab") });
   const reasons = hi.reasons.map((r) => ({
     code: r.code,
     label: redact(r.label),
@@ -90,6 +92,8 @@ export function buildCardModel(incident, events, attempts, redact, opts = {}) {
     actions,
     compareUrl,
     allowedMoves: TRANSITIONS[incident.status] || [],
+    labRun: labSummary(events, redact),
+    labQueued: Boolean(hi.labQueued),
   };
   model.searchText = [
     `#${model.id}`,
@@ -104,6 +108,51 @@ export function buildCardModel(incident, events, attempts, redact, opts = {}) {
     .join(" ")
     .toLowerCase();
   return model;
+}
+
+/** Latest automated lab report of the incident (redacted, normalized) or null. */
+function latestLabEvent(events) {
+  let best = null;
+  for (const e of events || []) {
+    if (e.kind !== "fix_result") continue;
+    const m = e.meta !== undefined ? e.meta : parseMeta(e.meta_json);
+    if (!m?.lab_report || m.via !== "lab") continue;
+    if (!best || Number(e.id) > Number(best.e.id)) best = { e, m };
+  }
+  return best;
+}
+
+function parseMeta(j) {
+  try {
+    return j ? JSON.parse(j) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function labSummary(events, redact) {
+  const best = latestLabEvent(events);
+  if (!best) return null;
+  const r = normalizeLabReport(best.m.lab_report);
+  if (!r) return null;
+  return {
+    verdict: r.verdict,
+    passed: r.passed,
+    failed: r.failed,
+    total: r.checks.length,
+    attempt: Number(best.m.attempts) || null,
+    maxAttempts: Number(best.m.max_attempts) || null,
+    at: formatZurich(best.e.created_at),
+    report: {
+      ...r,
+      reason: redact(r.reason),
+      failedStage: redact(r.failedStage),
+      checks: r.checks.map((c) => ({ ...c, label: redact(c.label), detail: redact(c.detail) })),
+      evidence: r.evidence.map((l) => redact(l)),
+      planNotes: r.planNotes.map((l) => redact(l)),
+      generation: { ...r.generation, labToplevel: redact(r.generation.labToplevel) },
+    },
+  };
 }
 
 /** Drawer model: card model + redacted timeline, attempts, lab, links. */
@@ -192,6 +241,11 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
     path += "/start-fix";
     hidden = "";
     confirm = `Enqueue a fix job for incident #${id}? (local Hermes, fork branch, compare link; no auto-merge)`;
+  } else if (action === "retry_lab") {
+    if (!caps.lab) return "";
+    path += "/retry-lab";
+    hidden = "";
+    confirm = `Re-run the automated lab test for incident #${id}? (activates the fix branch on the lab host, then rolls back)`;
   } else if (action === "retry_push") {
     if (!caps.push) return "";
     path += "/retry-push";
@@ -260,9 +314,64 @@ export function renderCard(card, base, caps, { hidden = false } = {}) {
         ? `<div class="kc-need" title="${esc(card.reasons.map((r) => r.label).join(" · "))}">${ICONS.alert}<span>${esc(top.label)}</span></div>`
         : ""
     }
-    ${caps.runningJob && caps.runningJob.incidentId === card.id ? renderRunLine(caps.runningJob) : ""}
+    ${caps.runningJob && caps.runningJob.incidentId === card.id ? renderRunLine(caps.runningJob) : card.labQueued ? `<div class="kc-labq" title="Automated lab test: the worker runs it; no action needed">Automated lab test queued</div>` : ""}
+    ${card.labRun && ["testing", "needs_human", "pr_opened", "fixing"].includes(card.status) ? renderLabLine(card.labRun) : ""}
     ${actions || (!caps.readOnly && card.allowedMoves.length) ? `<div class="kc-actions">${actions}${moveForm(base, card, caps)}</div>` : ""}
   </article>`;
+}
+
+const VERDICT_LABEL = { pass: "passed", fail: "failed", error: "error", cancelled: "cancelled" };
+
+/** One-line lab result on a card: verdict + per-check pass/fail counts. */
+export function renderLabLine(l) {
+  const v = VERDICT_LABEL[l.verdict] ? l.verdict : "error";
+  return `<div class="kc-lab v-${v}" title="Automated lab test ${esc(VERDICT_LABEL[v])} (${esc(l.at)})">
+      <span class="kc-lab-v">Lab ${esc(VERDICT_LABEL[v])}</span>
+      <span class="kc-lab-n ok" aria-label="${l.passed} passed">✓ ${l.passed}</span>
+      <span class="kc-lab-n bad" aria-label="${l.failed} failed">✗ ${l.failed}</span>
+    </div>`;
+}
+
+/** Drawer section: the full per-check list + rollback guarantees. */
+export function renderLabReport(l) {
+  const r = l.report;
+  const v = VERDICT_LABEL[r.verdict] ? r.verdict : "error";
+  const g = r.generation;
+  const gen =
+    g.before != null
+      ? `${esc(g.before)} → lab → ${esc(g.after ?? "?")} ${g.restored ? `<span class="okv">restored</span>` : `<span class="badv">not verified</span>`}${g.bootedUnchanged ? "" : ` · <span class="badv">booted system changed</span>`}`
+      : `<span class="muted">not activated</span>`;
+  const wd = r.watchdog.fired
+    ? `<span class="badv">fired (runner did not finish)</span>`
+    : r.watchdog.armed
+      ? `armed · ${r.watchdog.disarmed ? `<span class="okv">disarmed</span>` : `<span class="warnv">still armed</span>`}`
+      : `<span class="muted">not armed</span>`;
+  const pins = r.pinsIdentical ? `<span class="okv">byte-identical</span>` : r.pinsRestored ? `<span class="warnv">changed, restored from backup</span>` : g.before != null ? `<span class="badv">not verified</span>` : `<span class="muted">—</span>`;
+  const act = r.activationExit != null ? `exit ${esc(r.activationExit)}` : `<span class="muted">—</span>`;
+  const checks = r.checks.length
+    ? `<ul class="lab-checks">${r.checks
+        .map(
+          (c) => `<li class="${c.ok ? "ok" : "bad"}"><span class="ck" aria-label="${c.ok ? "pass" : "fail"}">${c.ok ? "✓" : "✗"}</span>
+            <span class="lbl">${esc(c.label)}${c.generic ? ` <span class="chip gen">generic</span>` : ""}</span>
+            ${c.detail ? `<span class="det">${esc(c.detail)}</span>` : ""}</li>`,
+        )
+        .join("")}</ul>`
+    : `<p class="muted">No checks ran${r.failedStage ? ` (stopped at ${esc(r.failedStage)})` : ""}.</p>`;
+  return `<section class="lab-rep v-${v}" data-lab-report>
+    <h3>Automated lab test <span class="chip lab-${esc(v === "pass" ? "passed" : v === "fail" ? "failed" : v)}">${esc(VERDICT_LABEL[v])}</span>
+      <span class="muted">${esc(l.at)}${l.attempt ? ` · attempt ${esc(l.attempt)}/${esc(l.maxAttempts || "?")}` : ""} · ${r.passed}/${r.checks.length} checks</span></h3>
+    ${r.reason ? `<p class="lab-reason">${esc(r.reason)}</p>` : ""}
+    ${checks}
+    <dl class="dr-kv lab-kv">
+      <div><dt>Generation</dt><dd>${gen}</dd></div>
+      <div><dt>Watchdog</dt><dd>${wd}</dd></div>
+      <div><dt>Pins (lock/flake/settings)</dt><dd>${pins}</dd></div>
+      <div><dt>Tested commit</dt><dd>${r.testedRev ? `<code>${esc(r.testedRev)}</code> (fork branch tip = gated commit)` : `<span class="muted">—</span>`}</dd></div>
+      <div><dt>Activation</dt><dd>${act}${r.durationSec != null ? ` · run ${esc(Math.round(r.durationSec))} s` : ""}</dd></div>
+      <div><dt>Check plan</dt><dd>${r.planSource === "hermes" ? "Hermes" : r.planSource === "default" ? "default (Hermes plan unusable)" : "—"}${r.planNotes.length ? ` <span class="muted">· ${esc(r.planNotes.join("; "))}</span>` : ""}</dd></div>
+    </dl>
+    ${r.evidence.length ? `<details class="dr-logs"><summary>Evidence (redacted, ${r.evidence.length} lines)</summary><pre>${esc(r.evidence.join("\n"))}</pre></details>` : ""}
+  </section>`;
 }
 
 // ------------------------------------------------------------------ board
@@ -448,7 +557,7 @@ export function renderDrawer(d, base, caps) {
         ${kv("Draft branch", d.branch ? `<code>${esc(d.branch)}</code>` : `<span class="muted">—</span>`)}
         ${kv("Compare / PR", `${compare}${d.draftPrUrl ? ` · <a href="${esc(d.draftPrUrl)}" target="_blank" rel="noopener">Draft PR ${ICONS.ext}</a>` : ""}`)}
       </dl>
-      ${d.labSummary ? `<section><h3>Lab-test result</h3><p class="mono">${esc(d.labSummary)}</p></section>` : ""}
+      ${d.labRun ? renderLabReport(d.labRun) : d.labSummary ? `<section><h3>Lab-test result</h3><p class="mono">${esc(d.labSummary)}</p></section>` : ""}
       <section><h3>Fix attempts <span class="muted">(${d.attemptsTable.length})</span></h3>${attempts}</section>
       <section><h3>Events <span class="muted">newest first · Europe/Zurich</span></h3>${events}</section>
       ${d.logsExcerpt ? `<details class="dr-logs"><summary>Logs excerpt (redacted)</summary><pre>${esc(d.logsExcerpt)}</pre></details>` : ""}
