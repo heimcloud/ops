@@ -31,6 +31,10 @@ const OPS = path.join(tmp, "ops");
 const STATE = path.join(tmp, "state");
 const LOCKS = path.join(tmp, "locks");
 const INST = "lab-7-2026-09-30T10-00-00-000Z";
+// Neo sources (deployed input vs fork branch) the runner diffs for protected paths.
+const SRC_DEPLOYED = path.join(STORE, "dddd-source");
+const SRC_BRANCH = path.join(STORE, "eeee-source");
+const APP_NODE_MODULES = path.resolve(here, "../node_modules");
 const PIN_LOCK = '{"nodes":{"neo":{"locked":{"rev":"0000synthetic"}}},"version":7}\n';
 
 let server;
@@ -61,6 +65,7 @@ before(async () => {
     `: > "${F}/failed"; cp "${F}/failed-pre" "${F}/failed" 2>/dev/null || true
 [ -n "\${FAKE_LAB_ONLY_UNIT:-}" ] && [ -e "${F}/lab-was-active" ] && echo "\${FAKE_LAB_ONLY_UNIT} not-found failed failed Lab only" >> "${F}/failed"
 [ -n "\${FAKE_STILL_FAILED:-}" ] && [ -e "${F}/lab-was-active" ] && echo "\${FAKE_STILL_FAILED} loaded failed failed Real" >> "${F}/failed"
+[ -n "\${FAKE_ROLLBACK_HEALS:-}" ] && rm -f "${F}/ops-down"
 true`,
   );
   system(
@@ -69,6 +74,8 @@ true`,
 [ -n "\${FAKE_LAB_FAILS_UNIT:-}" ] && echo "\${FAKE_LAB_FAILS_UNIT} loaded failed failed Demo" >> "${F}/failed"
 [ -n "\${FAKE_LAB_ONLY_UNIT:-}" ] && echo "\${FAKE_LAB_ONLY_UNIT} loaded failed failed Lab only" >> "${F}/failed"
 [ -n "\${FAKE_LAB_HANG:-}" ] && sleep 30
+[ -n "\${FAKE_LAB_KILLS_OPS:-}" ] && touch "${F}/ops-down"
+[ -n "\${FAKE_LAB_KILLS_HERMES:-}" ] && { grep -vx hermes-agent.service "${F}/active" > "${F}/active.tmp" || true; mv "${F}/active.tmp" "${F}/active"; }
 [ -n "\${FAKE_ACTIVATE_OUT:-}" ] && printf '%s\n' "\${FAKE_ACTIVATE_OUT}" >&2
 [ -n "\${FAKE_LAB_SYSSTATE:-}" ] && echo "\${FAKE_LAB_SYSSTATE}" > "${F}/sysstate"
 ln -sfn "$(dirname "$(dirname "$0")")" "${CUR}"
@@ -78,9 +85,20 @@ exit "\${FAKE_ACTIVATE_EXIT:-0}"`,
   sh(
     path.join(B, "nix"),
     `echo "nix $*" >> "${F}/log"
-case "$*" in *"flake metadata"*)
-  echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2"}},"neo_2":{"locked":{"type":"github","rev":"'"\${FAKE_REV:-${"1".repeat(40)}}"'"}}}}}'
-  exit 0 ;;
+case "$*" in
+  *"flake metadata"*"--override-input"*)
+    echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2"}},"neo_2":{"locked":{"type":"github","rev":"'"\${FAKE_REV:-${"1".repeat(40)}}"'"}}}}}'
+    exit 0 ;;
+  *"flake metadata --json --no-write-lock-file ${FLAKE}")
+    echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2"}},"neo_2":{"locked":{"type":"github","owner":"madebydamo","repo":"neo","rev":"${"9".repeat(40)}","narHash":"sha256-synthetic"}}}}}'
+    exit 0 ;;
+  *"flake metadata --json "*)
+    [ -n "\${FAKE_META_FAIL:-}" ] && exit 1
+    echo '{"path":"${SRC_BRANCH}","revision":"'"\${FAKE_REV:-${"1".repeat(40)}}"'"}'
+    exit 0 ;;
+  *" eval --raw --expr "*"builtins.fetchTree"*)
+    printf '%s' "${SRC_DEPLOYED}"
+    exit 0 ;;
 esac
 case "\${FAKE_NIX_MODE:-ok}" in
   fail) echo "error: builder for '/nix/store/x-demo.drv' failed with exit code 1" >&2; exit 1 ;;
@@ -101,6 +119,12 @@ case "$1" in
       *) if grep -qx "$2" "${F}/active" 2>/dev/null; then echo active; else echo inactive; exit 3; fi ;;
     esac ;;
   stop) rm -f "${F}/timer-$2" ;;
+  restart)
+    echo "$2" >> "${F}/restarted"
+    case "$2" in
+      docker-ops.service) [ -n "\${FAKE_OPS_RESTART_FAILS:-}" ] || rm -f "${F}/ops-down" ;;
+      hermes-agent.service) echo hermes-agent.service >> "${F}/active" ;;
+    esac ;;
   reset-failed) shift; [ "$1" = -- ] && shift; for u in "$@"; do grep -v "^$u " "${F}/failed" > "${F}/failed.tmp"; mv "${F}/failed.tmp" "${F}/failed"; done ;;
 esac
 exit 0`,
@@ -112,10 +136,23 @@ exit 0`,
 for a in "$@"; do case "$a" in --unit=*) touch "${F}/timer-\${a#--unit=}.timer" ;; esac; done
 exit 0`,
   );
+  fs.writeFileSync(
+    path.join(B, "sqlite3"),
+    `#!${process.execPath}
+const Database = require(${JSON.stringify(path.join(APP_NODE_MODULES, "better-sqlite3"))});
+const a = process.argv.slice(2);
+if (a[0] !== "-readonly" || a[1] !== "-json") process.exit(2);
+require("fs").appendFileSync(${JSON.stringify(path.join(F, "log"))}, "sqlite3 " + a.join(" ") + "\\n");
+const db = new Database(a[2], { readonly: true, fileMustExist: true });
+const rows = db.prepare(a[3]).all();
+process.stdout.write(rows.length ? JSON.stringify(rows) : "");
+`,
+    { mode: 0o755 },
+  );
   sh(path.join(B, "journalctl"), `echo "journalctl $*" >> "${F}/log"; cat "${F}/journal" 2>/dev/null; exit 0`);
   server = http.createServer((req, res) => {
     if (req.url === "/health") {
-      res.writeHead(health);
+      res.writeHead(fs.existsSync(path.join(F, "ops-down")) ? 503 : health);
       res.end("ok");
     } else if (req.url === "/svc") {
       res.writeHead(200);
@@ -156,6 +193,12 @@ function env(extra = {}) {
     LABTEST_BOOTED: BOOTED,
     LABTEST_STORE_PREFIX: STORE,
     OPS_REDACT_EXTRA_SLUGS: "ZZSYNTH01Q",
+    LABTEST_OPS_UID: String(process.getuid()),
+    LABTEST_SQLITE_BIN: path.join(B, "sqlite3"),
+    LABTEST_DB_PATH: path.join(OPS, "ops.sqlite"),
+    LABTEST_PROTECTED_WATCHDOG_SEC: "120",
+    LABTEST_PROTECTED_PROBE_SEC: "1",
+    LABTEST_RECOVER_SEC: "1",
     ...extra,
   };
 }
@@ -177,8 +220,22 @@ function spec(extra = {}) {
   };
 }
 
+function neoSource(dir) {
+  fs.rmSync(dir, { recursive: true, force: true });
+  for (const [f, body] of [
+    ["nix/services/hermes/default.nix", "{ hermes = true; }\n"],
+    ["nix/services/searxng/default.nix", "{ }\n"],
+    ["nix/modules/core/default.nix", "{ core = true; }\n"],
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), body);
+  }
+}
+
 function reset(s = spec()) {
   for (const f of fs.readdirSync(F)) fs.rmSync(path.join(F, f), { force: true });
+  neoSource(SRC_DEPLOYED);
+  neoSource(SRC_BRANCH);
   fs.writeFileSync(path.join(F, "active"), "hermes-agent.service\ndocker-demo.service\n");
   fs.writeFileSync(path.join(F, "failed"), "");
   fs.writeFileSync(path.join(F, "failed-pre"), "");
@@ -196,7 +253,7 @@ function reset(s = spec()) {
   fs.rmSync(path.join(OPS, "queue", "control", `cancel-${INST}.json`), { force: true });
   fs.writeFileSync(path.join(OPS, "queue", "processing", `${INST}.json`), JSON.stringify(s));
   health = 200;
-  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG", "FAKE_ACTIVATE_OUT", "FAKE_LAB_SYSSTATE"]) delete process.env[k];
+  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG", "FAKE_ACTIVATE_OUT", "FAKE_LAB_SYSSTATE", "FAKE_LAB_KILLS_OPS", "FAKE_LAB_KILLS_HERMES", "FAKE_ROLLBACK_HEALS", "FAKE_OPS_RESTART_FAILS", "FAKE_META_FAIL"]) delete process.env[k];
   Object.assign(process.env, env());
 }
 
@@ -572,4 +629,235 @@ test("incident checks carrying the worker's ids (c1…) run; a rejected check is
   assert.equal(r.checks.length, 6);
   assert.match(r.plan_errors[0], /^#1: unit_active: id must be/);
   assert.ok(r.evidence.some((l) => /^check #1 dropped: unit_active: id must be/.test(l)), JSON.stringify(r.evidence));
+});
+
+// ---------------------------------------------------------------- protected runs
+
+const Database = (await import("better-sqlite3")).default;
+const L = await import("../lib/lab-checks.js");
+const crypto = await import("node:crypto");
+const KEY = "a".repeat(64);
+function approvalDb() {
+  const db = new Database(path.join(OPS, "ops.sqlite"));
+  db.exec("CREATE TABLE IF NOT EXISTS incident_events (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, kind TEXT NOT NULL, message TEXT, meta_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)");
+  return db;
+}
+function approvalKey() {
+  const dir = path.join(OPS, "private");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  const f = path.join(dir, "lab-approval.key");
+  if (!fs.existsSync(f)) fs.writeFileSync(f, KEY, { mode: 0o400 });
+}
+/** What the app writes on "Approve lab test": DB event + signed approval in the spec. */
+function approved(s = spec(), { meta = {}, instance = INST, at = new Date().toISOString(), tamper = null } = {}) {
+  approvalKey();
+  const db = approvalDb();
+  const id = Number(
+    db
+      .prepare("INSERT INTO incident_events (incident_id, kind, message, meta_json) VALUES (?, ?, ?, ?)")
+      .run(7, meta.kind || "lab_approved", "Lab test approved", JSON.stringify({ lab_job: instance, head_sha: s.head_sha, branch: s.branch, approved_by: "admin", ...meta })).lastInsertRowid,
+  );
+  db.close();
+  const msg = L.labApprovalMessage({ incident_id: 7, instance, branch: s.branch, head_sha: s.head_sha, event_id: id, approved_at: at });
+  const sig = crypto.createHmac("sha256", KEY).update(msg).digest("hex");
+  const out = { ...s, protected: { areas: ["hermes"], paths: ["nix/services/hermes"], core: false }, approved_by: "admin", approval: { v: 1, by: "admin", event_id: id, approved_at: at, sig } };
+  if (tamper) tamper(out);
+  return out;
+}
+const touchHermes = () => fs.writeFileSync(path.join(SRC_BRANCH, "nix/services/hermes/default.nix"), "{ hermes = true; extra = 1; }\n");
+
+test("protected change without approval: detected by the runner itself, nothing built or activated", async () => {
+  touchHermes();
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "error");
+  assert.equal(r.failed_stage, "approval");
+  assert.equal(r.approval_required, true);
+  assert.deepEqual(r.protected.paths, ["nix/services/hermes"]);
+  assert.equal(r.protected.label, "hermes");
+  assert.equal(r.protected.detected, true);
+  assert.match(r.reason, /protected change \(hermes\) needs an admin approval; nothing built or activated/);
+  assert.doesNotMatch(log(), /nix .*build|^switch |systemd-run/m);
+  // Base system: flagged as core.
+  reset();
+  fs.writeFileSync(path.join(SRC_BRANCH, "nix/modules/core/default.nix"), "{ core = false; }\n");
+  fs.mkdirSync(path.join(SRC_BRANCH, "nix/services/swag"), { recursive: true });
+  fs.writeFileSync(path.join(SRC_BRANCH, "nix/services/swag/new.nix"), "{ }\n");
+  const r2 = await lt.runLab(cfg(), INST);
+  assert.equal(r2.approval_required, true);
+  assert.deepEqual(r2.protected.areas.sort(), ["base system", "swag"]);
+  assert.equal(r2.protected.core, true);
+  // Unrelated change: normal run, no approval needed.
+  reset();
+  fs.writeFileSync(path.join(SRC_BRANCH, "nix/services/searxng/default.nix"), "{ limiter = true; }\n");
+  const r3 = await lt.runLab(cfg(), INST);
+  assert.equal(r3.verdict, "pass", r3.reason);
+  assert.equal(r3.protected, undefined);
+  // Cannot tell (source not fetchable) → treated as protected (fail closed).
+  reset();
+  process.env.FAKE_META_FAIL = "1";
+  const r4 = await lt.runLab(cfg(), INST);
+  assert.equal(r4.approval_required, true);
+  assert.equal(r4.protected.unknown, true);
+  assert.doesNotMatch(log(), /^switch /m);
+  // A spec that claims "protected" without an approval is refused too.
+  reset(spec({ protected: { paths: ["nix/services/hermes"] } }));
+  assert.equal((await lt.runLab(cfg(), INST)).approval_required, true);
+  // Lab host not shared with ops: no protected-path gate.
+  reset();
+  touchHermes();
+  const r5 = await lt.runLab(lt.labConfig({ ...process.env, LABTEST_SHARES_OPS_HOST: "false" }), INST);
+  assert.equal(r5.verdict, "pass", r5.reason);
+});
+
+test("approved protected run: HMAC + DB event verified, short watchdog, services verified after rollback, approval single-use", async () => {
+  touchHermes();
+  const s = approved();
+  reset(s);
+  touchHermes();
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", `${r.reason} ${JSON.stringify(r.checks)}`);
+  assert.equal(r.protected.approved, true);
+  assert.equal(r.protected.approval_event_id, s.approval.event_id);
+  assert.equal(r.watchdog.deadline_sec, 120, "protected watchdog deadline");
+  assert.match(log(), /systemd-run .*--on-active=120s/);
+  assert.match(log(), /sqlite3 -readonly -json \S+ops\.sqlite SELECT id, incident_id, kind, meta_json FROM incident_events WHERE id = \d+;/);
+  assert.ok(r.evidence.some((l) => /^protected run \(hermes\): approved by admin \(event #\d+\); watchdog 120 s/.test(l)), JSON.stringify(r.evidence));
+  assert.ok(r.evidence.includes("after rollback: ops /health ok (HTTP 200)"));
+  assert.ok(r.evidence.includes("after rollback: Hermes ok (active)"));
+  assert.equal(r.post_rollback_services.ok, true);
+  assert.equal(r.services_unhealthy, undefined);
+  assert.equal(r.generation.restored, true);
+  assert.ok(fs.existsSync(path.join(STATE, "approvals", `${s.approval.event_id}.used`)));
+  // Same approval again (e.g. a worker re-queues the spec): refused.
+  reset(s);
+  touchHermes();
+  const again = await lt.runLab(cfg(), INST);
+  assert.equal(again.approval_invalid, true);
+  assert.match(again.reason, /approval rejected: approval already used/);
+  assert.doesNotMatch(log(), /^switch /m);
+});
+
+test("approval forgery / mismatch is refused before building", async () => {
+  const cases = [
+    ["bad signature", approved(spec(), { tamper: (o) => (o.approval.sig = "0".repeat(64)) }), /signature invalid/],
+    ["other branch", approved(spec(), { tamper: (o) => (o.branch = "fix/other") }), /signature invalid/],
+    ["event for another job", approved(spec(), { meta: { lab_job: "lab-7-other" } }), /does not match this job/],
+    ["event of another kind", approved(spec(), { meta: { kind: "admin_update" } }), /does not match this job/],
+    ["missing event", approved(spec(), { tamper: (o) => { o.approval.event_id = 999999; o.approval.sig = crypto.createHmac("sha256", KEY).update(L.labApprovalMessage({ incident_id: 7, instance: INST, branch: o.branch, head_sha: o.head_sha, event_id: 999999, approved_at: o.approval.approved_at })).digest("hex"); } }), /not found in the ops DB/],
+    ["expired", approved(spec(), { at: new Date(Date.now() - 4 * 86400_000).toISOString() }), /expired/],
+    ["not by admin", approved(spec(), { tamper: (o) => (o.approval.by = "worker") }), /malformed/],
+  ];
+  for (const [name, s, why] of cases) {
+    reset(s);
+    touchHermes();
+    const r = await lt.runLab(cfg(), INST);
+    assert.equal(r.approval_invalid, true, name);
+    assert.match(r.reason, why, name);
+    assert.doesNotMatch(log(), /nix .*build|^switch /m, name);
+  }
+  // Key readable by others (or owned by another uid) → no approval is trusted.
+  const s = approved();
+  fs.chmodSync(path.join(OPS, "private", "lab-approval.key"), 0o440);
+  reset(s);
+  touchHermes();
+  let r = await lt.runLab(cfg(), INST);
+  assert.match(r.reason, /approval key has the wrong owner, mode or size/);
+  fs.chmodSync(path.join(OPS, "private", "lab-approval.key"), 0o400);
+  reset(s);
+  touchHermes();
+  r = await lt.runLab(lt.labConfig({ ...process.env, LABTEST_OPS_UID: String(process.getuid() + 1) }), INST);
+  assert.match(r.reason, /approval key dir has the wrong owner or mode/);
+});
+
+test("approved protected run: ops down after activation → immediate rollback, ops restarted and verified", async () => {
+  const s = approved();
+  reset(s);
+  touchHermes();
+  process.env.FAKE_LAB_KILLS_OPS = "1";
+  const t0 = Date.now();
+  const r = await lt.runLab(cfg(), INST);
+  assert.ok(Date.now() - t0 < 15000, "no full check timeouts");
+  assert.equal(r.verdict, "fail");
+  assert.match(r.reason, /protected run: ops \/health down \(HTTP 503\) after activation; rolled back immediately/);
+  assert.equal(r.protected_probe.ops_health, false);
+  assert.ok(r.checks.filter((c) => !c.generic).every((c) => c.ok === false && /rolled back immediately/.test(c.detail)));
+  assert.ok(r.evidence.some((l) => /ops \/health down \(HTTP 503\) after activation → rolling back immediately/.test(l)));
+  assert.ok(r.evidence.includes("after rollback: ops /health down (HTTP 503); restarting docker-ops.service"));
+  assert.ok(r.evidence.includes("after restart of docker-ops.service: ops /health ok (HTTP 200)"));
+  assert.equal(r.post_rollback_services.ops_health.restarted, true);
+  assert.equal(r.post_rollback_services.ok, true);
+  assert.equal(r.generation.restored, true);
+  assert.equal(fs.realpathSync(CUR), BASE);
+  // Rollback heals ops by itself: no restart.
+  const s2 = approved();
+  reset(s2);
+  touchHermes();
+  process.env.FAKE_LAB_KILLS_OPS = "1";
+  process.env.FAKE_ROLLBACK_HEALS = "1";
+  const r2 = await lt.runLab(cfg(), INST);
+  assert.equal(r2.post_rollback_services.ops_health.restarted, false);
+  assert.doesNotMatch(log(), /systemctl restart docker-ops/);
+});
+
+test("approved protected run: Hermes killed and not back after rollback → restarted; ops that stays down is flagged", async () => {
+  let s = approved();
+  reset(s);
+  touchHermes();
+  process.env.FAKE_LAB_KILLS_HERMES = "1";
+  let r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "fail");
+  assert.match(r.reason, /Hermes inactive after activation/);
+  assert.match(log(), /systemctl restart hermes-agent\.service/);
+  assert.ok(r.evidence.includes("after restart of hermes-agent.service: Hermes ok (active)"));
+  assert.equal(r.services_unhealthy, undefined);
+  s = approved();
+  reset(s);
+  touchHermes();
+  process.env.FAKE_LAB_KILLS_OPS = "1";
+  process.env.FAKE_OPS_RESTART_FAILS = "1";
+  r = await lt.runLab(cfg(), INST);
+  assert.equal(r.services_unhealthy, true);
+  assert.equal(r.services_reason, "ops /health");
+  assert.ok(r.evidence.includes("after restart of docker-ops.service: ops /health STILL DOWN (HTTP 503)"));
+  assert.equal(r.generation.restored, true, "the rollback itself is still verified");
+});
+
+test("watchdog of a protected run also verifies and restarts ops / Hermes", async () => {
+  const dir = path.join(STATE, INST);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.rmSync(path.join(dir, "result.json"), { force: true });
+  fs.writeFileSync(path.join(F, "ops-down"), "");
+  const act = {
+    version: 1,
+    instance: INST,
+    phase: "activating",
+    before: BASE,
+    lab: LAB,
+    current_link: CUR,
+    profile: PROFILE,
+    store_prefix: STORE,
+    rollback_timeout_sec: 20,
+    lab_unit: `heimcloud-ops-labtest@${INST}.service`,
+    systemctl: path.join(B, "systemctl"),
+    flock: "flock",
+    system_lock: path.join(LOCKS, "system.lock"),
+    flake: FLAKE,
+    pins: [],
+    protected: true,
+    ops_health: `http://localhost:${port}/health`,
+    ops_unit: "docker-ops.service",
+    hermes_unit: "hermes-agent.service",
+    recover_sec: 1,
+  };
+  fs.writeFileSync(path.join(dir, "activation.json"), JSON.stringify(act));
+  fs.rmSync(CUR);
+  fs.symlinkSync(LAB, CUR);
+  const w = await lt.runWatchdog(path.join(dir, "activation.json"), { ...process.env, LABTEST_POLL_MS: "20" });
+  assert.equal(w.restored, true);
+  assert.equal(w.services.ok, true);
+  assert.equal(w.services.ops_health.restarted, true);
+  const res = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
+  assert.ok(res.evidence.includes("after restart of docker-ops.service: ops /health ok (HTTP 200)"), JSON.stringify(res.evidence));
+  assert.equal(res.services_unhealthy, false);
 });

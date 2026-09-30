@@ -63,6 +63,8 @@ export function buildCardModel(incident, events, attempts, redact, opts = {}) {
     action: r.action,
     actions: r.actions,
     ...(r.detail ? { detail: truncate(redact(r.detail), 400) } : {}),
+    ...(r.protected ? { protected: { label: redact(r.protected.label), core: r.protected.core === true } } : {}),
+    ...(r.untested ? { untested: true } : {}),
   }));
   const compareUrl = safeLink(incident.compare_url, redact);
   const summaryFull = redact(incidentSummary(incident, events));
@@ -94,6 +96,9 @@ export function buildCardModel(incident, events, attempts, redact, opts = {}) {
     allowedMoves: TRANSITIONS[incident.status] || [],
     labRun: labSummary(events, redact),
     labQueued: Boolean(hi.labQueued),
+    // Protected fix waiting for "Approve lab test" / skipped lab (warning chip).
+    protectedLab: reasons.find((r) => r.protected)?.protected || null,
+    untested: reasons.some((r) => r.untested),
   };
   model.searchText = [
     `#${model.id}`,
@@ -163,8 +168,18 @@ export function labSummary(events, redact) {
       evidence: r.evidence.map((l) => redact(l)),
       planNotes: r.planNotes.map((l) => redact(l)),
       generation: { ...r.generation, labToplevel: redact(r.generation.labToplevel) },
+      protected: r.protected ? { ...r.protected, label: redact(r.protected.label), paths: r.protected.paths.map((p) => redact(p)) } : null,
+      protectedProbe: redactSvc(r.protectedProbe, redact),
+      postRollbackServices: redactSvc(r.postRollbackServices, redact),
+      servicesReason: redact(r.servicesReason),
     },
   };
+}
+
+function redactSvc(p, redact) {
+  if (!p) return null;
+  const one = (v) => (v ? { ...v, detail: redact(v.detail) } : null);
+  return { ops: one(p.ops), hermes: one(p.hermes) };
 }
 
 /** Drawer model: card model + redacted timeline, attempts, lab, links. */
@@ -244,6 +259,8 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
   let path = `${base}/incidents/${id}`;
   let hidden = `<input type="hidden" name="_action" value="${esc(action)}" />`;
   let confirm = "";
+  let extraCls = "";
+  let label = ACTIONS[action];
   if (action === "start_triage") {
     if (!caps.triage) return "";
     path += "/start-triage";
@@ -258,6 +275,29 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
     path += "/retry-lab";
     hidden = "";
     confirm = `Re-run the automated lab test for incident #${id}? (activates the fix branch on the lab host, then rolls back)`;
+  } else if (action === "approve_lab") {
+    if (!caps.lab) return "";
+    path += "/approve-lab";
+    hidden = "";
+    const p = card.protectedLab || { label: "protected", core: false };
+    const wd = Math.round((Number(caps.protectedWatchdogSec) || 600) / 60);
+    if (p.core) {
+      extraCls = " danger";
+      label = "Approve lab test (base system!)";
+      confirm =
+        `BASE SYSTEM change (${p.label}) for incident #${id}. The lab test activates it on the shared ops/lab host and can cut ` +
+        `network / SSH / the ops app / Hermes / the worker there. The root runner rolls back as soon as ops or Hermes is down, ` +
+        `the watchdog rolls back after ${wd} min at the latest, then ops and Hermes are checked and restarted. ` +
+        `If the host stays unreachable you need console access. Approve the lab test?`;
+    } else {
+      confirm =
+        `Protected change (${p.label}) for incident #${id}: the lab test activates it on the shared ops/lab host and may take down ` +
+        `ops, Hermes or the worker for a moment. Rollback is immediate if ops or Hermes goes down (watchdog ${wd} min). Approve the lab test?`;
+    }
+  } else if (action === "skip_lab") {
+    path += "/skip-lab";
+    hidden = "";
+    confirm = `Open the compare link for incident #${id} WITHOUT a lab test? The card moves to Awaiting PR marked "NOT lab-tested".`;
   } else if (action === "retry_push") {
     if (!caps.push) return "";
     path += "/retry-push";
@@ -270,7 +310,7 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
   }
   return `<form class="act-form" method="post" action="${esc(path)}"${confirm ? ` data-confirm="${esc(confirm)}"` : ""}>
       ${hidden}<input type="hidden" name="return_to" value="board" />
-      <button class="${cls}${primary}" type="submit">${esc(ACTIONS[action])}</button>
+      <button class="${cls}${primary}${extraCls}" type="submit">${esc(label)}</button>
     </form>`;
 }
 
@@ -326,6 +366,8 @@ export function renderCard(card, base, caps, { hidden = false } = {}) {
         ? `<div class="kc-need" title="${esc(card.reasons.map((r) => r.label).join(" · "))}">${ICONS.alert}<span>${esc(top.label)}</span></div>`
         : ""
     }
+    ${card.protectedLab?.core ? `<div class="kc-warn" title="The fix touches the base system of the shared ops/lab host">BASE SYSTEM change: lab test needs your approval</div>` : ""}
+    ${card.untested ? `<div class="kc-warn" title="Lab test skipped by admin">NOT lab-tested</div>` : ""}
     ${caps.runningJob && caps.runningJob.incidentId === card.id ? renderRunLine(caps.runningJob) : card.labQueued ? `<div class="kc-labq" title="Automated lab test: the worker runs it; no action needed">Automated lab test queued</div>` : ""}
     ${card.labRun && ["testing", "needs_human", "pr_opened", "fixing"].includes(card.status) ? renderLabLine(card.labRun) : ""}
     ${actions || (!caps.readOnly && card.allowedMoves.length) ? `<div class="kc-actions">${actions}${moveForm(base, card, caps)}</div>` : ""}
@@ -349,6 +391,12 @@ export function renderLabLine(l) {
 }
 
 /** Drawer section: the full per-check list + rollback guarantees. */
+function svcPair(p) {
+  const one = (name, v) =>
+    v ? `${name} <span class="${v.ok ? "okv" : "badv"}">${v.ok ? "ok" : "down"}</span>${v.restarted ? " (restarted)" : ""}${v.detail ? ` <span class="muted">${esc(v.detail)}</span>` : ""}` : "";
+  return [one("ops /health", p.ops), one("Hermes", p.hermes)].filter(Boolean).join(" · ");
+}
+
 export function renderLabReport(l) {
   const r = l.report;
   const v = VERDICT_LABEL[r.verdict] ? r.verdict : "error";
@@ -383,7 +431,10 @@ export function renderLabReport(l) {
     ${checks}
     <dl class="dr-kv lab-kv">
       <div><dt>Generation</dt><dd>${gen}</dd></div>
-      <div><dt>Watchdog</dt><dd>${wd}</dd></div>
+      ${r.protected ? `<div><dt>Protected</dt><dd><span class="${r.protected.core ? "badv" : "warnv"}">${esc(r.protected.label)}${r.protected.core ? " (BASE SYSTEM)" : ""}</span> · ${r.protected.approved ? `approved by admin${r.protected.approvalEventId ? ` (event #${esc(r.protected.approvalEventId)})` : ""}` : `<span class="badv">not approved</span>`}</dd></div>` : ""}
+      <div><dt>Watchdog</dt><dd>${wd}${r.watchdog.deadlineSec ? ` <span class="muted">· deadline ${esc(Math.round(r.watchdog.deadlineSec / 60))} min</span>` : ""}</dd></div>
+      ${r.protectedProbe ? `<div><dt>Ops / Hermes after activation</dt><dd>${svcPair(r.protectedProbe)}</dd></div>` : ""}
+      ${r.postRollbackServices ? `<div><dt>Services after rollback</dt><dd>${svcPair(r.postRollbackServices)}${r.servicesUnhealthy ? ` · <span class="badv">STILL DOWN: check the host</span>` : ""}</dd></div>` : ""}
       <div><dt>Pins (lock/flake/settings)</dt><dd>${pins}</dd></div>
       <div><dt>Tested commit</dt><dd>${r.testedRev ? `<code>${esc(r.testedRev)}</code> (fork branch tip = gated commit)` : `<span class="muted">—</span>`}</dd></div>
       <div><dt>Activation</dt><dd>${act}${r.durationSec != null ? ` · run ${esc(Math.round(r.durationSec))} s` : ""}</dd></div>

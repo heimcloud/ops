@@ -43,6 +43,12 @@ import {
   keepUnitNames,
   normalizeLabReport,
   checkLabel,
+  DEFAULT_PROTECTED_PATHS,
+  DEFAULT_BASE_PATHS,
+  normalizePathPrefixes,
+  protectedPrefixesHit,
+  describeProtected,
+  normalizeProtected,
 } from "./lab-checks.js";
 
 const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -72,11 +78,10 @@ export function config() {
     lock: e.OPS_AUTOFIX_LOCK || "/run/heimcloud-ops-worker/lock",
     maxAttempts: Math.max(1, Number(e.OPS_AUTOFIX_MAX_ATTEMPTS || 2)),
     maxJobs: Math.max(1, Number(e.OPS_AUTOFIX_MAX_JOBS || 10)),
-    deny: (e.OPS_AUTOFIX_DENY_PATHS ||
-      "nix/services/ops,nix/services/hermes,nix/services/swag,nix/modules/core")
-      .split(",")
-      .map((s) => s.trim().replace(/^\.?\/+/, "").replace(/\/+$/, ""))
-      .filter(Boolean),
+    // Protected paths (formerly "deny list"): fixes touching them are written
+    // and pushed, but the automated lab test waits for an admin approval.
+    deny: normalizePathPrefixes(String(e.OPS_AUTOFIX_DENY_PATHS || DEFAULT_PROTECTED_PATHS.join(",")).split(",")),
+    basePaths: normalizePathPrefixes(String(e.OPS_AUTOFIX_BASE_PATHS || DEFAULT_BASE_PATHS.join(",")).split(",")),
     labSharesOps: !FALSE.includes(
       String(e.OPS_AUTOFIX_LAB_SHARES_OPS_HOST || "true").toLowerCase(),
     ),
@@ -707,15 +712,51 @@ export function scanOutbound(label, text, slugs) {
   }
 }
 
+/** First protected prefix the diff touches (null when the lab does not share the ops host). */
 export function denyListHit(files, cfg) {
+  return protectedHit(files, cfg)?.paths[0] || null;
+}
+
+/**
+ * Protected paths touched by the diff while the lab shares the ops host:
+ * {areas, paths, core, label, files} or null. Not a refusal any more: the fix
+ * is pushed, the lab test waits for an admin approval.
+ */
+export function protectedHit(files, cfg) {
   if (!cfg.labSharesOps) return null;
-  for (const f of files) {
-    const norm = f.replace(/^\.?\/+/, "");
-    for (const d of cfg.deny) {
-      if (norm === d || norm.startsWith(`${d}/`)) return d;
-    }
-  }
-  return null;
+  const hit = protectedPrefixesHit(files, cfg.deny);
+  if (!hit.length) return null;
+  const inHit = (f) => hit.some((d) => f === d || f.startsWith(`${d}/`));
+  return { ...describeProtected(hit, cfg.basePaths || DEFAULT_BASE_PATHS), files: files.map((f) => f.replace(/^\.?\/+/, "")).filter(inHit).slice(0, 10) };
+}
+
+/**
+ * Result for a pushed fix whose lab test needs an admin approval (protected
+ * path). No compare link yet (pending_compare_url is only used by the admin
+ * "Skip lab" action); everything the app needs to build the approved lab job
+ * comes from this result, never from the form.
+ */
+export function approvalNeededResult(common, info, extra = "") {
+  const prot = normalizeProtected(info.protected) || info.protected;
+  return {
+    ...common,
+    branch: info.branch,
+    job: info.fix_job,
+    fix_job: info.fix_job,
+    attempt: info.attempt,
+    head_sha: info.head_sha,
+    base_sha: info.base_sha,
+    pr_title: info.pr_title,
+    pr_body: info.pr_body,
+    compare_url: undefined,
+    pending_compare_url: info.compare_url,
+    protected: prot,
+    status: "lab_approval_needed",
+    lab: "awaiting_approval",
+    summary:
+      `Protected path (${prot.label}): approve lab test. Branch ${info.branch} was pushed to the fork; the automated lab test did not run ` +
+      `because the change touches ${prot.paths.join(", ")}${prot.core ? " (base system)" : ""}.${extra ? ` ${extra}` : ""}`,
+  };
 }
 
 function tail(s, n = 800) {
@@ -960,10 +1001,8 @@ export function gateCommits(cfg, neoDir, baseSha, { branch, prTitle, prBody, slu
     return { ok: false, result: { status: "redaction_blocked", summary: "commit author/committer differs from the pinned autofix identity" } };
   }
   const files = git(neoDir, ["diff", "--name-only", `${baseSha}..HEAD`]).stdout.split("\n").filter(Boolean);
-  const denied = denyListHit(files, cfg);
-  if (denied) {
-    return { ok: false, result: { status: "denied", summary: `diff touches deny-listed path ${denied} while lab shares ops host` } };
-  }
+  // Protected paths no longer block the fix; the lab test needs an approval.
+  const prot = protectedHit(files, cfg);
   const diffText = git(neoDir, ["diff", `${baseSha}..HEAD`]).stdout;
   const msgs = git(neoDir, ["log", "--format=%B", `${baseSha}..HEAD`]).stdout;
   try {
@@ -975,7 +1014,7 @@ export function gateCommits(cfg, neoDir, baseSha, { branch, prTitle, prBody, slu
   } catch (err) {
     return { ok: false, result: { status: "redaction_blocked", summary: err.message, hits: err.hits } };
   }
-  return { ok: true, files, commits: count };
+  return { ok: true, files, commits: count, protected: prot };
 }
 
 /** Save everything a later push needs (no second Hermes run). */
@@ -1146,7 +1185,7 @@ export function handleFix(cfg, job, ctx) {
       };
     }
 
-    const pushed = pushAndLab(cfg, neoDir, branch, job.class, { skipLab: cfg.labAuto });
+    const pushed = pushAndLab(cfg, neoDir, branch, job.class, { skipLab: cfg.labAuto || Boolean(gate.protected) });
     if (!pushed.pushed) {
       // Not a Hermes failure: no retry loop, attempt budget untouched.
       return {
@@ -1157,6 +1196,28 @@ export function handleFix(cfg, job, ctx) {
       };
     }
     last = { ...common, branch, compare_url: pushed.compare_url, pr_title: prTitle, pr_body: prBody };
+    if (gate.protected) {
+      const info = {
+        protected: gate.protected,
+        branch,
+        fix_job: jobName,
+        attempt,
+        head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim(),
+        base_sha: baseSha,
+        pr_title: prTitle,
+        pr_body: prBody,
+        compare_url: pushed.compare_url,
+      };
+      if (cfg.labAuto) return approvalNeededResult(common, info);
+      return {
+        ...last,
+        protected: gate.protected,
+        head_sha: info.head_sha,
+        status: "awaiting_lab_test",
+        lab: "skipped",
+        summary: `Protected path (${gate.protected.label}): branch pushed, compare link ready; no automatic lab test for protected paths. Test manually before opening the PR.`,
+      };
+    }
     if (cfg.labAuto) {
       // Automated lab stage: a separate lab job (shown in the queue) runs the
       // root lab unit. No compare link until it passes.
@@ -1231,6 +1292,9 @@ function enqueueSelf(cfg, kind, incidentId, payload) {
 }
 
 export function enqueueLab(cfg, job, fields) {
+  // Only the app (admin approval) may queue a protected lab job; the root
+  // runner re-checks the approval and detects protected changes on its own.
+  if (fields?.protected || fields?.approval || fields?.approved_by) throw new Error("the worker cannot enqueue a protected / approved lab job");
   const incidentId = Number(job.incident_id);
   return enqueueSelf(cfg, "lab", incidentId, {
     report_hash: job.report_hash,
@@ -1346,6 +1410,22 @@ export function handleLab(cfg, job, ctx) {
   const err = (summary, extra = {}) => ({ ...base, status: "lab_error", lab: "error", summary, _bucket: "failed", _reason: { code: "lab_error", reason: summary.slice(0, 160) }, ...extra });
   if (!isValidInstance(instance) || !isValidBranch(job.branch)) return err("lab job has an invalid name or branch");
   const unit = `${cfg.labUnitPrefix}@${instance}.service`;
+  const labInfo = (prot) => ({
+    protected: normalizeProtected(prot) || describeProtected(["(unknown)"]),
+    branch: job.branch,
+    fix_job: job.fix_job,
+    attempt,
+    head_sha: job.head_sha,
+    base_sha: job.base_sha,
+    pr_title: job.pr_title,
+    pr_body: job.pr_body,
+    compare_url: job.compare_url,
+  });
+  // A protected lab job without the app's approval never reaches the root
+  // unit (the runner would refuse it anyway).
+  if (job.protected && !job.approval) {
+    return { ...approvalNeededResult(base, labInfo(job.protected)), _bucket: "failed", _reason: { code: "approval_required", reason: "protected lab job without admin approval" } };
+  }
 
   let report = readLabFile(cfg, instance, "result.json");
   let plan = null;
@@ -1413,6 +1493,16 @@ export function handleLab(cfg, job, ctx) {
   const gen = norm.generation.before != null ? `, generation ${norm.generation.before} → lab → ${norm.generation.after ?? "?"}${norm.generation.restored ? " (restored)" : ""}` : "";
   const withReport = { ...base, lab_report, evidence_path: path.join(cfg.labStateDir, instance, "result.json") };
 
+  // The root runner found protected changes (its own diff of the deployed neo
+  // source vs the fork branch) and no valid admin approval: nothing activated.
+  if (report.approval_required || report.approval_invalid) {
+    const extra = report.approval_invalid ? `The runner rejected the approval (${redact(report.reason || "")}); approve again.` : "";
+    return {
+      ...approvalNeededResult({ ...base, lab_report, evidence_path: path.join(cfg.labStateDir, instance, "result.json") }, labInfo(report.protected), extra.slice(0, 300)),
+      _bucket: "failed",
+      _reason: { code: "approval_required", reason: report.approval_invalid ? "approval rejected by the lab runner" : "protected change without admin approval" },
+    };
+  }
   if (report.rollback_unverified) {
     return {
       ...withReport,
@@ -1421,6 +1511,17 @@ export function handleLab(cfg, job, ctx) {
       summary: `ROLLBACK NOT VERIFIED after the lab test: check the host now. ${redact(report.reason || "")}`.slice(0, 600),
       _bucket: "failed",
       _reason: { code: "rollback_unverified", reason: "lab rollback not verified" },
+    };
+  }
+  if (report.services_unhealthy) {
+    return {
+      ...withReport,
+      status: "needs_human",
+      lab: norm.verdict === "pass" ? "passed" : "error",
+      services_unhealthy: true,
+      summary: `Lab test ${norm.verdict} and rolled back, but ${redact(report.services_reason || "ops / Hermes")} is still down after a restart: check the host now.`.slice(0, 600),
+      _bucket: "failed",
+      _reason: { code: "services_unhealthy", reason: "ops/Hermes down after the lab rollback" },
     };
   }
   if (norm.verdict === "pass") {
@@ -1629,12 +1730,27 @@ function pushPendingLocked(cfg, scratch) {
   if (!token.ok) {
     return { ...baseRes, status: "ready_no_token", summary: `Fix branch ${p.branch} still waiting for the fork-push token (${token.reason}). ${retryHint(jobName)}` };
   }
-  const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class, { skipLab: cfgP.labAuto });
+  const pushed = pushAndLab(cfgP, neoDir, p.branch, p.class, { skipLab: cfgP.labAuto || Boolean(gate.protected) });
   if (!pushed.pushed) {
     return { ...baseRes, status: "push_failed", push_error: pushed.error.class, summary: `Push to the fork failed again (${pushed.error.class}: ${pushed.error.message}). ${retryHint(jobName)}` };
   }
   fs.renameSync(pendingPath, `${pendingPath}.done`);
   const common = { ...baseRes, pending_path: undefined, compare_url: pushed.compare_url, pr_title: p.pr_title, pr_body: p.pr_body };
+  if (gate.protected) {
+    const info = {
+      protected: gate.protected,
+      branch: p.branch,
+      fix_job: p.job || path.basename(scratch),
+      attempt: Math.max(1, Number(p.attempt) || 1),
+      head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() || p.head_sha,
+      base_sha: p.base_sha,
+      pr_title: p.pr_title,
+      pr_body: p.pr_body,
+      compare_url: pushed.compare_url,
+    };
+    if (cfgP.labAuto) return approvalNeededResult({ ...common, compare_url: undefined }, info, "Saved fix pushed.");
+    return { ...common, protected: gate.protected, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; protected path (${gate.protected.label}): no automatic lab test, test manually.` };
+  }
   if (cfgP.labAuto) {
     const lab = enqueueLab(cfgP, { incident_id: p.incident_id, report_hash: p.report_hash, severity: p.severity, class: p.class }, {
       branch: p.branch,

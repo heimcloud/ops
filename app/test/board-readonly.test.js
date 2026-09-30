@@ -83,3 +83,44 @@ test("read-only: no dragging, no action buttons, server refuses every mutation",
     await new Promise((r) => server.close(r));
   }
 });
+
+test("read-only: protected-lab approval / skip refused (JSON + form), nothing signed or queued", async () => {
+  const inc = db.upsertIncident({ report_hash: "ro-2", unit: "docker-hermes.service", severity: "high", logs_excerpt: "x" }).incident;
+  applyResult({
+    kind: "fix",
+    incident_id: inc.id,
+    status: "lab_approval_needed",
+    lab: "awaiting_approval",
+    branch: "fix/hermes-x",
+    fix_job: `fix-${inc.id}-2026-01-01T00-00-00-000Z`,
+    head_sha: "d".repeat(40),
+    pending_compare_url: "https://github.com/example/neo/compare/dev...fork:neo:fix/hermes-x?expand=1",
+    protected: { areas: ["hermes"], paths: ["nix/services/hermes"], core: false },
+    summary: "Protected path (hermes): approve lab test.",
+  });
+  const app = express();
+  app.use("/admin", createAdminRouter());
+  const server = await new Promise((r) => {
+    const s = app.listen(0, "127.0.0.1", () => r(s));
+  });
+  const port = server.address().port;
+  try {
+    const board = await request(port, "GET", "/admin/");
+    assert.match(board.body, /Protected path \(hermes\): approve lab test/, "badge shown read-only");
+    assert.doesNotMatch(board.body, /approve-lab|skip-lab/, "no buttons read-only");
+    const evs = db.listIncidentEvents(inc.id).length;
+    for (const p of ["approve-lab", "skip-lab"]) {
+      const j = await request(port, "POST", `/admin/incidents/${inc.id}/${p}`, { json: {} });
+      assert.equal(j.status, 403, p);
+      assert.equal(JSON.parse(j.body).error, "read_only");
+      const f = await request(port, "POST", `/admin/incidents/${inc.id}/${p}`, { form: { return_to: "board" } });
+      assert.equal(f.status, 403, `${p} form`);
+    }
+    assert.equal(db.getIncident(inc.id).status, "needs_human");
+    assert.equal(db.listIncidentEvents(inc.id).length, evs);
+    assert.equal(fs.existsSync(path.join(tmpDir, "queue", "lab")), false, "no lab job");
+    assert.equal(fs.existsSync(path.join(tmpDir, "private")), false, "no approval key minted");
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

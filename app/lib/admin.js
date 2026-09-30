@@ -41,6 +41,7 @@ import {
   NO_TOKEN_WARNING,
 } from "./queue.js";
 import { ingestResultsDir, pushRetryJob } from "./results.js";
+import { labApprovalSource, approveProtectedLab, skipProtectedLab } from "./lab-approval.js";
 import { registerQueueRoutes } from "./admin-queue.js";
 import { workerModel, queueModel } from "./worker-state.js";
 import { renderWorkerPanel } from "./worker-view.js";
@@ -465,6 +466,40 @@ export function createAdminRouter() {
       return res.redirect(303, backTo(req, base, id, "err", message));
     }
   });
+  // Protected-path fix (ops / Hermes / swag / base system on the shared
+  // ops/lab host): the admin approves the automated lab test or skips it.
+  // Source is the DB (latest fix_result), never the form.
+  function protectedLabHandler(action) {
+    return (req, res) => {
+      const base = req.adminBase;
+      const json = wantsJson(req);
+      if (ADMIN_READ_ONLY && json) return res.status(403).json({ ok: false, error: "read_only", message: "Admin is read-only (ADMIN_READ_ONLY)." });
+      if (refuseMutations(res, base)) return;
+      const id = Number(req.params.id);
+      const incident = getIncident(id);
+      if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
+      try {
+        const src = labApprovalSource(incident, getLatestIncidentEvent(id, "fix_result"));
+        let msg;
+        if (action === "approve") {
+          const r = approveProtectedLab(incident, src);
+          msg = `Lab test approved (protected: ${src.protected.label}); ${r.instance} queued`;
+        } else {
+          skipProtectedLab(incident, src);
+          msg = "Lab test skipped: compare link opened (NOT lab-tested)";
+        }
+        if (json) return res.json({ ok: true, message: msg, ...cardPayload(id, base) });
+        return res.redirect(303, backTo(req, base, id, "msg", msg));
+      } catch (err) {
+        console.error(`[admin] ${action}-lab`, err.code || "", err.message);
+        const message = err.message || `${action} lab failed`;
+        if (json) return res.status(err.status || 500).json({ ok: false, error: err.code || `${action}_lab_failed`, message, ...cardPayload(id, base) });
+        return res.redirect(303, backTo(req, base, id, "err", message));
+      }
+    };
+  }
+  router.post("/incidents/:id/approve-lab", protectedLabHandler("approve"));
+  router.post("/incidents/:id/skip-lab", protectedLabHandler("skip"));
   router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
 
   registerQueueRoutes(router, {
@@ -523,6 +558,7 @@ function capabilities() {
     fix: isAutofixKindEnabled("fix"),
     push: isAutofixKindEnabled("push"),
     lab: isAutofixKindEnabled("lab"),
+    protectedWatchdogSec: Math.max(60, Number(process.env.OPS_LAB_PROTECTED_WATCHDOG_SEC) || 600),
   };
 }
 

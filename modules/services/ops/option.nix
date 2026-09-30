@@ -132,7 +132,12 @@
                     labSharesOpsHost = mkOption {
                       type = types.bool;
                       default = true;
-                      description = "When true (hattori today), deny-list patches that touch ops/hermes/swag/core.";
+                      description = ''
+                        When true (the lab host is the shared ops/lab host), fixes that touch a
+                        protected path (denyPaths: ops / hermes / swag / base system) are still
+                        coded and pushed, but the automated lab test waits for an admin
+                        "Approve lab test" on the board (needs_human badge).
+                      '';
                       rank = 40;
                     };
                     denyPaths = mkOption {
@@ -143,8 +148,14 @@
                         "nix/services/swag"
                         "nix/modules/core"
                       ];
-                      description = "Path prefixes refused in fix diffs while labSharesOpsHost.";
+                      description = "Protected path prefixes (admin approval before the lab test) while labSharesOpsHost.";
                       rank = 50;
+                    };
+                    basePaths = mkOption {
+                      type = types.listOf types.str;
+                      default = ["nix/modules/core"];
+                      description = "Subset of denyPaths shown as BASE SYSTEM (stronger warning on the approval button).";
+                      rank = 52;
                     };
                     neoBaseRef = mkOption {
                       type = types.strMatching "[A-Za-z0-9._/-]+";
@@ -266,6 +277,16 @@
                             default = 600;
                             description = "Timeout of the Hermes call that plans the incident checks (falls back to 'incident unit active').";
                             rank = 65;
+                          };
+                          protectedWatchdogSec = mkOption {
+                            type = types.ints.between 60 3600;
+                            default = 600;
+                            description = ''
+                              Rollback watchdog deadline for admin-approved protected lab runs (the
+                              change may take down ops, Hermes or the worker). Normal runs use the
+                              full run budget.
+                            '';
+                            rank = 66;
                           };
                         };
                       };

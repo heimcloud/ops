@@ -37,6 +37,11 @@ import {
   UNIT_RE,
   CONTAINER_RE,
   keepUnitNames,
+  labApprovalMessage,
+  DEFAULT_PROTECTED_PATHS,
+  DEFAULT_BASE_PATHS,
+  normalizePathPrefixes,
+  describeProtected,
 } from "./lab-checks.js";
 import { redactIdentifyingDetails, getExtraRedactSlugs } from "./redact.js";
 import { cancelRequested } from "./queue-control.js";
@@ -94,6 +99,24 @@ export function labConfig(env = process.env) {
     self: env.LABTEST_SELF || SELF,
     unitPrefix: env.LABTEST_UNIT_PREFIX || "heimcloud-ops-labtest",
     pollMs: num(env.LABTEST_POLL_MS, 2000, 10),
+    // ---- protected runs (fix touches ops / Hermes / swag / base system)
+    labSharesOps: !["0", "false", "no", "off"].includes(String(env.LABTEST_SHARES_OPS_HOST ?? "true").toLowerCase()),
+    protectedPaths: normalizePathPrefixes(String(env.LABTEST_PROTECTED_PATHS || DEFAULT_PROTECTED_PATHS.join(",")).split(",")),
+    basePaths: normalizePathPrefixes(String(env.LABTEST_BASE_PATHS || DEFAULT_BASE_PATHS.join(",")).split(",")),
+    // Shorter independent watchdog deadline for approved protected runs.
+    protectedWatchdogSec: num(env.LABTEST_PROTECTED_WATCHDOG_SEC, 600, 60),
+    // After activation: how long ops /health + Hermes may take before an immediate rollback.
+    protectedProbeSec: num(env.LABTEST_PROTECTED_PROBE_SEC, 45, 0),
+    // Stop checks this long before the watchdog deadline (leaves time for the rollback).
+    protectedMarginSec: num(env.LABTEST_PROTECTED_MARGIN_SEC, 150, 0),
+    // After rollback: wait this long for ops /health + Hermes (before and after a restart).
+    recoverSec: num(env.LABTEST_RECOVER_SEC, 120, 0),
+    opsUnit: /^[A-Za-z0-9@._:-]+\.service$/.test(env.LABTEST_OPS_UNIT || "") ? env.LABTEST_OPS_UNIT : "docker-ops.service",
+    // Approval check: HMAC key only the ops container uid can read + the DB event.
+    opsUid: /^\d+$/.test(String(env.LABTEST_OPS_UID ?? "")) ? Number(env.LABTEST_OPS_UID) : null,
+    dbPath: env.LABTEST_DB_PATH || path.join(env.LABTEST_OPS_DIR || "/var/neo/DATA/AppData/ops", "ops.sqlite"),
+    sqlite: env.LABTEST_SQLITE_BIN || "sqlite3",
+    approvalMaxAgeSec: num(env.LABTEST_APPROVAL_MAX_AGE_SEC, 3 * 86400, 60),
   };
 }
 
@@ -512,7 +535,205 @@ export function loadSpec(cfg, instance) {
   // The root only activates that exact tip (checked after the build).
   if (!/^[0-9a-f]{40}$/.test(String(spec.head_sha || ""))) throw Object.assign(new Error("job spec has no gated commit (head_sha)"), { code: "invalid_spec" });
   const plan = validateCheckPlan(spec.lab_checks || []);
-  return { incidentId, branch: spec.branch, headSha: spec.head_sha, checks: plan.checks, planErrors: plan.errors, processingName: `${instance}.json` };
+  return {
+    incidentId,
+    branch: spec.branch,
+    headSha: spec.head_sha,
+    checks: plan.checks,
+    planErrors: plan.errors,
+    processingName: `${instance}.json`,
+    // Written by the app on an admin approval (verified in verifyApproval).
+    approval: spec.approval && typeof spec.approval === "object" ? spec.approval : null,
+    claimsProtected: Boolean(spec.protected),
+  };
+}
+
+// ------------------------------------------------------------------ protected runs
+
+/** Entries (relative path → content digest) under root/rel; null past `limit`. */
+function treeDigest(root, rel, limit = 20000) {
+  const out = new Map();
+  const walk = (r) => {
+    const abs = path.join(root, r);
+    let st;
+    try {
+      st = fs.lstatSync(abs);
+    } catch {
+      return true;
+    }
+    if (out.size >= limit) return false;
+    if (st.isSymbolicLink()) out.set(r, `l:${fs.readlinkSync(abs)}`);
+    else if (st.isFile()) out.set(r, `f:${(st.mode & 0o111) ? "x" : "-"}:${sha256(fs.readFileSync(abs))}`);
+    else if (st.isDirectory()) {
+      out.set(r, "d");
+      for (const n of fs.readdirSync(abs).sort()) if (!walk(path.join(r, n))) return false;
+    }
+    return true;
+  };
+  return walk(rel) ? out : null;
+}
+
+function sameTree(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) if (b.get(k) !== v) return false;
+  return true;
+}
+
+function nixString(s) {
+  return `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$\{/g, "\\${")}"`;
+}
+
+/**
+ * Does activating the fork branch change a protected path on this host?
+ * Worker-independent: compares the neo source the host runs now (the locked
+ * input of the host flake) with the fork branch source, file by file, under
+ * each protected prefix. Returns {checked, hit, unknown, paths, detail}.
+ * Anything it cannot determine counts as protected (fail closed).
+ */
+export async function detectProtected(cfg, branch, headSha) {
+  if (!cfg.labSharesOps || !cfg.protectedPaths.length) return { checked: false, hit: false, unknown: false, paths: [] };
+  const nixArgs = ["--extra-experimental-features", "nix-command flakes"];
+  const unknown = (detail) => ({ checked: true, hit: false, unknown: true, paths: [], detail });
+  const bm = await runCmd(cfg.nix, [...nixArgs, "flake", "metadata", "--json", flakeUrlFor(cfg, branch)], { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake });
+  let branchSrc;
+  try {
+    const j = JSON.parse(bm.stdout);
+    branchSrc = j.path;
+    const rev = j.revision || j.locked?.rev;
+    if (rev !== headSha) return { ...unknown("fork branch tip is not the gated commit"), moved: /^[0-9a-f]{40}$/.test(String(rev || "")) };
+  } catch {
+    return unknown(`nix flake metadata of the fork branch failed (exit ${bm.status})`);
+  }
+  const hm = await runCmd(cfg.nix, [...nixArgs, "flake", "metadata", "--json", "--no-write-lock-file", cfg.flake], { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake });
+  let locked;
+  try {
+    const locks = JSON.parse(hm.stdout).locks;
+    locked = locks.nodes[locks.nodes[locks.root || "root"].inputs[cfg.input]].locked;
+    if (!locked || typeof locked !== "object" || !locked.type) throw new Error("no locked input");
+  } catch {
+    return unknown(`could not read the host flake's locked ${cfg.input} input (exit ${hm.status})`);
+  }
+  const ev = await runCmd(cfg.nix, [...nixArgs, "eval", "--raw", "--expr", `(builtins.fetchTree (builtins.fromJSON ${nixString(JSON.stringify(locked))})).outPath`], {
+    timeoutSec: 300,
+    graceSec: cfg.killGraceSec,
+    cwd: cfg.flake,
+  });
+  const deployedSrc = String(ev.stdout || "").trim();
+  for (const [name, p] of [["fork branch", branchSrc], ["deployed", deployedSrc]]) {
+    if (typeof p !== "string" || !p.startsWith(cfg.storePrefix) || p.includes("..") || !fs.existsSync(p)) return unknown(`${name} source not in the store`);
+  }
+  const changed = [];
+  for (const prefix of cfg.protectedPaths) {
+    const a = treeDigest(deployedSrc, prefix);
+    const b = treeDigest(branchSrc, prefix);
+    if (!a || !b) return unknown(`too many files under ${prefix}`);
+    if (!sameTree(a, b)) changed.push(prefix);
+  }
+  return { checked: true, hit: changed.length > 0, unknown: false, paths: changed };
+}
+
+const APPROVAL_KEY_REL = path.join("private", "lab-approval.key");
+
+/** Read the approval key; the file and its dir must belong to the ops uid, mode 0?00 / 0700. */
+function readApprovalKey(cfg) {
+  if (cfg.opsUid == null) return { error: "ops uid not configured (LABTEST_OPS_UID)" };
+  const dir = path.join(cfg.opsDir, "private");
+  const file = path.join(cfg.opsDir, APPROVAL_KEY_REL);
+  try {
+    const d = fs.lstatSync(dir);
+    if (!d.isDirectory() || d.uid !== cfg.opsUid || (d.mode & 0o077) !== 0) return { error: "approval key dir has the wrong owner or mode" };
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.uid !== cfg.opsUid || (st.mode & 0o077) !== 0 || st.size < 32 || st.size > 256) return { error: "approval key has the wrong owner, mode or size" };
+      const buf = Buffer.alloc(st.size);
+      fs.readSync(fd, buf, 0, st.size, 0);
+      return { key: buf.toString("utf8").trim() };
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    return { error: `approval key unreadable (${err.code || err.message})` };
+  }
+}
+
+function approvalUsedFile(cfg, eventId) {
+  return path.join(cfg.stateDir, "approvals", `${Number(eventId)}.used`);
+}
+
+/**
+ * Verify the admin approval of a protected lab job: HMAC over the job
+ * identity (key readable only by the ops container uid, so neither Hermes nor
+ * the worker can mint one), the matching lab_approved DB event, age, and
+ * single use. Returns {ok, eventId} or {ok:false, missing?, reason}.
+ */
+export async function verifyApproval(cfg, spec, instance) {
+  const a = spec.approval;
+  if (!a) return { ok: false, missing: true, reason: "no admin approval in the job" };
+  const eventId = Number(a.event_id);
+  if (a.v !== 1 || a.by !== "admin" || !Number.isInteger(eventId) || eventId < 1 || typeof a.approved_at !== "string" || !/^[0-9a-f]{64}$/.test(String(a.sig || ""))) {
+    return { ok: false, reason: "approval malformed" };
+  }
+  const at = Date.parse(a.approved_at);
+  if (!Number.isFinite(at) || at > Date.now() + 5 * 60_000 || Date.now() - at > cfg.approvalMaxAgeSec * 1000) return { ok: false, reason: "approval expired" };
+  const k = readApprovalKey(cfg);
+  if (k.error) return { ok: false, reason: k.error };
+  const msg = labApprovalMessage({ incident_id: spec.incidentId, instance, branch: spec.branch, head_sha: spec.headSha, event_id: eventId, approved_at: a.approved_at });
+  const want = crypto.createHmac("sha256", k.key).update(msg).digest();
+  const got = Buffer.from(a.sig, "hex");
+  if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return { ok: false, reason: "approval signature invalid" };
+  if (fs.existsSync(approvalUsedFile(cfg, eventId))) return { ok: false, reason: "approval already used" };
+  const q = await runCmd(cfg.sqlite, ["-readonly", "-json", cfg.dbPath, `SELECT id, incident_id, kind, meta_json FROM incident_events WHERE id = ${eventId};`], { timeoutSec: 30, graceSec: 5 });
+  let row;
+  try {
+    row = JSON.parse(String(q.stdout || "").trim() || "[]")[0];
+  } catch {
+    row = null;
+  }
+  if (q.status !== 0 || !row) return { ok: false, reason: `approval event #${eventId} not found in the ops DB` };
+  let meta = {};
+  try {
+    meta = JSON.parse(row.meta_json || "{}") || {};
+  } catch {
+    meta = {};
+  }
+  if (row.kind !== "lab_approved" || Number(row.incident_id) !== spec.incidentId || meta.lab_job !== instance || meta.head_sha !== spec.headSha || meta.branch !== spec.branch || meta.approved_by !== "admin") {
+    return { ok: false, reason: `approval event #${eventId} does not match this job` };
+  }
+  return { ok: true, eventId };
+}
+
+/**
+ * After a (verified) rollback: ops /health must be 200 and Hermes active;
+ * a service still down is restarted once (the runner is root) and checked
+ * again. Never depends on ops/Hermes/the worker itself.
+ */
+export async function recoverServices(cfg, note) {
+  const probeCfg = { ...cfg, checkSec: cfg.recoverSec };
+  const quiet = { stopping: false };
+  const out = {};
+  const svc = [
+    ["ops_health", "ops /health", cfg.opsUnit, () => opsHealth(cfg)],
+    ["hermes_active", "Hermes", cfg.hermesUnit, async () => {
+      const st = await isActive(cfg, cfg.hermesUnit);
+      return { ok: st === "active", detail: st };
+    }],
+  ];
+  for (const [key, name, unit, probe] of svc) {
+    let r = await until(probeCfg, probe, quiet);
+    if (r.ok) {
+      out[key] = { ok: true, detail: r.detail, restarted: false };
+      note(`after rollback: ${name} ok (${r.detail})`);
+      continue;
+    }
+    note(`after rollback: ${name} down (${r.detail}); restarting ${unit}`);
+    const rs = await systemctl(cfg, ["restart", unit], 300);
+    r = await until(probeCfg, probe, quiet);
+    out[key] = { ok: r.ok, detail: r.detail, restarted: true, restart_exit: rs.status };
+    note(r.ok ? `after restart of ${unit}: ${name} ok (${r.detail})` : `after restart of ${unit}: ${name} STILL DOWN (${r.detail})`);
+  }
+  out.ok = Object.values(out).every((v) => v.ok);
+  return out;
 }
 
 export function flakeUrlFor(cfg, branch) {
@@ -773,6 +994,7 @@ export async function runLab(cfg, instance) {
   let pins = null;
   let wdUnit = null;
   let before = null;
+  let protectedRun = false;
   try {
     run.setStage("validating");
     let spec;
@@ -824,6 +1046,36 @@ export async function runLab(cfg, instance) {
     const dropHolder = await writeNeoHolder(cfg, spec.incidentId);
     if (dropHolder) run.releases.push(dropHolder);
     if (cancelled()) return cancel("waiting_lock");
+
+    // Protected change (ops / Hermes / swag / base system)? Detected here from
+    // the deployed neo source vs the fork branch, independent of what the
+    // worker claims. Protected → only with a valid admin approval.
+    const prot = await detectProtected(cfg, spec.branch, spec.headSha);
+    if (prot.moved) {
+      result.failed_stage = "validating";
+      result.reason = "fix branch moved after the worker gated it (fork tip is not the gated commit); not activating";
+      return result;
+    }
+    protectedRun = prot.hit || prot.unknown || Boolean(spec.approval) || spec.claimsProtected;
+    if (protectedRun) {
+      const desc = describeProtected(prot.paths, cfg.basePaths);
+      if (!desc.label) Object.assign(desc, prot.unknown ? { areas: ["unverified"], label: "unverified" } : { areas: ["claimed by the job"], label: "claimed by the job" });
+      result.protected = { ...desc, detected: prot.hit, unknown: prot.unknown, ...(prot.detail ? { detail: red(prot.detail).slice(0, 200) } : {}) };
+      const ap = await verifyApproval(cfg, spec, instance);
+      if (!ap.ok) {
+        result.failed_stage = "approval";
+        result[ap.missing ? "approval_required" : "approval_invalid"] = true;
+        result.reason = `protected change (${desc.label}${prot.unknown ? `: ${red(prot.detail || "")}` : ""}) ${ap.missing ? "needs an admin approval" : `approval rejected: ${ap.reason}`}; nothing built or activated`;
+        run.note(result.reason);
+        return result;
+      }
+      result.protected.approved = true;
+      result.protected.approval_event_id = ap.eventId;
+      run.note(
+        `protected run (${desc.label}${desc.core ? ", BASE SYSTEM" : ""}): approved by admin (event #${ap.eventId}); watchdog ${Math.round(cfg.protectedWatchdogSec)} s; ` +
+          "ops /health or Hermes down after activation → immediate rollback; services verified after rollback",
+      );
+    }
 
     before = {
       current: realpathOrNull(cfg.current),
@@ -886,9 +1138,26 @@ export async function runLab(cfg, instance) {
       armed_at: nowIso(),
       deadline_sec: cfg.watchdogSec,
     };
-    const wd = await armWatchdog(cfg, run, act);
+    const wdCfg = protectedRun ? { ...cfg, watchdogSec: cfg.protectedWatchdogSec } : cfg;
+    act.deadline_sec = wdCfg.watchdogSec;
+    if (protectedRun) {
+      Object.assign(act, { protected: true, ops_health: cfg.opsHealth, ops_unit: cfg.opsUnit, hermes_unit: cfg.hermesUnit, docker: cfg.docker, recover_sec: cfg.recoverSec });
+      // Single use: consumed right before the point of no return.
+      try {
+        fs.mkdirSync(path.dirname(approvalUsedFile(cfg, result.protected.approval_event_id)), { recursive: true, mode: 0o750 });
+        fs.writeFileSync(approvalUsedFile(cfg, result.protected.approval_event_id), `${instance}\n`, { flag: "wx", mode: 0o640 });
+      } catch (err) {
+        act = null;
+        result.failed_stage = "approval";
+        result.approval_invalid = true;
+        result.reason = `approval could not be consumed (${err.code === "EEXIST" ? "already used" : err.code || err.message}); nothing activated`;
+        return result;
+      }
+    }
+    const armedAt = Date.now();
+    const wd = await armWatchdog(wdCfg, run, act);
     wdUnit = wd.unit;
-    result.watchdog = { armed: wd.ok, disarmed: false, fired: false, deadline_sec: Math.round(cfg.watchdogSec) };
+    result.watchdog = { armed: wd.ok, disarmed: false, fired: false, deadline_sec: Math.round(wdCfg.watchdogSec) };
     if (!wd.ok) {
       result.failed_stage = "arming_watchdog";
       result.reason = `rollback watchdog could not be armed (${wd.detail}); not activating`;
@@ -916,17 +1185,48 @@ export async function runLab(cfg, instance) {
       st = await systemState(cfg);
     }
 
+    // Protected run: ops or Hermes down after activation → roll back now,
+    // do not wait for the full check timeouts.
+    let abortReason = "";
+    if (protectedRun && !run.stopping) {
+      const quick = { ...cfg, checkSec: cfg.protectedProbeSec };
+      const ops = await until(quick, () => opsHealth(cfg), run);
+      const hs = await until(quick, async () => {
+        const x = await isActive(cfg, cfg.hermesUnit);
+        return { ok: x === "active", detail: x };
+      }, run);
+      result.protected_probe = { ops_health: ops.ok, ops_detail: red(ops.detail || ""), hermes_active: hs.ok, hermes_detail: red(hs.detail || "") };
+      abortReason = [!ops.ok && `ops /health down (${ops.detail})`, !hs.ok && `Hermes ${hs.detail}`].filter(Boolean).join(", ");
+      if (abortReason) run.note(`protected run: ${abortReason} after activation → rolling back immediately`);
+    }
+    // Leave room for the rollback before the watchdog would fire (margin at most half the deadline).
+    const marginSec = Math.min(cfg.protectedMarginSec, wdCfg.watchdogSec / 2);
+    const checkDeadline = protectedRun ? armedAt + (wdCfg.watchdogSec - marginSec) * 1000 : Infinity;
+
     const total = GENERIC_CHECKS.length + spec.checks.length;
     run.setStage("checks", { step: 1, steps: total });
-    const checks = run.stopping ? [] : await genericChecks(cfg, run, { activation: result.activation, exit4, pre, stateAfterSettle: st, total });
+    const checks = run.stopping ? [] : await genericChecks(abortReason ? { ...cfg, checkSec: 0 } : cfg, run, { activation: result.activation, exit4, pre, stateAfterSettle: st, total });
+    let skippedNote = false;
     for (const [i, c] of spec.checks.entries()) {
       if (run.stopping) break;
+      const label = red(checkLabel(c)).slice(0, 200);
+      const why = abortReason ? "not run: rolled back immediately (ops/Hermes down)" : Date.now() > checkDeadline ? "not run: too close to the watchdog deadline" : "";
+      if (why) {
+        if (!abortReason && !skippedNote) run.note(`protected run: remaining checks skipped ${Math.round(marginSec)} s before the watchdog deadline`);
+        skippedNote = true;
+        checks.push({ id: c.id, type: c.type, generic: false, label, ok: false, detail: why });
+        continue;
+      }
       run.setStage("checks", { step: GENERIC_CHECKS.length + i + 1, steps: total });
       const r = await incidentCheck(cfg, run, c, { activatedAtSec });
-      checks.push({ id: c.id, type: c.type, generic: false, label: red(checkLabel(c)).slice(0, 200), ok: r.ok, detail: red(r.detail || "").slice(0, 400) });
+      checks.push({ id: c.id, type: c.type, generic: false, label, ok: r.ok, detail: red(r.detail || "").slice(0, 400) });
     }
     result.checks = checks;
-    if (run.stopping) {
+    if (abortReason && !run.stopping) {
+      result.verdict = "fail";
+      result.failed_stage = "checks";
+      result.reason = red(`protected run: ${abortReason} after activation; rolled back immediately`).slice(0, 300);
+    } else if (run.stopping) {
       result.verdict = "error";
       result.failed_stage = "checks";
       result.reason = "lab unit stopped during checks; rolled back";
@@ -972,6 +1272,23 @@ export async function runLab(cfg, instance) {
           await cleanupLabFailures(cfg, run, result, before.preFailed);
         } catch {
           /* best effort; the rollback itself is verified */
+        }
+        if (protectedRun) {
+          // The change may have taken down ops / Hermes: verify after the
+          // rollback, restart what is still down (we are root), record it.
+          run.setStage("verifying");
+          try {
+            const svc = await recoverServices(cfg, (l) => run.note(l));
+            result.post_rollback_services = svc;
+            if (!svc.ok) {
+              result.services_unhealthy = true;
+              result.services_reason = [!svc.ops_health.ok && "ops /health", !svc.hermes_active.ok && "Hermes"].filter(Boolean).join(" and ");
+            }
+          } catch (err) {
+            result.services_unhealthy = true;
+            result.services_reason = `service check error (${err.message})`;
+          }
+          run.setStage("restored");
         }
       } else {
         // Leave the watchdog armed: it retries the same rollback at its deadline.
@@ -1050,7 +1367,26 @@ export async function runWatchdog(actFile, env = process.env) {
     const pinCfg = { ...cfg, flake: act.flake, pinFiles: (act.pins || []).map((p) => p.name) };
     const pv = verifyPins(pinCfg, (act.pins || []).map((p) => ({ ...p, exists: true })));
     const restored = now === act.before;
-    const res = done({ fired: true, rollback_exit: rb.status, restored, pins: pv, locked: lk.ok });
+    const notes = [`watchdog rollback exit ${rb.status}`];
+    let services = null;
+    if (act.protected && restored) {
+      // Protected run: the runner died (maybe with ops/Hermes); same service
+      // verification + restart as the runner, from the activation record.
+      const svcCfg = {
+        ...cfg,
+        opsHealth: act.ops_health || cfg.opsHealth,
+        docker: act.docker || cfg.docker,
+        hermesUnit: /^[A-Za-z0-9@._:-]+\.service$/.test(act.hermes_unit || "") ? act.hermes_unit : cfg.hermesUnit,
+        opsUnit: /^[A-Za-z0-9@._:-]+\.service$/.test(act.ops_unit || "") ? act.ops_unit : cfg.opsUnit,
+        recoverSec: Number(act.recover_sec) >= 0 ? Number(act.recover_sec) : cfg.recoverSec,
+      };
+      try {
+        services = await recoverServices(svcCfg, (l) => notes.push(red(l).slice(0, 300)));
+      } catch (err) {
+        services = { ok: false, error: err.message };
+      }
+    }
+    const res = done({ fired: true, rollback_exit: rb.status, restored, pins: pv, locked: lk.ok, ...(services ? { services } : {}) });
     const resultFile = path.join(dir, "result.json");
     if (!fs.existsSync(resultFile)) {
       writeJson(resultFile, {
@@ -1065,7 +1401,9 @@ export async function runWatchdog(actFile, env = process.env) {
         pins: pv,
         watchdog: { armed: true, disarmed: false, fired: true },
         finished_at: nowIso(),
-        evidence: [`watchdog rollback exit ${rb.status}`],
+        evidence: notes,
+        ...(services ? { post_rollback_services: services, services_unhealthy: !services.ok, services_reason: services.ok ? undefined : "ops /health or Hermes" } : {}),
+        ...(act.protected ? { protected: { approved: true, label: "protected run" } } : {}),
       });
     }
     return res;

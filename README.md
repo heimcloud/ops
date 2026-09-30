@@ -8,7 +8,7 @@ Repo: <https://github.com/heimcloud/ops>
 
 1. **`POST /api/incidents`** — protected by `OPS_INGEST_SECRET` (`Authorization: Bearer …` or `X-Ops-Secret`). Idempotent on `report_hash`.
 2. **SQLite WAL** (`PRAGMA journal_mode=WAL`) at `OPS_DB_PATH` (default `/data/ops.sqlite`).
-3. **Admin UI** at `/admin` — kanban board of incidents (drag and drop status, "needs my input" badges, detail drawer, filters); **Start triage / Start fix / Retry push** enqueue host jobs (fix PRs come from the tested-branch loop; see design doc).
+3. **Admin UI** at `/admin` — kanban board of incidents (drag and drop status, "needs my input" badges, detail drawer, filters); **Start triage / Start fix / Retry push / Retry lab / Approve lab test / Skip lab** act on host jobs (fix PRs come from the tested-branch loop; see design doc).
 
 ## Schema
 
@@ -86,7 +86,11 @@ Nothing can be moved *into* `fixing` / `testing` by hand: **Start fix** and the 
 | testing | no `passed`/`failed` lab result (lab skipped, or automated lab off) — **no badge** while an automated lab job is queued/running (`OPS_AUTOFIX_LAB`) | Lab test needed → Open compare link |
 | testing | automated lab `lab_error` / lab job cancelled | Lab test error / Lab test cancelled → Retry lab |
 | needs_human | lab rollback not verified | Lab rollback NOT verified: check the host |
-| needs_human | `lab: failed` / `redaction_blocked` / `denied` / Hermes gave up after retries / other | reason + worker summary → Start fix / Close |
+| needs_human | latest fix result `lab_approval_needed` (protected path: ops / hermes / swag / base system while the lab shares the ops host); stays until acted on | Protected path (hermes): approve lab test → **Approve lab test** (base system: "Approve lab test (base system!)", stronger confirm) / **Skip lab, open compare link** / Close |
+| needs_human | protected lab run: ops / Hermes still down after rollback + restart | Ops/Hermes still down after the lab rollback: check the host |
+| needs_human | `lab: failed` / `redaction_blocked` / `denied` (legacy) / Hermes gave up after retries / other | reason + worker summary → Start fix / Close |
+| testing | `lab_approved` event after the last result (approved protected lab job queued/running) | **no badge** |
+| pr_opened | `compare_url` set, lab skipped by the admin (`lab_skipped` after the last fix result) | Open the PR from the compare link (NOT lab-tested) → Open compare link / Mark resolved; card chip "NOT lab-tested" |
 | pr_opened | `compare_url` set | Open the PR from the compare link → Open compare link / Mark resolved |
 
 Old triage results without `verdict` are mapped from `class` + `fixable` (human_config → config_error, software+fixable → code_fix, software+!fixable → not_actionable, unknown → uncertain).

@@ -80,6 +80,14 @@ if [ "$1" = start ]; then
   d="${tmp}/labstate/$inst"; mkdir -p "$d"
   echo '{"stage":"checks","step":2,"steps":7}' > "$d/status.json"
   v="\${FAKE_LAB_VERDICT:-pass}"; ok=true; [ "$v" = pass ] || ok=false; unver=false; [ "$v" = unverified ] && { v=fail; unver=true; }
+  if [ "$v" = approval ]; then
+    echo '{"verdict":"error","failed_stage":"approval","approval_required":true,"protected":{"areas":["hermes"],"paths":["nix/services/hermes"],"core":false,"detected":true},"reason":"protected change (hermes) needs an admin approval; nothing built or activated","checks":[],"evidence":[]}' > "$d/result.json"
+    exit 0
+  fi
+  if [ "$v" = svcdown ]; then
+    echo '{"verdict":"fail","failed_stage":"checks","reason":"protected run: ops /health down after activation; rolled back immediately","checks":[],"generation":{"before":41,"after":41,"restored":true,"booted_unchanged":true},"pins":{"identical":true},"watchdog":{"armed":true,"disarmed":true,"deadline_sec":600},"protected":{"areas":["ops"],"paths":["nix/services/ops"],"approved":true,"approval_event_id":7},"post_rollback_services":{"ops_health":{"ok":false,"detail":"HTTP 503","restarted":true},"hermes_active":{"ok":true,"detail":"active"},"ok":false},"services_unhealthy":true,"services_reason":"ops /health","evidence":[]}' > "$d/result.json"
+    exit 0
+  fi
   cat > "$d/result.json" <<J
 {"verdict":"$v","failed_stage":"checks","reason":"check c1 failed on 10.20.30.40","rollback_unverified":$unver,
  "checks":[{"id":"g1","type":"activate_exit","generic":true,"ok":true,"detail":"exit 0"},{"id":"c1","type":"unit_active","unit":"docker-searxng.service","ok":$ok,"detail":"docker-searxng.service is failed; peer 10.20.30.40"}],
@@ -198,11 +206,16 @@ test("fix job with an identifier in the diff is blocked before push (fail closed
   assert.equal(afterSha, before, "nothing pushed");
 });
 
-test("deny-listed path while lab shares ops host → denied", () => {
+test("protected path while lab shares ops host, lab stage off → pushed, awaiting a manual lab test (no denial)", () => {
   process.env.FAKE_HERMES_MODE = "deny";
   const name = enqueue("fix", 15);
   W.main([]);
-  assert.equal(result("fix", name).status, "denied");
+  const r = result("fix", name);
+  assert.equal(r.status, "awaiting_lab_test", r.summary);
+  assert.equal(r.lab, "skipped");
+  assert.deepEqual(r.protected.paths, ["nix/services/ops"]);
+  const tip = execFileSync("git", ["-C", fork, "rev-parse", "fix/searxng-engines"], { encoding: "utf8" }).trim();
+  assert.equal(r.head_sha, tip, "branch pushed to the fork as usual");
 });
 
 test("no commit from Hermes → needs_human", () => {
@@ -498,10 +511,15 @@ test("extractJson picks the last valid object from noisy output", () => {
   assert.equal(W.extractJson("no json"), null);
 });
 
-test("denyListHit matches path prefixes, not substrings in content", () => {
+test("denyListHit / protectedHit match path prefixes, not substrings; base system flagged", () => {
   const cfg = W.config();
   assert.equal(W.denyListHit(["nix/services/opsx/a.nix"], cfg), null);
   assert.equal(W.denyListHit(["nix/services/ops/a.nix"], cfg), "nix/services/ops");
+  const h = W.protectedHit(["nix/services/hermes/default.nix", "nix/modules/core/net.nix", "README.md"], cfg);
+  assert.deepEqual(h.paths, ["nix/services/hermes", "nix/modules/core"]);
+  assert.equal(h.core, true);
+  assert.equal(h.label, "hermes, base system");
+  assert.equal(W.protectedHit(["nix/services/hermes/x.nix"], { ...cfg, labSharesOps: false }), null, "separate lab host: not protected");
 });
 
 // ---------------------------------------------------------------- automated lab stage
@@ -639,6 +657,85 @@ test("lab stage: a lab job with an injected branch never reaches systemctl", () 
     const [r] = resultsFor("lab", 135);
     assert.equal(r.status, "lab_error");
     assert.equal(fs.existsSync(path.join(tmp, "systemctl-calls")), false);
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("protected path + lab stage: pushed to the fork, NO lab job, needs admin approval (pending compare link only)", () => {
+  labEnv(true);
+  try {
+    process.env.FAKE_HERMES_MODE = "deny";
+    fs.rmSync(path.join(tmp, "systemctl-calls"), { force: true });
+    const name = enqueue("fix", 140);
+    W.main([]);
+    const r = result("fix", name);
+    assert.equal(r.status, "lab_approval_needed", r.summary);
+    assert.equal(r.lab, "awaiting_approval");
+    assert.match(r.summary, /^Protected path \(ops\): approve lab test\./);
+    assert.equal(r.compare_url, undefined, "no compare link before the admin decides");
+    assert.match(r.pending_compare_url, /compare\/dev\.\.\.heimcloud:neo:fix\/searxng-engines/);
+    assert.match(r.head_sha, /^[0-9a-f]{40}$/);
+    assert.equal(r.head_sha, execFileSync("git", ["-C", fork, "rev-parse", "fix/searxng-engines"], { encoding: "utf8" }).trim());
+    assert.deepEqual(resultsFor("lab", 140), [], "no lab job ran");
+    assert.deepEqual(fs.readdirSync(path.join(data, "queue", "lab")).filter((n) => n.startsWith("140-")), [], "no lab job queued");
+    assert.equal(fs.existsSync(path.join(tmp, "systemctl-calls")), false, "root lab unit never started");
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("the worker cannot enqueue a protected / approved lab job itself", () => {
+  labEnv(true);
+  try {
+    const cfg = W.config();
+    for (const extra of [{ protected: { paths: ["nix/services/ops"] } }, { approval: { v: 1 } }, { approved_by: "admin" }]) {
+      assert.throws(() => W.enqueueLab(cfg, { incident_id: 141, unit: "x" }, { branch: "fix/x", attempt: 1, ...extra }), /protected|approv/);
+    }
+    assert.deepEqual(fs.readdirSync(path.join(data, "queue", "lab")).filter((n) => n.startsWith("141-")), []);
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("lab job flagged protected without an approval never starts the root unit → approval needed", () => {
+  labEnv(true);
+  try {
+    fs.rmSync(path.join(tmp, "systemctl-calls"), { force: true });
+    const name = enqueue("lab", 142, { branch: "fix/x", attempt: 1, head_sha: "a".repeat(40), compare_url: "https://github.com/madebydamo/neo/compare/dev...heimcloud:neo:fix/x?expand=1", protected: { areas: ["swag"], paths: ["nix/services/swag"], core: false } });
+    W.main([]);
+    const r = result("lab", name);
+    assert.equal(r.status, "lab_approval_needed", r.summary);
+    assert.match(r.summary, /Protected path \(swag\): approve lab test/);
+    assert.match(r.pending_compare_url, /^https:\/\/github\.com\//);
+    assert.equal(r.compare_url, undefined);
+    assert.equal(fs.existsSync(path.join(tmp, "systemctl-calls")), false, "systemctl never called");
+  } finally {
+    labEnv(false);
+  }
+});
+
+test("runner found a protected change the worker did not flag → approval needed; services still down → needs_human", () => {
+  labEnv(true);
+  try {
+    process.env.FAKE_PLAN = "none";
+    process.env.FAKE_LAB_VERDICT = "approval";
+    const cfg = W.config();
+    W.enqueueLab(cfg, { incident_id: 143, unit: "x" }, { branch: "fix/x", attempt: 1, head_sha: "b".repeat(40), compare_url: "https://github.com/madebydamo/neo/compare/dev...heimcloud:neo:fix/x?expand=1" });
+    W.main([]);
+    const [a] = resultsFor("lab", 143);
+    assert.equal(a.status, "lab_approval_needed", a.summary);
+    assert.match(a.summary, /Protected path \(hermes\)/);
+    assert.equal(a.compare_url, undefined);
+
+    process.env.FAKE_LAB_VERDICT = "svcdown";
+    W.enqueueLab(cfg, { incident_id: 144, unit: "x" }, { branch: "fix/x", attempt: 1, head_sha: "c".repeat(40) });
+    W.main([]);
+    const [u] = resultsFor("lab", 144);
+    assert.equal(u.status, "needs_human");
+    assert.equal(u.services_unhealthy, true);
+    assert.match(u.summary, /still down after a restart: check the host now/);
+    assert.equal(u.lab_report.post_rollback_services.ops_health.restarted, true);
   } finally {
     labEnv(false);
   }

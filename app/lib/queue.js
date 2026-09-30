@@ -10,6 +10,7 @@ import {
   getExtraRedactSlugs,
 } from "./redact.js";
 import { listDistinctCustomerRepoSlugs } from "./db.js";
+import { normalizeProtected } from "./lab-checks.js";
 
 export function getDataDir() {
   if (process.env.OPS_DATA_DIR) return process.env.OPS_DATA_DIR;
@@ -282,6 +283,9 @@ export function enqueueLabRetry(incident, prev) {
     pr_body: typeof prev.pr_body === "string" ? prev.pr_body.slice(0, 20000) : undefined,
     base_sha: pick("base_sha", /^[0-9a-f]{7,64}$/),
     head_sha: pick("head_sha", /^[0-9a-f]{7,64}$/),
+    // A protected job keeps its flag but never its approval: the worker turns
+    // it back into "approve lab test" (fresh admin approval, fresh signature).
+    protected: prev.protected || prev.approval ? normalizeProtected(prev.protected) || { areas: ["unverified"], paths: [], core: false, label: "unverified" } : undefined,
     enqueued_at: new Date().toISOString(),
     enqueued_by: "admin",
   };

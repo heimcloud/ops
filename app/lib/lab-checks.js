@@ -256,7 +256,15 @@ export function normalizeLabReport(r) {
       armed: r.watchdog?.armed === true,
       disarmed: r.watchdog?.disarmed === true,
       fired: r.watchdog?.fired === true,
+      deadlineSec: n(r.watchdog?.deadline_sec),
     },
+    // Protected-path run (admin-approved): what was protected, the quick
+    // post-activation probe and the service check after the rollback.
+    protected: normalizeProtectedRun(r.protected),
+    protectedProbe: normalizeSvcPair(r.protected_probe, "ops_health", "hermes_active"),
+    postRollbackServices: normalizeSvcPair(r.post_rollback_services),
+    servicesUnhealthy: r.services_unhealthy === true,
+    servicesReason: typeof r.services_reason === "string" ? r.services_reason.slice(0, 200) : "",
     activationExit: n(r.activation?.exit_code),
     testedRev: /^[0-9a-f]{7,40}$/.test(String(r.tested_rev || "")) ? r.tested_rev : "",
     startedAt: typeof r.started_at === "string" ? r.started_at : "",
@@ -284,4 +292,89 @@ export function keepUnitNames(redact) {
     const s = String(text ?? "").split(PH).join("");
     return String(redact(s.replace(SAFE_SUFFIX, `${PH}$1`))).split(PH).join(".");
   };
+}
+
+// ------------------------------------------------------------ protected paths
+
+/**
+ * Protected paths (lab shares the ops host): a fix touching them may take down
+ * ops, Hermes, the worker or the base system during the lab activation. Such a
+ * fix is still written and pushed, but the lab test only runs after an admin
+ * approval. Base-system prefixes get a stronger warning.
+ */
+export const DEFAULT_PROTECTED_PATHS = ["nix/services/ops", "nix/services/hermes", "nix/services/swag", "nix/modules/core"];
+export const DEFAULT_BASE_PATHS = ["nix/modules/core"];
+
+export function normalizePathPrefixes(list) {
+  return [].concat(list || [])
+    .map((s) => String(s).trim().replace(/^\.?\/+/, "").replace(/\/+$/, ""))
+    .filter((s) => s && !s.split("/").includes(".."));
+}
+
+/** Prefixes (of `prefixes`) that any of `files` lies under (path prefix, not substring). */
+export function protectedPrefixesHit(files, prefixes) {
+  const hit = new Set();
+  for (const f of files || []) {
+    const norm = String(f).replace(/^\.?\/+/, "");
+    for (const d of prefixes || []) if (norm === d || norm.startsWith(`${d}/`)) hit.add(d);
+  }
+  return [...hit];
+}
+
+/** {areas, paths, core, label} for display: "hermes", "base system", … */
+export function describeProtected(paths, basePaths = DEFAULT_BASE_PATHS) {
+  const ps = [...new Set(normalizePathPrefixes(paths))].slice(0, 8);
+  const areas = [...new Set(ps.map((p) => (basePaths.includes(p) ? "base system" : p.split("/").pop())))];
+  return { areas, paths: ps, core: ps.some((p) => basePaths.includes(p)), label: areas.join(", ") };
+}
+
+/** Sanitized protected info from a result / job (never trusts shapes). */
+export function normalizeProtected(p) {
+  if (!p || typeof p !== "object") return null;
+  const paths = normalizePathPrefixes(Array.isArray(p.paths) ? p.paths : []).filter((x) => /^[A-Za-z0-9._/-]{1,120}$/.test(x));
+  const areas = (Array.isArray(p.areas) ? p.areas : []).map(String).filter((a) => /^[A-Za-z0-9 ._-]{1,40}$/.test(a)).slice(0, 8);
+  if (!paths.length && !areas.length) return null;
+  return { areas, paths: paths.slice(0, 8), core: p.core === true, label: areas.join(", ") || paths.join(", ") };
+}
+
+/**
+ * Canonical message the app signs (HMAC-SHA256, key only the ops container
+ * uid can read) when an admin approves a protected lab test. The root runner
+ * recomputes it from the job spec + its own instance name.
+ */
+export function labApprovalMessage({ incident_id, instance, branch, head_sha, event_id, approved_at }) {
+  return [
+    "heimcloud-ops-lab-approval-v1",
+    String(Number(incident_id)),
+    String(instance),
+    String(branch),
+    String(head_sha),
+    String(Number(event_id)),
+    String(approved_at),
+  ].join("\n");
+}
+
+function normalizeProtectedRun(p) {
+  const base = normalizeProtected(p) || (p && typeof p === "object" && (p.unknown || p.claimed) ? { areas: [], paths: [], core: false, label: "unverified" } : null);
+  if (!base) return null;
+  return {
+    ...base,
+    approved: p.approved === true,
+    approvalEventId: Number.isInteger(Number(p.approval_event_id)) && p.approval_event_id != null ? Number(p.approval_event_id) : null,
+    unknown: p.unknown === true,
+  };
+}
+
+/** {ops, hermes} service states from a probe / post-rollback record. */
+function normalizeSvcPair(s) {
+  if (!s || typeof s !== "object") return null;
+  const one = (v, flat) => {
+    if (v && typeof v === "object") return { ok: v.ok === true, detail: typeof v.detail === "string" ? v.detail.slice(0, 120) : "", restarted: v.restarted === true };
+    if (typeof v === "boolean") return { ok: v, detail: typeof flat === "string" ? flat.slice(0, 120) : "", restarted: false };
+    return null;
+  };
+  const ops = one(s.ops_health, s.ops_detail);
+  const hermes = one(s.hermes_active, s.hermes_detail);
+  if (!ops && !hermes) return null;
+  return { ops, hermes };
 }

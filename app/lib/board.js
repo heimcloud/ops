@@ -92,6 +92,8 @@ export const ACTIONS = {
   start_fix: "Start fix",
   retry_push: "Retry push",
   retry_lab: "Retry lab test",
+  approve_lab: "Approve lab test",
+  skip_lab: "Skip lab, open compare link",
   open_compare: "Open compare link",
   mark_config_error: "Mark config error & close",
   mark_resolved: "Mark resolved",
@@ -185,6 +187,13 @@ function triageReasons(incident, t) {
   }
 }
 
+/** Protected-path info (label + base-system flag) from a result / event. */
+export function protectedInfo(p) {
+  const areas = Array.isArray(p?.areas) ? p.areas.map(String).filter((a) => /^[A-Za-z0-9 ._-]{1,40}$/.test(a)).slice(0, 8) : [];
+  const label = areas.join(", ") || (typeof p?.label === "string" && /^[A-Za-z0-9 ,._-]{1,120}$/.test(p.label) ? p.label : "protected");
+  return { label, core: p?.core === true || areas.includes("base system") };
+}
+
 function pushReason(fixMeta, job) {
   const acts = job ? ["retry_push"] : [];
   if (fixMeta.status === "ready_no_token") {
@@ -215,7 +224,8 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
   const triage = latestEvent(events, ["triage_result"]);
   const fix = latestEvent(events, ["fix_result"]);
   const triageEnq = latestEvent(events, ["triage_enqueued"]);
-  const fixEnq = latestEvent(events, ["fix_enqueued", "push_enqueued", "lab_enqueued"]);
+  // lab_approved = admin approved a protected lab test (the signed job is queued).
+  const fixEnq = latestEvent(events, ["fix_enqueued", "push_enqueued", "lab_enqueued", "lab_approved"]);
   // A job cancelled while still pending never produces a result: its
   // job_cancelled event (meta.job_kind) ends the busy window instead.
   const cancelledOf = (kinds) =>
@@ -248,7 +258,7 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
     }
     case "testing": {
       if (fixBusy) {
-        labQueued = fixEnq.kind === "lab_enqueued";
+        labQueued = fixEnq.kind === "lab_enqueued" || fixEnq.kind === "lab_approved";
         break;
       }
       const labCancel = cancelledOf(["lab"]);
@@ -301,11 +311,22 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
     case "needs_human": {
       if (fixBusy) break;
       const job = pushRetryJob(incident, fix);
-      if (fm && (["ready_no_token", "push_failed"].includes(fm.status) || job)) {
+      if (fm?.status === "lab_approval_needed") {
+        // Protected path (ops / Hermes / swag / base system on the shared
+        // ops/lab host): pushed, the lab test waits for the admin. The badge
+        // stays until he approves or skips.
+        const p = protectedInfo(fm.protected);
+        const r = reason("lab_approval", `Protected path (${p.label}): approve lab test`, ["approve_lab", "skip_lab", "close"], fm.summary);
+        r.protected = { label: p.label, core: p.core };
+        reasons.push(r);
+      } else if (fm?.services_unhealthy) {
+        reasons.push(reason("services_unhealthy", "Ops/Hermes still down after the lab rollback: check the host", ["mark_resolved"], fm.summary));
+      } else if (fm && (["ready_no_token", "push_failed"].includes(fm.status) || job)) {
         reasons.push(pushReason({ ...fm, status: fm.status === "ready_no_token" ? "ready_no_token" : "push_failed" }, job));
       } else if (fm?.status === "redaction_blocked") {
         reasons.push(reason("redaction_blocked", "Redaction gate blocked the push", ["start_fix", "close"], fm.summary));
       } else if (fm?.status === "denied") {
+        // Legacy results (before protected paths got the approval flow).
         reasons.push(reason("denied", "Diff touches a deny-listed path", ["start_fix", "close"], fm.summary));
       } else if (fm?.lab === "error" && /ROLLBACK NOT VERIFIED/.test(String(fm.summary || ""))) {
         reasons.push(reason("rollback_unverified", "Lab rollback NOT verified: check the host", ["mark_resolved"], fm.summary));
@@ -332,7 +353,19 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
       break;
     }
     case "pr_opened": {
-      if (incident.compare_url) {
+      const skipped = latestEvent(events, ["lab_skipped"]);
+      const untested = Boolean(skipped && (!fix || skipped.id > fix.id));
+      if (incident.compare_url && untested) {
+        const p = protectedInfo(skipped.meta?.protected);
+        const r = reason(
+          "compare_untested",
+          "Open the PR from the compare link (NOT lab-tested)",
+          ["open_compare", "mark_resolved"],
+          `Lab test skipped by admin: the protected change (${p.label}) was NOT lab-tested. Review it carefully, open the upstream PR, merge, then mark resolved.`,
+        );
+        r.untested = true;
+        reasons.push(r);
+      } else if (incident.compare_url) {
         reasons.push(
           reason(
             "compare_ready",

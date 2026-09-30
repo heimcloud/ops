@@ -80,6 +80,7 @@
             else "false"
           }"
           "OPS_AUTOFIX_DENY_PATHS=${concatStringsSep "," af.denyPaths}"
+          "OPS_AUTOFIX_BASE_PATHS=${concatStringsSep "," af.basePaths}"
           "OPS_NEO_BASE_REF=${af.neoBaseRef}"
           "OPS_AUTOFIX_HERMES_TIMEOUT_SEC=${toString af.hermesTimeoutSec}"
           "OPS_DB_PATH=${opsAppdata}/ops.sqlite"
@@ -271,8 +272,11 @@
           # Never restarted/stopped by a switch: it is the thing switching.
           restartIfChanged = false;
           stopIfChanged = false;
-          path = [config.nix.package pkgs.git pkgs.util-linux pkgs.coreutils pkgs.bash config.systemd.package config.virtualisation.docker.package];
+          path = [config.nix.package pkgs.git pkgs.util-linux pkgs.coreutils pkgs.bash pkgs.sqlite config.systemd.package config.virtualisation.docker.package];
           unitConfig.ConditionPathExists = [opsAppdata];
+          # Independent of ops / Hermes / the worker on purpose: no Requires /
+          # BindsTo / PartOf / After on them, so a protected change that kills
+          # any of them cannot stop the runner (or its watchdog) mid-rollback.
           serviceConfig = {
             Type = "oneshot";
             User = "root";
@@ -307,6 +311,22 @@
               "LABTEST_FLOCK_BIN=${pkgs.util-linux}/bin/flock"
               "LABTEST_DOCKER_BIN=${config.virtualisation.docker.package}/bin/docker"
               "LABTEST_NIX_BIN=${config.nix.package}/bin/nix"
+              # Protected paths (admin-approved runs only): the runner detects them
+              # itself (deployed neo source vs the fork branch), verifies the app's
+              # HMAC approval (key under ${opsAppdata}/private, owned by the ops uid)
+              # + the lab_approved DB event, and uses the short watchdog.
+              "LABTEST_SHARES_OPS_HOST=${
+                if af.labSharesOpsHost
+                then "true"
+                else "false"
+              }"
+              "LABTEST_PROTECTED_PATHS=${concatStringsSep "," af.denyPaths}"
+              "LABTEST_BASE_PATHS=${concatStringsSep "," af.basePaths}"
+              "LABTEST_PROTECTED_WATCHDOG_SEC=${toString lab.protectedWatchdogSec}"
+              "LABTEST_OPS_UID=${uid}"
+              "LABTEST_OPS_UNIT=${config.virtualisation.oci-containers.backend}-ops.service"
+              "LABTEST_DB_PATH=${opsAppdata}/ops.sqlite"
+              "LABTEST_SQLITE_BIN=${pkgs.sqlite}/bin/sqlite3"
             ];
             # Evidence redaction uses the same extra slugs as the worker.
             EnvironmentFile = mkIf (af.redactExtraSlugsFile != null) [af.redactExtraSlugsFile];

@@ -16,8 +16,8 @@ The worker prepares a fresh partial clone under `$HOME/workspace/autofix/<job>/n
 - Branch name: `fix/<short-topic>` or `ops/incident-<n>` — no customer info.
 - **Commit** your change on that branch (`git switch -c <branch>` then `git commit`). The worker only pushes commits on top of the base ref; uncommitted edits are discarded.
 - Git author/committer identity is preset by the worker. Do not run `git config`, do not amend the base history.
-- Do **not** `git push`, do not open a GitHub PR, do not merge. The worker runs a fail-closed redaction and deny-list gate, pushes, and prepares a compare link; Damo opens the upstream PR.
-- Minimal diff. Never touch deny-listed paths when the lab host shares the ops host: `nix/services/ops`, `nix/services/hermes`, `nix/services/swag`, `nix/modules/core`.
+- Do **not** `git push`, do not open a GitHub PR, do not merge. The worker runs a fail-closed redaction and protected-path gate, pushes, and prepares a compare link; Damo opens the upstream PR.
+- Minimal diff. Protected paths (`nix/services/ops`, `nix/services/hermes`, `nix/services/swag`, `nix/modules/core` = base system) may be changed when the incident is really there, but keep the change as small as possible and do not touch them otherwise. While the lab shares the ops host, such a fix is pushed as usual but its lab test waits for Damo's approval (it can take down ops, Hermes or the worker during the test). Say in `summary` which protected path you changed and why.
 - No identifiers in branch name, commit messages, or file contents you add (no customer slug, hostname, IP, email, home path, slug-bearing plugin URL). Any 10-character upper-case token blocks the push.
 - If the prompt includes a previous lab-test failure, fix forward with a new commit on the same branch.
 - Check what you changed, when the tools are available (`command -v`):

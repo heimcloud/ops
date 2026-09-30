@@ -215,6 +215,7 @@ const LAB_ATTEMPT_RESULT = {
   needs_human: "lab_failed",
   lab_error: "lab_error",
   awaiting_lab_test: "lab_cancelled",
+  lab_approval_needed: "lab_approval_needed",
 };
 
 /** Hermes fix attempt (vs. token wait / push failure / push-only retry). */
@@ -277,6 +278,9 @@ export function fixStatusToIncidentStatus(st) {
       // job scratch dir and waits for the fork-push token, or the admin
       // cancelled the run).
       return "triaged";
+    case "lab_approval_needed":
+      // Protected path: pushed, lab test waits for the admin (badge).
+      return "needs_human";
     default:
       // needs_human, redaction_blocked, denied, lab_failed, failed, error, …
       return "needs_human";
