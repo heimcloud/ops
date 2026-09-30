@@ -11,7 +11,7 @@
       cp ${../../scripts/autofix/redact.js} $out/redact.js
       cp ${../../scripts/autofix/compare.js} $out/compare.js
       cp ${../../scripts/autofix/queue-control.js} $out/queue-control.js
-      cp ${../../scripts/autofix/lab-checks.js} $out/lab-checks.js
+      cp ${../../app/lib/lab-checks.js} $out/lab-checks.js
       cp ${../../scripts/autofix/labtest.mjs} $out/labtest.mjs
     '';
     worker = pkgs.writeShellApplication {

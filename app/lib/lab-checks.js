@@ -1,8 +1,9 @@
 /**
  * Lab-test check schema, shared by the host worker (validates Hermes's plan),
  * the root lab runner (re-validates before executing anything) and the ops app
- * (renders the per-check results). Byte-identical copies live in app/lib and
- * scripts/autofix (a test enforces it); only plain JS, no imports.
+ * (renders the per-check results). One source: app/lib/lab-checks.js;
+ * scripts/autofix/lab-checks.js is a symlink to it and the worker package
+ * copies this file (a test enforces both). Only plain JS, no imports.
  *
  * Hermes may only choose from these check types. Every field is validated and
  * nothing is ever passed to a shell: units are matched by a strict regex,
@@ -15,7 +16,7 @@ export const MAX_LAB_CHECKS = 12;
 
 /** Generic checks the runner always adds (not choosable by Hermes). */
 export const GENERIC_CHECKS = [
-  { id: "activate", type: "activate", label: "Activation exits 0" },
+  { id: "activate", type: "activate", label: "Activation exits 0 (exit 4 only if just the user bus failed)" },
   { id: "failed_units", type: "failed_units", label: "No failed units (systemctl --failed)" },
   { id: "system_running", type: "system_running", label: "systemctl is-system-running = running" },
   { id: "ops_health", type: "ops_health", label: "Ops /health returns 200" },
@@ -24,6 +25,8 @@ export const GENERIC_CHECKS = [
 
 export const UNIT_RE = /^[A-Za-z0-9][A-Za-z0-9@._:-]{0,120}\.(service|socket|timer|target|path|mount)$/;
 export const CONTAINER_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
+/** Optional per-check id (the worker's validated plan carries c1…; Hermes may set its own). */
+export const CHECK_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 export const LAB_BRANCH_RE = /^(fix|ops)\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 export const LAB_INSTANCE_RE = /^lab-[0-9]{1,9}-[A-Za-z0-9-]{1,80}$/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
@@ -55,11 +58,17 @@ export const LAB_STAGE_LABELS = {
   done: "Done",
 };
 
+// Every type accepts the optional "id" and "label" fields. validateCheckPlan's
+// output must pass validateCheckPlan again unchanged: the worker validates
+// Hermes's plan and writes it (ids included) to the job spec, and the root
+// runner re-validates that spec with this same function.
+const COMMON_KEYS = ["type", "id", "label"];
 const KEYS = {
-  unit_active: ["type", "unit", "label"],
-  journal_absent: ["type", "unit", "pattern", "label"],
-  http_status: ["type", "url", "container", "port", "path", "expect_status", "contains", "label"],
+  unit_active: [...COMMON_KEYS, "unit"],
+  journal_absent: [...COMMON_KEYS, "unit", "pattern"],
+  http_status: [...COMMON_KEYS, "url", "container", "port", "path", "expect_status", "contains"],
 };
+const GENERIC_IDS = new Set(GENERIC_CHECKS.map((g) => g.id));
 
 function str(v, max) {
   return typeof v === "string" && v.length > 0 && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
@@ -81,6 +90,10 @@ export function validateCheck(raw) {
   const extra = Object.keys(raw).filter((k) => !KEYS[type].includes(k));
   if (extra.length) return { error: `${type}: unexpected field(s) ${extra.slice(0, 3).join(", ")}` };
   const out = { type };
+  if (raw.id != null) {
+    if (typeof raw.id !== "string" || !CHECK_ID_RE.test(raw.id)) return { error: `${type}: id must be 1-32 chars of A-Z a-z 0-9 _ -` };
+    out.id = raw.id;
+  }
   if (raw.label != null) {
     if (!str(raw.label, 100)) return { error: `${type}: label must be a short single-line string` };
     out.label = raw.label;
@@ -137,7 +150,11 @@ export function validateCheck(raw) {
 
 /**
  * Validate a Hermes check plan ({checks:[…]} or a bare array). Invalid entries
- * are dropped with a reason; duplicates are dropped; at most MAX_LAB_CHECKS.
+ * are dropped with a reason ("#N: why", N = 1-based position in the plan);
+ * duplicates are dropped; at most MAX_LAB_CHECKS. Every kept check gets an id:
+ * a valid supplied one is kept unless already taken or equal to a generic
+ * check's id, otherwise c<N>. A malformed id drops the check (like any bad field).
+ * Idempotent: validateCheckPlan(validateCheckPlan(p).checks) keeps all checks.
  * @returns {{checks: object[], errors: string[]}}
  */
 export function validateCheckPlan(plan) {
@@ -152,7 +169,7 @@ export function validateCheckPlan(plan) {
       errors.push(`#${i + 1}: ${r.error}`);
       return;
     }
-    const key = JSON.stringify({ ...r.check, label: undefined });
+    const key = JSON.stringify({ ...r.check, id: undefined, label: undefined });
     if (seen.has(key)) return;
     if (checks.length >= MAX_LAB_CHECKS) {
       errors.push(`#${i + 1}: more than ${MAX_LAB_CHECKS} checks`);
@@ -161,7 +178,19 @@ export function validateCheckPlan(plan) {
     seen.add(key);
     checks.push(r.check);
   });
-  return { checks: checks.map((c, i) => ({ id: `c${i + 1}`, ...c })), errors };
+  const used = new Set(GENERIC_IDS);
+  const withIds = checks.map((c) => {
+    const { id, ...rest } = c;
+    return { want: id && !used.has(id) ? (used.add(id), id) : null, rest };
+  });
+  let n = 0;
+  const nextId = () => {
+    do n += 1;
+    while (used.has(`c${n}`));
+    used.add(`c${n}`);
+    return `c${n}`;
+  };
+  return { checks: withIds.map(({ want, rest }) => ({ id: want || nextId(), ...rest })), errors };
 }
 
 /** Deterministic fallback when Hermes gives no usable plan: the incident unit must be active. */
@@ -235,6 +264,9 @@ export function normalizeLabReport(r) {
     durationSec: n(r.duration_sec),
     planSource: ["hermes", "default"].includes(r.plan_source) ? r.plan_source : "",
     planNotes: (Array.isArray(r.plan_notes) ? r.plan_notes : []).slice(0, 8).map((s) => String(s).slice(0, 200)),
+    // Checks the runner itself dropped while re-validating the job spec.
+    planErrors: (Array.isArray(r.plan_errors) ? r.plan_errors : []).slice(0, 8).map((s) => String(s).slice(0, 200)),
+    activationWarning: typeof r.activation?.warning === "string" ? r.activation.warning.slice(0, 200) : "",
     evidence: (Array.isArray(r.evidence) ? r.evidence : []).slice(0, 30).map((s) => String(s).slice(0, 300)),
   };
 }

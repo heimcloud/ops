@@ -69,6 +69,8 @@ true`,
 [ -n "\${FAKE_LAB_FAILS_UNIT:-}" ] && echo "\${FAKE_LAB_FAILS_UNIT} loaded failed failed Demo" >> "${F}/failed"
 [ -n "\${FAKE_LAB_ONLY_UNIT:-}" ] && echo "\${FAKE_LAB_ONLY_UNIT} loaded failed failed Lab only" >> "${F}/failed"
 [ -n "\${FAKE_LAB_HANG:-}" ] && sleep 30
+[ -n "\${FAKE_ACTIVATE_OUT:-}" ] && printf '%s\n' "\${FAKE_ACTIVATE_OUT}" >&2
+[ -n "\${FAKE_LAB_SYSSTATE:-}" ] && echo "\${FAKE_LAB_SYSSTATE}" > "${F}/sysstate"
 ln -sfn "$(dirname "$(dirname "$0")")" "${CUR}"
 exit "\${FAKE_ACTIVATE_EXIT:-0}"`,
   );
@@ -194,7 +196,7 @@ function reset(s = spec()) {
   fs.rmSync(path.join(OPS, "queue", "control", `cancel-${INST}.json`), { force: true });
   fs.writeFileSync(path.join(OPS, "queue", "processing", `${INST}.json`), JSON.stringify(s));
   health = 200;
-  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG"]) delete process.env[k];
+  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG", "FAKE_ACTIVATE_OUT", "FAKE_LAB_SYSSTATE"]) delete process.env[k];
   Object.assign(process.env, env());
 }
 
@@ -455,4 +457,119 @@ test("after rollback: lab-only failed units (not-found) are reset, a real unit s
   assert.doesNotMatch(failedNow, /neo-labtest-fail/);
   assert.match(failedNow, /docker-demo2\.service/, "real failure is not hidden");
   assert.ok(r.evidence.some((l) => /still failed after rollback/.test(l)));
+});
+
+// switch-to-configuration-ng output when a service user's user manager has no
+// bus (no lingering): the per-user child fails, the parent exits 4.
+const USER_BUS_OUT = [
+  "activating the configuration...",
+  "setting up /etc...",
+  "reloading user units for svcagent...",
+  "Error: Failed to open dbus connection",
+  "",
+  "Caused by:",
+  "    Failed to connect to socket /run/user/990/bus: No such file or directory",
+  "warning: user activation for svcagent failed",
+  "restarting sysinit-reactivation.target",
+  "the following new units were started: neo-labtest-demo.service",
+  "switching to system configuration /nix/store/bbbb-nixos-system-lab failed (status 4)",
+].join("\n");
+
+test("exit 4 from the user bus only (no new failed units, system running) passes with a warning", async () => {
+  process.env.FAKE_ACTIVATE_EXIT = "4";
+  process.env.FAKE_ACTIVATE_OUT = USER_BUS_OUT;
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", r.reason);
+  const act = r.checks.find((c) => c.id === "activate");
+  assert.equal(act.ok, true);
+  assert.match(act.detail, /^exit 4 tolerated: user bus unavailable/);
+  assert.doesNotMatch(act.detail, /svcagent/, "no user names in the check detail");
+  assert.ok(r.evidence.includes("activation exit 4 tolerated: user bus unavailable"), JSON.stringify(r.evidence));
+  assert.equal(r.activation.exit_code, 4);
+  assert.equal(r.activation.tolerated_exit4, true);
+  assert.equal(r.activation.warning, "exit 4 tolerated: user bus unavailable");
+  assert.equal(r.generation.restored, true);
+});
+
+test("exit 4 stays a failure: new failed unit, degraded system, system-level errors, unknown cause", async () => {
+  const cases = [
+    { name: "newly failed unit", env: { FAKE_LAB_FAILS_UNIT: "docker-demo.service" }, out: USER_BUS_OUT, why: /newly failed units/ },
+    { name: "degraded without failed units", env: { FAKE_LAB_SYSSTATE: "degraded" }, out: USER_BUS_OUT, why: /system degraded/ },
+    { name: "system unit failed to start", out: `${USER_BUS_OUT}\nFailed to start neo-labtest-fail.service: Unit failed`, why: /system-level failure: Failed to start neo-labtest-fail/ },
+    { name: "system units failed", out: `${USER_BUS_OUT}\nwarning: the following units failed: neo-labtest-fail.service`, why: /system-level failure: warning: the following units failed/ },
+    { name: "logind", out: "Unable to list users with logind: timeout\nswitching to system configuration x failed (status 4)", why: /system-level failure: Unable to list users/ },
+    { name: "no signature", out: "something odd happened", why: /unknown exit-4 cause/ },
+  ];
+  for (const c of cases) {
+    reset();
+    process.env.FAKE_ACTIVATE_EXIT = "4";
+    process.env.FAKE_ACTIVATE_OUT = c.out;
+    Object.assign(process.env, c.env || {});
+    const r = await lt.runLab(cfg(), INST);
+    const act = r.checks.find((x) => x.id === "activate");
+    assert.equal(r.verdict, "fail", c.name);
+    assert.equal(act.ok, false, c.name);
+    assert.match(act.detail, /^exit 4 not tolerated: /, c.name);
+    assert.match(act.detail, c.why, c.name);
+    assert.ok(!r.evidence.some((l) => /tolerated/.test(l)), c.name);
+    assert.equal(r.activation.tolerated_exit4, undefined, c.name);
+    assert.equal(r.generation.restored, true, c.name);
+  }
+  // Pre-degraded host: tolerated only while the failed set does not grow.
+  reset();
+  fs.writeFileSync(path.join(F, "failed-pre"), "old-thing.service loaded failed failed Old\n");
+  fs.writeFileSync(path.join(F, "failed"), "old-thing.service loaded failed failed Old\n");
+  process.env.FAKE_ACTIVATE_EXIT = "4";
+  process.env.FAKE_ACTIVATE_OUT = USER_BUS_OUT;
+  assert.equal((await lt.runLab(cfg(), INST)).verdict, "pass");
+  reset();
+  fs.writeFileSync(path.join(F, "failed-pre"), "old-thing.service loaded failed failed Old\n");
+  fs.writeFileSync(path.join(F, "failed"), "old-thing.service loaded failed failed Old\n");
+  process.env.FAKE_ACTIVATE_EXIT = "4";
+  process.env.FAKE_ACTIVATE_OUT = USER_BUS_OUT;
+  process.env.FAKE_LAB_FAILS_UNIT = "docker-demo.service";
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "fail");
+  assert.equal(r.checks.find((c) => c.id === "activate").ok, false);
+  // Other non-zero exits are never tolerated.
+  reset();
+  process.env.FAKE_ACTIVATE_EXIT = "2";
+  process.env.FAKE_ACTIVATE_OUT = USER_BUS_OUT;
+  assert.equal((await lt.runLab(cfg(), INST)).checks.find((c) => c.id === "activate").ok, false);
+});
+
+test("classifyActivationExit4: user-level lines are fine, system-level lines and truncation are not", () => {
+  const k = lt.classifyActivationExit4;
+  assert.equal(k(USER_BUS_OUT).tolerable, true);
+  assert.equal(k(USER_BUS_OUT).userBus, true);
+  assert.deepEqual(k(USER_BUS_OUT).users, ["svcagent"]);
+  const userUnits = "warning: user activation for svcagent failed\nFailed to restart user unit demo.service: x\nwarning: the following user units failed: demo.service\nFailed to restart nixos-activation.service: x";
+  assert.equal(k(userUnits).tolerable, true);
+  assert.equal(k(userUnits).userBus, false);
+  assert.equal(k(`${USER_BUS_OUT}\nFailed to reload docker-demo.service: x`).tolerable, false);
+  assert.equal(k(`${USER_BUS_OUT}\nFailed to stop docker-demo.service`).tolerable, false);
+  assert.equal(k(`${USER_BUS_OUT}\nFailed to restart sysinit-reactivation.target: x`).tolerable, false);
+  assert.equal(k(USER_BUS_OUT, { truncated: true }).tolerable, false);
+  assert.equal(k("").tolerable, false);
+});
+
+test("incident checks carrying the worker's ids (c1…) run; a rejected check is a visible evidence note", async () => {
+  const L = await import("../lib/lab-checks.js");
+  // What the worker writes: validateCheckPlan output, ids included.
+  const planned = L.validateCheckPlan({ checks: [{ type: "unit_active", unit: "docker-demo" }, { type: "journal_absent", unit: "docker-demo.service", pattern: "engine failed to load", id: "journal-1" }] });
+  assert.deepEqual(planned.errors, []);
+  assert.deepEqual(planned.checks.map((c) => c.id), ["c1", "journal-1"]);
+  reset(spec({ lab_checks: planned.checks }));
+  let r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", r.reason);
+  assert.deepEqual(r.plan_errors, []);
+  assert.equal(r.checks.length, 5 + 2);
+  assert.deepEqual(r.checks.slice(5).map((c) => c.id), ["c1", "journal-1"]);
+  assert.ok(!r.evidence.some((l) => /dropped/.test(l)));
+  // A bad check (here: a malformed id) is dropped, and says so on the card.
+  reset(spec({ lab_checks: [{ type: "unit_active", unit: "docker-demo.service", id: "no spaces allowed" }, { type: "unit_active", unit: "docker-demo.service", id: "c2" }] }));
+  r = await lt.runLab(cfg(), INST);
+  assert.equal(r.checks.length, 6);
+  assert.match(r.plan_errors[0], /^#1: unit_active: id must be/);
+  assert.ok(r.evidence.some((l) => /^check #1 dropped: unit_active: id must be/.test(l)), JSON.stringify(r.evidence));
 });

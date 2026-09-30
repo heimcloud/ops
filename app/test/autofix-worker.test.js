@@ -527,7 +527,7 @@ function resultsFor(kind, id) {
     .map((n) => ({ name: n, ...JSON.parse(fs.readFileSync(path.join(data, "results", n), "utf8")) }));
 }
 
-test("lab stage: push enqueues a lab job; pass → compare_ready with checks; Hermes plan validated (no shell)", () => {
+test("lab stage: push enqueues a lab job; pass → compare_ready with checks; Hermes plan validated (no shell)", async () => {
   labEnv(true);
   try {
     process.env.FAKE_HERMES_MODE = "ok";
@@ -553,7 +553,17 @@ test("lab stage: push enqueues a lab job; pass → compare_ready with checks; He
     assert.deepEqual(spec.lab_checks.map((c) => c.type), ["unit_active", "journal_absent"]);
     assert.equal(JSON.stringify(spec).includes("rm -rf"), false);
     assert.equal(spec.lab_plan.source, "hermes");
-    assert.ok(spec.lab_plan.notes.some((n) => /shell/.test(n)), "dropped check is noted");
+    assert.ok(spec.lab_plan.notes.some((n) => /^check #\d+ dropped: unknown check type .*shell/.test(n)), "dropped check is noted");
+    // Worker → root round trip: the ids the worker's validation assigned (c1…)
+    // are accepted by the root runner's loadSpec (same validator), nothing dropped.
+    assert.deepEqual(spec.lab_checks.map((c) => c.id), ["c1", "c2"]);
+    const rootOps = fs.mkdtempSync(path.join(tmp, "root-ops-"));
+    fs.mkdirSync(path.join(rootOps, "queue", "processing"), { recursive: true });
+    fs.writeFileSync(path.join(rootOps, "queue", "processing", `${inst}.json`), JSON.stringify(spec));
+    const LT = await import("../../scripts/autofix/labtest.mjs");
+    const loaded = LT.loadSpec({ opsDir: rootOps }, inst);
+    assert.deepEqual(loaded.planErrors, []);
+    assert.deepEqual(loaded.checks, spec.lab_checks);
     const calls = fs.readFileSync(path.join(tmp, "systemctl-calls"), "utf8");
     assert.match(calls, new RegExp(`start --no-block heimcloud-ops-labtest@${inst}\\.service`));
     // Evidence redacted, unit names kept readable.

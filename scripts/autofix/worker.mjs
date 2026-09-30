@@ -1296,7 +1296,8 @@ export function planLabChecks(cfg, job, ctx) {
   });
   const raw = extractJson(r.stdout) || extractJson(r.stderr);
   const plan = raw ? validateCheckPlan(raw) : { checks: [], errors: [`Hermes produced no plan (${hermesFailure(r)})`] };
-  for (const e of plan.errors.slice(0, 6)) notes.push(redactIdentifyingDetails(e, { knownSlugs: slugs }));
+  // Same wording as the root runner's evidence note ("check #N dropped: why").
+  for (const e of plan.errors.slice(0, 6)) notes.push(redactIdentifyingDetails(`check ${e.replace(/^(#\d+):\s*/, "$1 dropped: ")}`, { knownSlugs: slugs }));
   if (plan.checks.length) return { checks: plan.checks, source: "hermes", notes };
   notes.push("using the default check (incident unit active)");
   return { checks: defaultChecks(job.unit), source: "default", notes };

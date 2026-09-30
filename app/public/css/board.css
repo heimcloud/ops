@@ -431,6 +431,7 @@ select.prio.p-low, .chip.prio.p-low { color: var(--k-muted); }
 .kc-lab-n { font-variant-numeric: tabular-nums; }
 .kc-lab-n.ok { color: var(--k-accent); }
 .kc-lab-n.bad { color: var(--k-crit); }
+.kc-lab-note { display: block; margin-top: 0.2rem; font-size: 0.7rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kc-run[data-lab] .mono { color: var(--k-warn); }
 .lab-rep h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
 .lab-rep h3 .muted { font-weight: 500; font-size: 0.72rem; text-transform: none; letter-spacing: 0; }

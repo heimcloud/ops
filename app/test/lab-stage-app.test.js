@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 
+const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ops-lab-app-"));
 process.env.OPS_DB_PATH = path.join(tmpDir, "ops.sqlite");
 process.env.OPS_DATA_DIR = tmpDir;
@@ -142,6 +143,52 @@ test("check plan schema: whitelisted types only, unknown fields/types dropped, b
   assert.deepEqual(L.defaultChecks("docker-searxng").map((c) => [c.type, c.unit]), [["unit_active", "docker-searxng.service"]]);
 });
 
+test("check ids: optional on every type, validated, kept or assigned; the worker's output re-validates unchanged", () => {
+  const ids = L.validateCheckPlan({
+    checks: [
+      { type: "unit_active", unit: "chronyd.service", id: "c1" },
+      { type: "journal_absent", unit: "chronyd", pattern: "no reachable server", id: "journal_1" },
+      { type: "http_status", url: "http://127.0.0.1:8080/", id: "web-A" },
+      { type: "unit_active", unit: "other.service", id: "c1" }, // duplicate id → reassigned
+      { type: "unit_active", unit: "third.service", id: "activate" }, // generic id → reassigned
+      { type: "unit_active", unit: "fourth.service" },
+    ],
+  });
+  assert.deepEqual(ids.errors, []);
+  assert.deepEqual(ids.checks.map((c) => c.id), ["c1", "journal_1", "web-A", "c2", "c3", "c4"]);
+  // Round trip: what the worker writes into the job spec is exactly what the
+  // root runner accepts (it re-validates with the same function).
+  const again = L.validateCheckPlan({ checks: ids.checks });
+  assert.deepEqual(again.errors, []);
+  assert.deepEqual(again.checks, ids.checks);
+  const plain = L.validateCheckPlan([{ type: "unit_active", unit: "chronyd" }]);
+  assert.deepEqual(L.validateCheckPlan(plain.checks), plain);
+  assert.deepEqual(L.validateCheckPlan(L.defaultChecks("chronyd")).errors, []);
+  // Same id, same check → still a duplicate (id/label are not part of the key).
+  assert.equal(L.validateCheckPlan([{ type: "unit_active", unit: "a.service", id: "x" }, { type: "unit_active", unit: "a.service", id: "y" }]).checks.length, 1);
+  for (const bad of ["a b", "x".repeat(33), "", "c1;id", "ü", 5, { x: 1 }]) {
+    const r = L.validateCheck({ type: "unit_active", unit: "a.service", id: bad });
+    assert.match(r.error || "", /id must be 1-32 chars/, JSON.stringify(bad));
+  }
+  assert.equal(L.validateCheck({ type: "unit_active", unit: "a.service", id: "x".repeat(32) }).check.id, "x".repeat(32));
+  // Every type accepts id and label, and still rejects any other unknown field.
+  for (const t of L.LAB_CHECK_TYPES) {
+    const base = t === "http_status" ? { url: "http://127.0.0.1/" } : t === "journal_absent" ? { unit: "a.service", pattern: "boom!" } : { unit: "a.service" };
+    assert.ok(L.validateCheck({ type: t, ...base, id: "k1", label: "L" }).check, t);
+    assert.match(L.validateCheck({ type: t, ...base, idx: "k1" }).error, /unexpected field\(s\) idx/, t);
+  }
+});
+
+test("skill doc: the documented check schema matches what the validator accepts", () => {
+  const doc = fs.readFileSync(path.join(repo, "skills", "heimcloud-ops-labtest", "SKILL.md"), "utf8");
+  assert.match(doc, /`id`/, "SKILL.md documents the optional id");
+  assert.match(doc, /A-Za-z0-9_-\]\{1,32\}/);
+  // Every JSON example in the doc validates without errors.
+  const blocks = [...doc.matchAll(/```json\n([\s\S]*?)```/g)].map((m) => JSON.parse(m[1]));
+  assert.ok(blocks.length >= 1);
+  for (const b of blocks) assert.deepEqual(L.validateCheckPlan(b).errors, [], JSON.stringify(b));
+});
+
 test("branch and instance validation blocks injection", () => {
   for (const b of ["fix/labtest-pass", "fix/a/b.c_d-1", "ops/x"]) assert.ok(L.isValidBranch(b), b);
   for (const b of ["main", "fix/../x", "fix/x;reboot", "fix/$(id)", "-fix/x", "fix/x y", "fix/", "fix/x/"]) assert.equal(L.isValidBranch(b), false, b);
@@ -248,6 +295,36 @@ test("card + drawer: progress line, per-check list, evidence redacted (IPs, host
   assert.match(html, /byte-identical/);
   assert.match(html, /disarmed/);
   for (const leak of ["198.51.100.7", "lab01.example.net", "ops@example.org", "YYBURNED01"]) assert.equal(html.includes(leak) || cardHtml.includes(leak), false, leak);
+});
+
+test("card + drawer: dropped checks and a tolerated activation exit 4 are visible, not silent", () => {
+  const inc = incident();
+  applyResult({ kind: "fix", incident_id: inc.id, status: "lab_queued", branch: "fix/x", attempts: 1, max_attempts: 2 });
+  const rep = report("fail", {
+    plan_errors: ["#1: unit_active: unexpected field(s) idx"],
+    plan_notes: ["check #3 dropped: unknown check type \"shell\" on 198.51.100.7"],
+    activation: { exit_code: 4, tolerated_exit4: true, warning: "exit 4 tolerated: user bus unavailable" },
+  });
+  applyResult({ kind: "fix", via: "lab", incident_id: inc.id, status: "lab_retry", lab: "failed", branch: "fix/x", attempts: 1, max_attempts: 2, lab_report: rep });
+  const inc2 = db.getIncident(inc.id);
+  const events = db.listIncidentEvents(inc.id, { limit: 100 });
+  const attempts = db.listFixAttempts(inc.id);
+  const redact = B.makeDisplayRedactor(["YYBURNED01"]);
+  const caps = { admin: true, fix: true, triage: true, lab: true, readOnly: false };
+  const card = buildCardModel(inc2, events, attempts, redact, { labAuto: true });
+  assert.deepEqual(card.labRun.dropped.length, 2);
+  const cardHtml = renderCard(card, "/admin", caps);
+  assert.match(cardHtml, /data-lab-dropped[^>]*>⚠ check #3 dropped: unknown check type/);
+  assert.match(cardHtml, /\(\+1 more\)/);
+  assert.match(cardHtml, /check #1 dropped: unit_active: unexpected field\(s\) idx/, "full list in the title");
+  assert.match(cardHtml, /data-lab-actwarn>⚠ activation exit 4 tolerated: user bus unavailable/);
+  const html = renderDrawer(buildDrawerModel(inc2, events, attempts, redact, { labAuto: true }), "/admin", caps);
+  assert.match(html, /<dt>Dropped checks<\/dt>/);
+  assert.match(html, /exit 4 <span class="warnv">\(exit 4 tolerated: user bus unavailable\)<\/span>/);
+  assert.equal(html.includes("198.51.100.7") || cardHtml.includes("198.51.100.7"), false, "dropped notes are redacted");
+  // No drops, clean exit: no extra lines.
+  const plainHtml = renderCard(buildCardModel(db.getIncident(incident().id), [], [], redact, { labAuto: true }), "/admin", caps);
+  assert.doesNotMatch(plainHtml, /data-lab-dropped|data-lab-actwarn/);
 });
 
 // ---------------------------------------------------------------- queue + admin

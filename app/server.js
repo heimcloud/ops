@@ -72,7 +72,7 @@ app.post("/api/incidents", requireIngestSecret, (req, res) => {
     if (created && ["1", "true", "yes", "on"].includes(String(process.env.OPS_AUTOTRIAGE || "").toLowerCase())) {
       try {
         const { path: jobPath } = enqueueJob("triage", incident);
-        addIncidentEvent(incident.id, "triage_enqueued", "Auto-triage job enqueued", { job_path: jobPath });
+        addIncidentEvent(incident.id, "triage_enqueued", "Auto-triage job enqueued (OPS_AUTOTRIAGE on ingest)", { job_path: jobPath, trigger: "ingest_autotriage" });
       } catch (err) {
         console.error("[ingest] autotriage enqueue failed", err);
       }
@@ -119,6 +119,6 @@ if (pollMs > 0) {
 
 app.listen(PORT, () => {
   console.log(
-    `Heimcloud ops listening on :${PORT} (ingest=${Boolean(OPS_INGEST_SECRET)}, github=${getGithubTokenConfigured()}, admin=${ADMIN_ENABLED ? ADMIN_PATH : "off"}, readOnly=${ADMIN_READ_ONLY}, db=${getDbPath()})`,
+    `Heimcloud ops listening on :${PORT} (ingest=${Boolean(OPS_INGEST_SECRET)}, github=${getGithubTokenConfigured()}, admin=${ADMIN_ENABLED ? ADMIN_PATH : "off"}, readOnly=${ADMIN_READ_ONLY}, autoTriage=${["1", "true", "yes", "on"].includes(String(process.env.OPS_AUTOTRIAGE || "").toLowerCase())}, db=${getDbPath()})`,
   );
 });

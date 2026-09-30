@@ -135,11 +135,23 @@ export function labSummary(events, redact) {
   if (!best) return null;
   const r = normalizeLabReport(best.m.lab_report);
   if (!r) return null;
+  // Checks Hermes planned that were dropped (by the worker's or the runner's
+  // validation): never silent, shown on the card and in the drawer.
+  const dropped = [
+    ...new Set([
+      ...r.planNotes.filter((l) => /^check #\d+ dropped: /.test(l)),
+      ...r.planErrors.map((e) => `check ${e.replace(/^(#\d+):\s*/, "$1 dropped: ")}`),
+    ]),
+  ]
+    .slice(0, 8)
+    .map((l) => redact(l));
   return {
     verdict: r.verdict,
     passed: r.passed,
     failed: r.failed,
     total: r.checks.length,
+    dropped,
+    activationWarning: redact(r.activationWarning),
     attempt: Number(best.m.attempts) || null,
     maxAttempts: Number(best.m.max_attempts) || null,
     at: formatZurich(best.e.created_at),
@@ -329,7 +341,11 @@ export function renderLabLine(l) {
       <span class="kc-lab-v">Lab ${esc(VERDICT_LABEL[v])}</span>
       <span class="kc-lab-n ok" aria-label="${l.passed} passed">✓ ${l.passed}</span>
       <span class="kc-lab-n bad" aria-label="${l.failed} failed">✗ ${l.failed}</span>
-    </div>`;
+    </div>${
+      l.dropped?.length
+        ? `<div class="kc-lab-note warnv" data-lab-dropped title="${esc(l.dropped.join("\n"))}">⚠ ${esc(l.dropped[0])}${l.dropped.length > 1 ? ` (+${l.dropped.length - 1} more)` : ""}</div>`
+        : ""
+    }${l.activationWarning ? `<div class="kc-lab-note warnv" data-lab-actwarn>⚠ activation ${esc(l.activationWarning)}</div>` : ""}`;
 }
 
 /** Drawer section: the full per-check list + rollback guarantees. */
@@ -347,7 +363,10 @@ export function renderLabReport(l) {
       ? `armed · ${r.watchdog.disarmed ? `<span class="okv">disarmed</span>` : `<span class="warnv">still armed</span>`}`
       : `<span class="muted">not armed</span>`;
   const pins = r.pinsIdentical ? `<span class="okv">byte-identical</span>` : r.pinsRestored ? `<span class="warnv">changed, restored from backup</span>` : g.before != null ? `<span class="badv">not verified</span>` : `<span class="muted">—</span>`;
-  const act = r.activationExit != null ? `exit ${esc(r.activationExit)}` : `<span class="muted">—</span>`;
+  const act =
+    r.activationExit != null
+      ? `exit ${esc(r.activationExit)}${l.activationWarning ? ` <span class="warnv">(${esc(l.activationWarning)})</span>` : ""}`
+      : `<span class="muted">—</span>`;
   const checks = r.checks.length
     ? `<ul class="lab-checks">${r.checks
         .map(
@@ -368,6 +387,7 @@ export function renderLabReport(l) {
       <div><dt>Pins (lock/flake/settings)</dt><dd>${pins}</dd></div>
       <div><dt>Tested commit</dt><dd>${r.testedRev ? `<code>${esc(r.testedRev)}</code> (fork branch tip = gated commit)` : `<span class="muted">—</span>`}</dd></div>
       <div><dt>Activation</dt><dd>${act}${r.durationSec != null ? ` · run ${esc(Math.round(r.durationSec))} s` : ""}</dd></div>
+      ${l.dropped?.length ? `<div><dt>Dropped checks</dt><dd><span class="warnv">${esc(l.dropped.join("; "))}</span></dd></div>` : ""}
       <div><dt>Check plan</dt><dd>${r.planSource === "hermes" ? "Hermes" : r.planSource === "default" ? "default (Hermes plan unusable)" : "—"}${r.planNotes.length ? ` <span class="muted">· ${esc(r.planNotes.join("; "))}</span>` : ""}</dd></div>
     </dl>
     ${r.evidence.length ? `<details class="dr-logs"><summary>Evidence (redacted, ${r.evidence.length} lines)</summary><pre>${esc(r.evidence.join("\n"))}</pre></details>` : ""}

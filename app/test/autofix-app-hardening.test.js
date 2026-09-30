@@ -147,6 +147,26 @@ test("worker copies of redact.js / compare.js / queue-control.js / lab-checks.js
   }
 });
 
+test("lab-checks.js has one source: scripts/autofix symlinks it and the worker package copies app/lib", () => {
+  const link = path.join(repo, "scripts", "autofix", "lab-checks.js");
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), "scripts/autofix/lab-checks.js must be a symlink");
+  assert.equal(fs.readlinkSync(link), "../../app/lib/lab-checks.js");
+  const pkg = fs.readFileSync(path.join(repo, "modules/packages/heimcloud-ops-worker.nix"), "utf8");
+  assert.match(pkg, /cp \$\{\.\.\/\.\.\/app\/lib\/lab-checks\.js\} \$out\/lab-checks\.js/);
+});
+
+test("auto-triage is off unless triage.enable and triage.autoEnqueue are both set (default false)", () => {
+  const opt = fs.readFileSync(path.join(repo, "modules/services/ops/option.nix"), "utf8");
+  const def = fs.readFileSync(path.join(repo, "modules/services/ops/default.nix"), "utf8");
+  assert.match(opt, /autoEnqueue = mkOption \{\s*type = types\.bool;\s*default = false;/);
+  assert.match(def, /triageOn = autofixOn && af\.triage\.enable;/);
+  assert.match(def, /autoTriage = triageOn && af\.triage\.autoEnqueue;/);
+  assert.match(def, /OPS_AUTOTRIAGE = boolStr autoTriage;/);
+  // The app enqueues on ingest only for an explicit truthy value.
+  const server = fs.readFileSync(path.join(repo, "app/server.js"), "utf8");
+  assert.match(server, /created && \["1", "true", "yes", "on"\]\.includes\(String\(process\.env\.OPS_AUTOTRIAGE \|\| ""\)\.toLowerCase\(\)\)/);
+});
+
 test("Nix path unit watches the host dir the container writes to", () => {
   const def = fs.readFileSync(path.join(repo, "modules/services/ops/default.nix"), "utf8");
   const af = fs.readFileSync(path.join(repo, "modules/services/ops/autofix.nix"), "utf8");

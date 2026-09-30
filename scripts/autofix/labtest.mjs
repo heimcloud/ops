@@ -205,7 +205,7 @@ export function runCmd(cmd, args, { timeoutSec = 600, graceSec = 30, env, cwd, m
       clearTimeout(timer);
       clearTimeout(killTimer);
       kill("SIGKILL"); // stragglers of the group
-      resolve({ status: code, signal, stdout, stderr, error: null, timedOut });
+      resolve({ status: code, signal, stdout, stderr, error: null, timedOut, truncated: stdout.length >= maxBytes || stderr.length >= maxBytes });
     });
   });
 }
@@ -613,19 +613,77 @@ async function switchTo(cfg, toplevel, timeoutSec) {
   });
 }
 
+/*
+ * switch-to-configuration exits 4 for "switched, but something failed". Neo's
+ * own activate treats every exit 4 as success-with-warnings (user session
+ * reloads). The lab is stricter: exit 4 only passes when the output shows that
+ * the *only* failure was the per-user activation (typically the service user's
+ * user bus /run/user/<uid>/bus not running: no lingering), and nothing at the
+ * system level failed. Messages below are the ones switch-to-configuration-ng
+ * prints (parent: per-user result; child: dbus / user-unit errors).
+ */
+const USER_ACTIVATION_FAILED = /warning: user activation for (\S+) failed/;
+const USER_BUS_HINT = /Failed to open dbus connection|\/run\/user\/\d+\/bus|DBUS_SESSION_BUS_ADDRESS|org\.freedesktop\.DBus\.Error\.(NoServer|FileNotFound|NoReply|Spawn)|XDG_RUNTIME_DIR/;
+// Any of these means a system-level failure: exit 4 is then a real failure.
+const SYSTEM_FAILURE = [
+  /warning: the following units failed:/, // (not "the following user units failed")
+  /Unable to list users with logind/,
+  /Failed to run activate script/,
+  /Failed to install bootloader/,
+  /Failed to restart sysinit-reactivation\.target/,
+  // Failed to start|stop|restart|reload <unit> (system job) vs "... user unit X"
+  // and the child's "Failed to restart nixos-activation.service" (user-level).
+  /\bFailed to (start|stop|restart|reload|reload-or-restart|verify-start|try-restart)\s+(?!user unit\b)(?!nixos-activation\.service\b)\S/,
+];
+
+/**
+ * Decide whether an exit-4 activation output is only the per-user activation
+ * failing. Returns {tolerable, reason, users, userBus}.
+ */
+export function classifyActivationExit4(output, { truncated = false } = {}) {
+  const lines = String(output || "").split("\n");
+  const users = [...new Set(lines.map((l) => USER_ACTIVATION_FAILED.exec(l)?.[1]).filter(Boolean))];
+  const blocker = lines.find((l) => SYSTEM_FAILURE.some((re) => re.test(l)));
+  const userBus = lines.some((l) => USER_BUS_HINT.test(l));
+  if (truncated) return { tolerable: false, reason: "activation output truncated", users, userBus };
+  if (blocker) return { tolerable: false, reason: `system-level failure: ${blocker.trim().slice(0, 160)}`, users, userBus };
+  if (!users.length) return { tolerable: false, reason: "no user-activation failure in the output (unknown exit-4 cause)", users, userBus };
+  return { tolerable: true, reason: userBus ? "user bus unavailable" : "user activation failed", users, userBus };
+}
+
 async function genericChecks(cfg, run, ctx) {
   const results = [];
   const g = (type) => GENERIC_CHECKS.find((c) => c.type === type);
   const add = (type, ok, detail) => results.push({ id: g(type).id, type, generic: true, label: g(type).label, ok, detail: red(detail || "").slice(0, 400) });
-  add("activate", ctx.activation.exit_code === 0 && !ctx.activation.timed_out, ctx.activation.timed_out ? `timed out after ${cfg.activateSec} s` : `exit ${ctx.activation.exit_code}`);
+  // failed_units / system_running are evaluated first: the exit-4 rule needs
+  // them. The result order stays activate, failed_units, system_running.
   const failed = await failedUnits(cfg);
   const pre = new Set(ctx.pre.failed);
   const grown = failed.filter((u) => !pre.has(u));
   const tolerate = ctx.pre.state === "degraded" && grown.length === 0;
-  add("failed_units", failed.length === 0 || tolerate, failed.length === 0 ? "none" : tolerate ? `${failed.length} already failed before the test: ${failed.join(", ")}` : `newly failed: ${grown.join(", ")}`);
-  if (grown.length) run.note(`failed units after activation: ${grown.join(", ")}`);
+  const failedOk = failed.length === 0 || tolerate;
   const state = ctx.stateAfterSettle;
-  add("system_running", state === "running" || (state === "degraded" && tolerate), state === "degraded" && tolerate ? "degraded (as before the test, no new failures)" : state);
+  const runningOk = state === "running" || (state === "degraded" && tolerate);
+  const act = ctx.activation;
+  let actOk = act.exit_code === 0 && !act.timed_out;
+  let actDetail = act.timed_out ? `timed out after ${cfg.activateSec} s` : `exit ${act.exit_code}`;
+  if (act.exit_code === 4 && !act.timed_out) {
+    const k = ctx.exit4 || { tolerable: false, reason: "no activation output" };
+    if (k.tolerable && failedOk && runningOk) {
+      actOk = true;
+      const what = k.userBus ? "user bus unavailable" : "user activation failed";
+      actDetail = `exit 4 tolerated: ${what} (user activation failed for ${k.users.length} user(s)); no newly failed units, system ${state}`;
+      act.tolerated_exit4 = true;
+      act.warning = `exit 4 tolerated: ${what}`;
+      run.note(`activation exit 4 tolerated: ${what}`);
+    } else {
+      actDetail = `exit 4 not tolerated: ${!k.tolerable ? k.reason : !failedOk ? "newly failed units after activation" : `system ${state}`}`;
+    }
+  }
+  add("activate", actOk, actDetail);
+  add("failed_units", failedOk, failed.length === 0 ? "none" : tolerate ? `${failed.length} already failed before the test: ${failed.join(", ")}` : `newly failed: ${grown.join(", ")}`);
+  if (grown.length) run.note(`failed units after activation: ${grown.join(", ")}`);
+  add("system_running", runningOk, state === "degraded" && tolerate ? "degraded (as before the test, no new failures)" : state);
   run.setStage("checks", { step: 3, steps: ctx.total });
   const ops = await until(cfg, () => opsHealth(cfg), run);
   add("ops_health", ops.ok, ops.detail);
@@ -729,6 +787,8 @@ export async function runLab(cfg, instance) {
     result.branch = spec.branch;
     result.flake_url = flakeUrlFor(cfg, spec.branch);
     result.plan_errors = spec.planErrors.map(red);
+    // A check the runner drops must be visible on the card, never vanish.
+    for (const e of result.plan_errors.slice(0, 6)) run.note(`check ${e.replace(/^(#\d+):\s*/, "$1 dropped: ")}`);
     run.status.incident_id = spec.incidentId;
     const cancelled = () => cancelRequested(path.join(cfg.opsDir, "queue"), spec.processingName) || run.stopping;
     const cancel = (stage) => {
@@ -845,6 +905,7 @@ export async function runLab(cfg, instance) {
     const a = await switchTo(cfg, b.toplevel, cfg.activateSec);
     result.activation = { exit_code: a.status, timed_out: a.timedOut, duration_sec: Math.round((Date.now() - ta) / 1000) };
     if (a.status !== 0) run.note(tailLines(`${a.stderr}\n${a.stdout}`, 15).map((l) => `activation: ${l}`));
+    const exit4 = a.status === 4 ? classifyActivationExit4(`${a.stderr}\n${a.stdout}`, { truncated: a.truncated }) : null;
 
     run.setStage("settling");
     if (!run.stopping) await sleep(cfg.settleSec * 1000);
@@ -857,7 +918,7 @@ export async function runLab(cfg, instance) {
 
     const total = GENERIC_CHECKS.length + spec.checks.length;
     run.setStage("checks", { step: 1, steps: total });
-    const checks = run.stopping ? [] : await genericChecks(cfg, run, { activation: result.activation, pre, stateAfterSettle: st, total });
+    const checks = run.stopping ? [] : await genericChecks(cfg, run, { activation: result.activation, exit4, pre, stateAfterSettle: st, total });
     for (const [i, c] of spec.checks.entries()) {
       if (run.stopping) break;
       run.setStage("checks", { step: GENERIC_CHECKS.length + i + 1, steps: total });
