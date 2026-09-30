@@ -4,7 +4,7 @@
 import express from "express";
 import { getDb, getDbPath, upsertIncident, addIncidentEvent } from "./lib/db.js";
 import { enqueueJob } from "./lib/queue.js";
-import { ingestResultsDir } from "./lib/results.js";
+import { ingestResultsDir, startResultsIngestLoop } from "./lib/results.js";
 import { createAdminRouter, getAdminConfig } from "./lib/admin.js";
 import { getGithubTokenConfigured, getAllowlist } from "./lib/github.js";
 
@@ -106,6 +106,16 @@ if (ADMIN_ENABLED) {
 
 // Ensure DB migrates on boot
 getDb();
+
+// Background ingest of worker results (poll + best-effort fs.watch). Same
+// claim-by-rename as the admin page-load path, so no double ingest.
+const pollMs = Number(process.env.OPS_RESULTS_POLL_MS ?? 15000);
+if (pollMs > 0) {
+  startResultsIngestLoop({
+    intervalMs: pollMs,
+    watch: !["0", "false", "no", "off"].includes(String(process.env.OPS_RESULTS_WATCH || "true").toLowerCase()),
+  });
+}
 
 app.listen(PORT, () => {
   console.log(

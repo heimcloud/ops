@@ -50,27 +50,99 @@ export function ingestResultsDir() {
 
   for (const file of files) {
     const full = path.join(dir, file);
+    const claimed = full.replace(/\.json$/, ".ingested.json");
+    // Claim first (atomic rename), then apply: a result is applied at most once
+    // even if the page-load path and the background loop overlap, and a failed
+    // rename can never lead to a second apply on the next tick.
     try {
-      const raw = fs.readFileSync(full, "utf8");
-      const result = JSON.parse(raw);
+      fs.renameSync(full, claimed);
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        const msg = `cannot claim ${file} (${err.code || err.message}); results dir must be writable by the container`;
+        warnOnce(msg);
+        errors.push(msg);
+      }
+      continue;
+    }
+    try {
+      const result = JSON.parse(fs.readFileSync(claimed, "utf8"));
       applyResult(result);
-      const done = full.replace(/\.json$/, ".ingested.json");
-      fs.renameSync(full, done);
       ingested += 1;
     } catch (err) {
       errors.push(`${file}: ${err.message || err}`);
-      // Park bad results so they are not retried on every page load.
-      if (!["EACCES", "EPERM"].includes(err.code)) {
-        try {
-          fs.renameSync(full, full.replace(/\.json$/, ".rejected.json"));
-        } catch {
-          /* ignore */
-        }
+      // Park bad results so they are not retried forever.
+      try {
+        fs.renameSync(claimed, full.replace(/\.json$/, ".rejected.json"));
+      } catch {
+        /* ignore */
       }
       console.error(`[results] ${file}: ${err.message || err}`);
     }
   }
   return { ingested, errors };
+}
+
+/**
+ * Background ingest: poll every intervalMs (authoritative) plus a best-effort
+ * fs.watch on the results dir (inotify works on a bind mount; it is re-armed
+ * by the poll if it dies or the dir appears later). Never throws; errors are
+ * warned once per distinct message.
+ * @returns {{ stop: () => void, tick: () => void }}
+ */
+export function startResultsIngestLoop({ intervalMs = 15_000, watch = true } = {}) {
+  let watcher = null;
+  let debounce = null;
+  let lastLoopError = "";
+
+  const tick = () => {
+    try {
+      const r = ingestResultsDir();
+      if (r.ingested) console.log(`[results] background ingest: ${r.ingested} result(s)`);
+      lastLoopError = "";
+    } catch (err) {
+      const msg = String(err && err.message ? err.message : err);
+      if (msg !== lastLoopError) {
+        lastLoopError = msg;
+        console.warn(`[results] background ingest failed: ${msg}`);
+      }
+    }
+    if (watch && !watcher) arm();
+  };
+
+  const arm = () => {
+    try {
+      watcher = fs.watch(resultsDir(), { persistent: false }, (_ev, name) => {
+        if (name && !String(name).endsWith(".json")) return;
+        if (String(name || "").endsWith(".ingested.json") || String(name || "").endsWith(".rejected.json")) return;
+        clearTimeout(debounce);
+        debounce = setTimeout(tick, 500);
+        debounce.unref?.();
+      });
+      watcher.on("error", () => {
+        try {
+          watcher.close();
+        } catch {
+          /* ignore */
+        }
+        watcher = null; // re-armed on the next poll
+      });
+    } catch {
+      watcher = null; // dir missing / unwatchable: polling still covers it
+    }
+  };
+
+  tick();
+  const timer = intervalMs > 0 ? setInterval(tick, intervalMs) : null;
+  timer?.unref?.();
+  return {
+    tick,
+    stop() {
+      if (timer) clearInterval(timer);
+      clearTimeout(debounce);
+      if (watcher) watcher.close();
+      watcher = null;
+    },
+  };
 }
 
 export function applyResult(result) {
@@ -137,7 +209,10 @@ export function fixStatusToIncidentStatus(st) {
     case "compare_ready":
       return "pr_opened";
     case "no_token":
+    case "ready_no_token":
     case "disabled":
+      // Nothing was pushed: back to triaged (fix is committed locally in the
+      // job scratch dir and waits for the fork-push token).
       return "triaged";
     default:
       // needs_human, redaction_blocked, denied, lab_failed, failed, error, …
