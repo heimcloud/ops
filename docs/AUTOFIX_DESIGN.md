@@ -95,7 +95,7 @@ Retry rule (unchanged semantics of `autofix.maxAttempts`, default 2 = the first 
 5. **Arm the watchdog** (below) and verify its timer is active; if arming fails nothing is activated.
 6. **Activate** `<lab-toplevel>/bin/switch-to-configuration test`: no bootloader entry, no new profile generation, so even a crash/reboot comes back on the recorded system.
 7. **Settle** (`settleSec`, then up to 180 s while `is-system-running` is still starting), then **checks** (generic + incident).
-8. **finally (always)**: `<recorded-system>/bin/switch-to-configuration test`, verify `/run/current-system` = recorded, profile generation and booted system unchanged, pin files byte-identical (a changed file is restored from the backup and reported), then **disarm** the watchdog (stop the timer). If anything cannot be verified the watchdog stays armed and the result says `rollback_unverified`.
+8. **finally (always)**: `<recorded-system>/bin/switch-to-configuration test`, verify `/run/current-system` = recorded, profile generation and booted system unchanged, pin files byte-identical (a changed file is restored from the backup and reported), then **disarm** the watchdog (stop the timer) and `reset-failed` only units that existed in the lab system alone (`not-found` after the rollback; a unit of the restored system that is still failed is reported in the evidence, never hidden). If anything cannot be verified the watchdog stays armed and the result says `rollback_unverified`.
 9. Write `result.json` (verdict, per-check results, generation before/after, pins, watchdog, activation exit, tested rev, redacted evidence). SIGTERM/stop only skips remaining checks; the rollback still runs.
 
 ### Watchdog

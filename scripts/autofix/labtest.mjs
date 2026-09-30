@@ -392,6 +392,35 @@ async function failedUnits(cfg) {
     .map((u) => u.replace(/^●/, ""));
 }
 
+/** Failed units with their load state ("not-found" = not in the running config). */
+async function failedUnitsDetailed(cfg) {
+  const r = await systemctl(cfg, ["--failed", "--plain", "--no-legend", "--no-pager"]);
+  return String(r.stdout || "")
+    .split("\n")
+    .map((l) => l.trim().replace(/^●\s*/, "").split(/\s+/))
+    .filter((p) => p[0] && UNIT_RE.test(p[0]))
+    .map((p) => ({ unit: p[0], load: p[1] || "" }));
+}
+
+/**
+ * After a verified rollback: units that only existed in the lab system stay
+ * listed as failed ("not-found") and would leave the host degraded; reset
+ * exactly those. A unit of the restored system that is still failed is
+ * reported, never hidden.
+ */
+async function cleanupLabFailures(cfg, run, result, preFailed) {
+  const pre = new Set(preFailed || []);
+  const now = (await failedUnitsDetailed(cfg)).filter((u) => !pre.has(u.unit));
+  const labOnly = now.filter((u) => u.load === "not-found").map((u) => u.unit);
+  const still = now.filter((u) => u.load !== "not-found").map((u) => u.unit);
+  if (labOnly.length) {
+    await systemctl(cfg, ["reset-failed", "--", ...labOnly]);
+    run.note(`reset-failed lab-only units after rollback: ${labOnly.join(", ")}`);
+  }
+  if (still.length) run.note(`still failed after rollback (was fine before the test): ${still.join(", ")}`);
+  result.post_rollback = { reset_lab_only: labOnly, still_failed: still };
+}
+
 async function systemState(cfg) {
   const r = await systemctl(cfg, ["is-system-running"]);
   return String(r.stdout || "").trim().split("\n")[0] || "unknown";
@@ -750,6 +779,7 @@ export async function runLab(cfg, instance) {
     }
     pins = snapshotPins(cfg, run.dir);
     const pre = { failed: await failedUnits(cfg), state: await systemState(cfg) };
+    before.preFailed = pre.failed;
     result.pre = { failed_units: pre.failed.length, state: pre.state };
 
     run.setStage("building");
@@ -877,6 +907,11 @@ export async function runLab(cfg, instance) {
         act.phase = "restored";
         writeJson(path.join(run.dir, "activation.json"), act);
         run.setStage("restored");
+        try {
+          await cleanupLabFailures(cfg, run, result, before.preFailed);
+        } catch {
+          /* best effort; the rollback itself is verified */
+        }
       } else {
         // Leave the watchdog armed: it retries the same rollback at its deadline.
         result.verdict = "error";

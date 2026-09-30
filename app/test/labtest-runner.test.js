@@ -56,10 +56,18 @@ before(async () => {
   for (const d of [B, F, STORE, path.dirname(CUR), path.dirname(PROFILE), FLAKE, path.join(OPS, "queue", "processing"), path.join(OPS, "queue", "control"), STATE, LOCKS]) {
     fs.mkdirSync(d, { recursive: true });
   }
-  system(BASE, `: > "${F}/failed"; cp "${F}/failed-pre" "${F}/failed" 2>/dev/null || true`);
+  system(
+    BASE,
+    `: > "${F}/failed"; cp "${F}/failed-pre" "${F}/failed" 2>/dev/null || true
+[ -n "\${FAKE_LAB_ONLY_UNIT:-}" ] && [ -e "${F}/lab-was-active" ] && echo "\${FAKE_LAB_ONLY_UNIT} not-found failed failed Lab only" >> "${F}/failed"
+[ -n "\${FAKE_STILL_FAILED:-}" ] && [ -e "${F}/lab-was-active" ] && echo "\${FAKE_STILL_FAILED} loaded failed failed Real" >> "${F}/failed"
+true`,
+  );
   system(
     LAB,
-    `[ -n "\${FAKE_LAB_FAILS_UNIT:-}" ] && echo "\${FAKE_LAB_FAILS_UNIT} loaded failed failed Demo" >> "${F}/failed"
+    `touch "${F}/lab-was-active"
+[ -n "\${FAKE_LAB_FAILS_UNIT:-}" ] && echo "\${FAKE_LAB_FAILS_UNIT} loaded failed failed Demo" >> "${F}/failed"
+[ -n "\${FAKE_LAB_ONLY_UNIT:-}" ] && echo "\${FAKE_LAB_ONLY_UNIT} loaded failed failed Lab only" >> "${F}/failed"
 [ -n "\${FAKE_LAB_HANG:-}" ] && sleep 30
 ln -sfn "$(dirname "$(dirname "$0")")" "${CUR}"
 exit "\${FAKE_ACTIVATE_EXIT:-0}"`,
@@ -91,6 +99,7 @@ case "$1" in
       *) if grep -qx "$2" "${F}/active" 2>/dev/null; then echo active; else echo inactive; exit 3; fi ;;
     esac ;;
   stop) rm -f "${F}/timer-$2" ;;
+  reset-failed) shift; [ "$1" = -- ] && shift; for u in "$@"; do grep -v "^$u " "${F}/failed" > "${F}/failed.tmp"; mv "${F}/failed.tmp" "${F}/failed"; done ;;
 esac
 exit 0`,
   );
@@ -185,7 +194,7 @@ function reset(s = spec()) {
   fs.rmSync(path.join(OPS, "queue", "control", `cancel-${INST}.json`), { force: true });
   fs.writeFileSync(path.join(OPS, "queue", "processing", `${INST}.json`), JSON.stringify(s));
   health = 200;
-  for (const k of ["FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG"]) delete process.env[k];
+  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG"]) delete process.env[k];
   Object.assign(process.env, env());
 }
 
@@ -430,4 +439,20 @@ test("root refuses a fork branch that moved after gating (tip != head_sha) and a
   assert.equal(r.verdict, "error");
   assert.match(r.reason, /gated commit/);
   assert.doesNotMatch(log(), /nix .*build/);
+});
+
+test("after rollback: lab-only failed units (not-found) are reset, a real unit still failed is reported", async () => {
+  process.env.FAKE_LAB_ONLY_UNIT = "neo-labtest-fail.service";
+  process.env.FAKE_STILL_FAILED = "docker-demo2.service";
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "fail", r.reason);
+  assert.equal(r.checks.find((c) => c.id === "failed_units").ok, false);
+  assert.match(r.checks.find((c) => c.id === "failed_units").detail, /neo-labtest-fail\.service/);
+  assert.equal(r.generation.restored, true);
+  assert.deepEqual(r.post_rollback, { reset_lab_only: ["neo-labtest-fail.service"], still_failed: ["docker-demo2.service"] });
+  assert.match(log(), /systemctl reset-failed -- neo-labtest-fail\.service/);
+  const failedNow = fs.readFileSync(path.join(F, "failed"), "utf8");
+  assert.doesNotMatch(failedNow, /neo-labtest-fail/);
+  assert.match(failedNow, /docker-demo2\.service/, "real failure is not hidden");
+  assert.ok(r.evidence.some((l) => /still failed after rollback/.test(l)));
 });
