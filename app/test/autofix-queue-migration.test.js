@@ -10,6 +10,8 @@ const dbPath = path.join(tmpDir, "ops.sqlite");
 process.env.OPS_DB_PATH = dbPath;
 process.env.OPS_DATA_DIR = tmpDir;
 delete process.env.OPS_AUTOTRIAGE;
+process.env.OPS_AUTOFIX_FIX = "true";
+process.env.OPS_AUTOFIX_TRIAGE = "true";
 delete process.env.OPS_REDACT_EXTRA_SLUGS;
 
 // Build an OLD schema DB before importing the app.

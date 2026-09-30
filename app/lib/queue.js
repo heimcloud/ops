@@ -25,8 +25,49 @@ export function resultsDir() {
   return path.join(getDataDir(), "results");
 }
 
-function ensureDir(d) {
-  fs.mkdirSync(d, { recursive: true });
+const TRUE = ["1", "true", "yes", "on"];
+
+/** Host worker for this job kind is installed (autofix.<kind>.enable via Nix env). */
+export function isAutofixKindEnabled(kind) {
+  const key = kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX";
+  return TRUE.includes(String(process.env[key] || "").toLowerCase());
+}
+
+export class QueueError extends Error {
+  constructor(code, message, cause) {
+    super(message);
+    this.code = code;
+    this.status = code === "autofix_disabled" || code === "already_queued" ? 409 : 503;
+    if (cause) this.cause = cause;
+  }
+}
+
+function whoami() {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "?";
+  const gid = typeof process.getgid === "function" ? process.getgid() : "?";
+  return `${uid}:${gid}`;
+}
+
+/**
+ * mkdir -p that turns EACCES/EPERM/EROFS into an operator-readable error
+ * (the raw Node error only says "permission denied, mkdir").
+ */
+export function ensureDir(d) {
+  try {
+    fs.mkdirSync(d, { recursive: true });
+    fs.accessSync(d, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (err) {
+    if (["EACCES", "EPERM", "EROFS"].includes(err.code)) {
+      throw new QueueError(
+        "queue_dir_not_writable",
+        `Autofix queue directory ${d} is not writable by the ops container (uid:gid ${whoami()}, ${err.code}). ` +
+          "Host fix: the queue/ and results/ dirs under the ops AppData must be owned by the Neo core user with mode 2770 " +
+          "(created by the ops module; restart docker-ops or re-run activation).",
+        err,
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -42,6 +83,7 @@ export function buildJobPayload(kind, incident) {
   );
   const redact = (s) => redactIdentifyingDetails(s, { knownSlugs });
   return {
+    job_version: 1,
     kind,
     incident_id: incident.id,
     report_hash: String(incident.report_hash || ""),
@@ -62,6 +104,19 @@ export function enqueueJob(kind, incident) {
   if (kind !== "triage" && kind !== "fix") {
     throw new Error("invalid_job_kind");
   }
+  if (!isAutofixKindEnabled(kind)) {
+    throw new QueueError(
+      "autofix_disabled",
+      `Autofix ${kind} is not enabled on this host (neo.services.ops.autofix.enable + autofix.${kind}.enable); no worker would pick up the job.`,
+    );
+  }
+  const pending = findPendingJobs(kind, incident.id);
+  if (pending.length) {
+    throw new QueueError(
+      "already_queued",
+      `A ${kind} job for incident #${incident.id} is already queued or running (${path.basename(pending[0])}).`,
+    );
+  }
   const job = buildJobPayload(kind, incident);
   // Defense: never allow slug field
   if ("customer_repo_slug" in job) delete job.customer_repo_slug;
@@ -77,11 +132,37 @@ export function enqueueJob(kind, incident) {
   return { path: dest, job };
 }
 
+/** Jobs for one incident still waiting in queue/<kind> or being processed. */
+export function findPendingJobs(kind, incidentId) {
+  const prefix = `${incidentId}-`;
+  const out = [];
+  const dirs = [
+    [queueDir(kind), prefix],
+    [path.join(getDataDir(), "queue", "processing"), `${kind}-${prefix}`],
+  ];
+  for (const [dir, pre] of dirs) {
+    let names = [];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of names) {
+      if (f.startsWith(pre) && f.endsWith(".json")) out.push(path.join(dir, f));
+    }
+  }
+  return out;
+}
+
 export function listQueuedJobs(kind) {
   const dir = queueDir(kind);
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
     .filter((f) => f.endsWith(".json") && !f.includes(".tmp-"))
     .map((f) => path.join(dir, f))
     .sort();

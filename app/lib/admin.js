@@ -16,7 +16,7 @@ import {
   getStatuses,
   listFixAttempts,
 } from "./db.js";
-import { enqueueJob } from "./queue.js";
+import { enqueueJob, isAutofixKindEnabled } from "./queue.js";
 import { ingestResultsDir } from "./results.js";
 import {
   getGithubTokenConfigured,
@@ -202,16 +202,30 @@ export function createAdminRouter() {
           <input name="target_repo" value="${escapeHtml(incident.target_repo || incident.target_hint || resolved)}" placeholder="owner/repo" />
           <p style="margin-top:1rem"><button class="btn" type="submit">Save</button></p>
         </form>
-        <form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Enqueue fix job for incident #${id}? Host worker must be enabled (autofix.fix.enable).');">
-          <p><strong>Start fix</strong> enqueues a host-side fix job (status → fixing). The worker (opt-in) runs local Hermes, pushes a fork branch, and prepares a compare link.
+        ${
+          isAutofixKindEnabled("triage")
+            ? `<form method="post" action="${base}/incidents/${id}/start-triage" class="card">
+          <p><strong>Start triage</strong> enqueues a host-side triage job (local Hermes classifies the incident; no code push).</p>
+          <button class="btn secondary" type="submit">Start triage</button>
+        </form>`
+            : ""
+        }
+        ${
+          isAutofixKindEnabled("fix")
+            ? `<form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Enqueue fix job for incident #${id}?');">
+          <p><strong>Start fix</strong> enqueues a host-side fix job (status → fixing). The worker runs local Hermes, pushes a fork branch, and prepares a compare link.
              Resolved target: <code>${escapeHtml(resolved)}</code>. No auto-merge.</p>
-          <button class="btn" type="submit">Start fix</button>
+          <button class="btn" type="submit">Start fix</button>`
+            : `<div class="card">
+          <p><strong>Start fix unavailable:</strong> autofix is not enabled on this host
+             (<code>neo.services.ops.autofix.enable</code> + <code>autofix.fix.enable</code>), so no worker would pick up the job.</p>`
+        }
           ${
             incident.draft_pr_url
               ? `<p style="margin-top:0.75rem" class="muted">Legacy draft PR link: <a href="${escapeHtml(incident.draft_pr_url)}" target="_blank" rel="noopener">${escapeHtml(incident.draft_pr_url)}</a></p>`
               : ""
           }
-        </form>`;
+        ${isAutofixKindEnabled("fix") ? "</form>" : "</div>"}`;
 
     res.type("html").send(
       adminLayout({
@@ -309,36 +323,40 @@ export function createAdminRouter() {
     }
   });
 
-  router.post("/incidents/:id/start-fix", (req, res) => {
-    const base = req.adminBase;
-    if (refuseMutations(res, base)) return;
-    const id = Number(req.params.id);
-    const incident = getIncident(id);
-    if (!incident) return res.status(404).send("Not found");
-    try {
-      const resolved = resolveTargetRepo(incident);
-      const { path: jobPath, job } = enqueueJob("fix", incident);
-      const updated = updateIncident(id, {
-        status: "fixing",
-        target_repo: incident.target_repo || resolved,
-      });
-      addIncidentEvent(id, "fix_enqueued", "Fix job enqueued for host worker", {
-        target_repo: updated.target_repo,
-        job_path: jobPath,
-        job_kind: job.kind,
-      });
-      return res.redirect(
-        303,
-        `${base}/incidents/${id}?msg=${encodeURIComponent("Fix job enqueued")}`,
-      );
-    } catch (err) {
-      console.error("[admin] start-fix", err);
-      return res.redirect(
-        303,
-        `${base}/incidents/${id}?err=${encodeURIComponent(err.message || "Start fix failed")}`,
-      );
-    }
-  });
+  function enqueueHandler(kind) {
+    return (req, res) => {
+      const base = req.adminBase;
+      if (refuseMutations(res, base)) return;
+      const id = Number(req.params.id);
+      const incident = getIncident(id);
+      if (!incident) return res.status(404).send("Not found");
+      try {
+        const resolved = resolveTargetRepo(incident);
+        const { path: jobPath, job } = enqueueJob(kind, incident);
+        const patch = { target_repo: incident.target_repo || resolved };
+        if (kind === "fix") patch.status = "fixing";
+        const updated = updateIncident(id, patch);
+        addIncidentEvent(id, `${kind}_enqueued`, `${kind === "fix" ? "Fix" : "Triage"} job enqueued for host worker`, {
+          target_repo: updated.target_repo,
+          job_file: jobPath.split("/").pop(),
+          job_kind: job.kind,
+        });
+        return res.redirect(
+          303,
+          `${base}/incidents/${id}?msg=${encodeURIComponent(`${kind === "fix" ? "Fix" : "Triage"} job enqueued`)}`,
+        );
+      } catch (err) {
+        console.error(`[admin] start-${kind}`, err.code || "", err.message);
+        return res.redirect(
+          303,
+          `${base}/incidents/${id}?err=${encodeURIComponent(err.message || `Start ${kind} failed`)}`,
+        );
+      }
+    };
+  }
+
+  router.post("/incidents/:id/start-fix", enqueueHandler("fix"));
+  router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
 
   // Silence unused import warning for getDb if tree-shaken oddly — keep for parity / future
   void getDb;
