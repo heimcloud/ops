@@ -145,6 +145,23 @@
                       description = "Path prefixes refused in fix diffs while labSharesOpsHost.";
                       rank = 50;
                     };
+                    neoBaseRef = mkOption {
+                      type = types.strMatching "[A-Za-z0-9._/-]+";
+                      default = "master";
+                      description = ''
+                        Neo branch the ops/lab host actually runs (e.g. "dev" when the host
+                        pins github:madebydamo/neo/dev). Fix branches are cut from this ref
+                        (fork first, then upstream) and the compare link targets it, so
+                        rollback/diff never silently assume master.
+                      '';
+                      rank = 55;
+                    };
+                    hermesTimeoutSec = mkOption {
+                      type = types.ints.positive;
+                      default = 2700;
+                      description = "Per Hermes call timeout in seconds (fix runs up to 40 turns).";
+                      rank = 58;
+                    };
                     redactExtraSlugsFile = mkOption {
                       type = types.nullOr types.str;
                       default = config.neo.services.ops.redactExtraSlugsFile;

@@ -91,12 +91,15 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 
 | Piece | Detail |
 |-------|--------|
-| Queue | Container writes `/data/queue/{triage,fix}/<id>-<ts>.json` (host: `$appdata/ops/…`). Payload: incident id, report_hash, unit, severity, class, neo_version, redacted logs only. |
-| Results | Worker writes `$appdata/ops/results/*.json`; admin/ingest applies `triage_result` / `fix_result` + `fix_attempts`. |
-| Units | `heimcloud-ops-worker.path` + oneshot `heimcloud-ops-worker.service` (User=hermes, concurrency 1 via lock). Only when `autofix.enable` and triage/fix enable. |
+| Queue | Container writes `/data/queue/{triage,fix}/<id>-<ts>.json` atomically (host: `$appdata/ops/queue/…`; `/data` is a bind mount of `$appdata/ops`). Payload (`job_version: 1`): incident id, report_hash, unit, severity, class, neo_version, redacted logs only — never a slug. The admin refuses to enqueue when the kind is disabled on the host (`OPS_AUTOFIX_FIX` / `OPS_AUTOFIX_TRIAGE`) or when a job for the incident is already queued/processing. |
+| Permissions | `queue/`, `queue/{triage,fix,processing,done,failed}`, `results/` are **Neo core uid : Neo core gid, 2770** (setgid), created for every host by the ops module (tmpfiles + docker-ops preStart + worker ExecStartPre, all `install -d`). The container runs as core uid:gid; with autofix on, `hermes` is added to the core group. Setgid keeps every job/result file in the core group; the worker runs with `UMask=0007`. Chosen over ACLs (ZFS datasets may have `acltype=off`) and over a new group (the container has no supplementary groups and fakeNss cannot resolve names). |
+| Claim | Worker (lock in `RuntimeDirectory=/run/heimcloud-ops-worker`, stale-pid reclaim) renames `queue/<kind>/X.json` → `queue/processing/<kind>-X.json`, then → `queue/done/` or `queue/failed/`. Jobs left in `processing/` by a killed run are failed with a result on the next run (no re-run loop). Disabled kinds are never touched. |
+| Results | Worker writes `$appdata/ops/results/<kind>-X.json`; the app ingests on every admin page load / ingest → `triage_result` / `fix_result` events + `fix_attempts`, renames to `.ingested.json` (bad files → `.rejected.json`). Status map: `awaiting_lab_test`→`testing`, `compare_ready`→`pr_opened`, `no_token`→`triaged`, anything else (redaction_blocked, denied, needs_human, lab failure, errors)→`needs_human`. Triage only promotes `open`→`triaged`. |
+| Units | `heimcloud-ops-worker.path` (`PathExistsGlob` per enabled kind) + oneshot `heimcloud-ops-worker.service` (User=hermes, `wants`/`after` `heimcloud-autofix-materialize-token.service`, PATH = hermes-agent unit PATH + git/gh/node/sqlite + `/run/current-system/sw`). Only when `autofix.enable` and triage/fix enable. |
 | Skills | `skills/heimcloud-ops-triage`, `skills/heimcloud-ops-fix` materialized into `HERMES_HOME/skills` when autofix enable. |
 | Credentials | `neo.services.credentials.ops.autofixForkPushToken` → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check` then wrap git/gh. |
-| Upstream PR | The worker pushes the `heimcloud/neo` branch and posts compare URL `https://github.com/madebydamo/neo/compare/master...heimcloud:neo:<branch>?expand=1` plus the prepared title/body in admin. Damo opens the upstream PR in the GitHub web UI. The worker's optional `GH_PR_TOKEN` → `gh pr create --draft` branch remains dormant and unused this phase; no `/run/heimcloud-autofix/pr-token` is provisioned. |
+| Fix run | Fresh partial clone (`--filter=blob:none`) of `autofix.neoBaseRef` (upstream first, fork second); Hermes runs **without** the push token, with git identity pinned to `heimcloud <heimcloud@users.noreply.github.com>`; the worker requires ≥1 commit, checks author/committer identity, deny-list by path prefix, then the redaction gate, then `heimcloud-autofix-env git push --force fork HEAD:refs/heads/<branch>` (fork `fix/*`/`ops/*` namespace is owned by this loop). Lab test: `heimcloud-lab-test <branch> <class>` if on PATH; pass → `compare_ready`; fail → Hermes retry with redacted evidence up to `maxAttempts`, then `needs_human` without a compare link; absent → `awaiting_lab_test` (manual test). |
+| Upstream PR | The worker pushes the `heimcloud/neo` branch and posts compare URL `https://github.com/madebydamo/neo/compare/<neoBaseRef>...heimcloud:neo:<branch>?expand=1` plus the prepared title/body in admin. Damo opens the upstream PR in the GitHub web UI. The worker's optional `GH_PR_TOKEN` → `gh pr create --draft` branch remains dormant and unused this phase; no `/run/heimcloud-autofix/pr-token` is provisioned. |
 | Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `neo.services.ops.redactExtraSlugsFile` (docker-ops `environmentFiles`) and the same path for the autofix worker (`autofix.redactExtraSlugsFile` defaults to it). |
 | Deny-list | While `labSharesOpsHost` (default true): refuse diffs under `nix/services/{ops,hermes,swag}`, `nix/modules/core`. |
 
@@ -110,6 +113,7 @@ redactExtraSlugsFile = "/var/neo/DATA/AppData/ops/redact-extra.env"  # OPS_REDAC
 
 [services.ops.autofix]
 enable = true
+neoBaseRef = "dev"     # the neo branch the host pins (github:madebydamo/neo/<ref>)
 maxAttempts = 2
 labSharesOpsHost = true
 # redactExtraSlugsFile defaults to services.ops.redactExtraSlugsFile

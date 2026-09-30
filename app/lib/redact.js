@@ -152,7 +152,10 @@ export function findIdentifierHits(text, opts = {}) {
   const known = Array.isArray(opts.knownSlugs) ? opts.knownSlugs : [];
   for (const slug of known) {
     const s = String(slug || "").trim();
-    if (s && raw.includes(s)) hits.push(`known_slug:${s.slice(0, 2)}…`);
+    // Case-insensitive: a lower-cased slug in a path/branch must still fail closed.
+    if (s && raw.toLowerCase().includes(s.toLowerCase())) {
+      hits.push(`known_slug:${s.slice(0, 2)}…`);
+    }
   }
   // Slug shape (uppercase 10) still present
   const shape = raw.match(/\b[A-Z0-9]{10}\b/g) || [];
