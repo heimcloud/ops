@@ -36,6 +36,13 @@
         OPS_TARGET_ALLOWLIST = cfg.targetAllowlist;
       };
       autoTriage = triageOn && af.triage.autoEnqueue;
+      # Only whether a fork-push token is configured (never its value). The
+      # worker's runtime check (queue/worker-status.json) overrides this hint.
+      tokenConfigured = let
+        cred = config.neo.services.credentials or {};
+        tok = cred.ops.autofixForkPushToken or null;
+      in
+        (cred.enabled or false) && tok != null && tok != "";
 
       # Shared autofix exchange dirs (host side of the container's /data/queue and
       # /data/results). Owner = Neo core uid, group = Neo core gid, mode 2770:
@@ -84,6 +91,7 @@
               # queued job would never be picked up.
               OPS_AUTOFIX_FIX = boolStr fixOn;
               OPS_AUTOFIX_TRIAGE = boolStr triageOn;
+              OPS_AUTOFIX_TOKEN_CONFIGURED = boolStr tokenConfigured;
               ADMIN_ENABLED = boolStr cfg.admin.enabled;
               ADMIN_PATH = adminPath;
               ADMIN_READ_ONLY = boolStr cfg.admin.readOnly;

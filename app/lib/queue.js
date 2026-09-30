@@ -33,6 +33,38 @@ export function isAutofixKindEnabled(kind) {
   return TRUE.includes(String(process.env[key] || "").toLowerCase());
 }
 
+/**
+ * Fork-push token availability as last seen by the host worker
+ * (queue/worker-status.json), else the Nix hint OPS_AUTOFIX_TOKEN_CONFIGURED.
+ * @returns {{ known: boolean, ok: boolean, source: string, reason?: string, checked_at?: string }}
+ */
+export function getForkPushTokenState() {
+  try {
+    const st = JSON.parse(
+      fs.readFileSync(path.join(getDataDir(), "queue", "worker-status.json"), "utf8"),
+    );
+    if (typeof st.fork_push_token === "boolean") {
+      return {
+        known: true,
+        ok: st.fork_push_token,
+        source: "worker",
+        reason: st.reason || undefined,
+        checked_at: st.checked_at,
+      };
+    }
+  } catch {
+    /* fall through to the Nix hint */
+  }
+  const hint = String(process.env.OPS_AUTOFIX_TOKEN_CONFIGURED || "").toLowerCase();
+  if (TRUE.includes(hint)) return { known: true, ok: true, source: "config" };
+  if (["0", "false", "no", "off"].includes(hint)) return { known: true, ok: false, source: "config" };
+  return { known: false, ok: false, source: "unknown" };
+}
+
+export const NO_TOKEN_WARNING =
+  "Fork-push token not available on the host: the fix will be coded, gated and committed locally, " +
+  "but the push will be skipped (result ready_no_token, incident back to triaged).";
+
 export class QueueError extends Error {
   constructor(code, message, cause) {
     super(message);

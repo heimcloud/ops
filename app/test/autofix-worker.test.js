@@ -157,11 +157,90 @@ test("no commit from Hermes → needs_human", () => {
   assert.match(r.summary, /no commit/);
 });
 
-test("missing token → no_token (triage-only fallback)", () => {
+test("missing token: Hermes still codes + commits, gates run, push skipped → ready_no_token with saved patch", () => {
+  process.env.FAKE_HERMES_MODE = "ok";
   process.env.FAKE_TOKEN = "0";
+  process.env.OPS_AUTOFIX_LAB_TEST_BIN = path.join(bin, "fake-lab-test");
+  const forkBefore = execFileSync("git", ["-C", fork, "for-each-ref", "--format=%(refname) %(objectname)"], { encoding: "utf8" });
+  fs.rmSync(path.join(tmp, "hermes-argv"), { force: true });
   const name = enqueue("fix", 17);
   W.main([]);
-  assert.equal(result("fix", name).status, "no_token");
+  const r = result("fix", name);
+  assert.equal(r.status, "ready_no_token", r.summary);
+  assert.ok(fs.existsSync(path.join(tmp, "hermes-argv")), "Hermes ran");
+  assert.equal(r.branch, "fix/searxng-engines");
+  assert.equal(r.compare_url, undefined);
+  assert.equal(r.lab, "deferred_until_push");
+  assert.match(r.summary, /committed locally .*waiting for the fork-push token/);
+  assert.match(r.summary, /heimcloud-ops-worker-push@fix-17-/);
+  const forkAfter = execFileSync("git", ["-C", fork, "for-each-ref", "--format=%(refname) %(objectname)"], { encoding: "utf8" });
+  assert.equal(forkAfter, forkBefore, "nothing pushed");
+  const patch = fs.readFileSync(r.patch_path, "utf8");
+  assert.match(patch, /^From [0-9a-f]{40} /);
+  assert.match(patch, /fix\(searxng\): drop stale engines/);
+  const pending = JSON.parse(fs.readFileSync(r.pending_path, "utf8"));
+  assert.equal(pending.branch, "fix/searxng-engines");
+  assert.equal(pending.incident_id, 17);
+  const status = JSON.parse(fs.readFileSync(path.join(data, "queue", "worker-status.json"), "utf8"));
+  assert.equal(status.fork_push_token, false);
+  assert.equal(JSON.stringify(status).includes("ghp_"), false);
+
+  // Later push: token appears, no second Hermes run.
+  process.env.FAKE_TOKEN = "1";
+  process.env.FAKE_LAB = "pass";
+  fs.rmSync(path.join(tmp, "hermes-argv"), { force: true });
+  const scratch = path.dirname(r.pending_path);
+  assert.equal(W.main(["--push-pending", scratch]), 0);
+  assert.equal(fs.existsSync(path.join(tmp, "hermes-argv")), false, "Hermes not re-run");
+  const pushed = JSON.parse(fs.readFileSync(path.join(data, "results", `push-${path.basename(scratch)}.json`), "utf8"));
+  assert.equal(pushed.status, "compare_ready");
+  assert.equal(pushed.incident_id, 17);
+  assert.equal(
+    execFileSync("git", ["-C", fork, "rev-parse", "fix/searxng-engines"], { encoding: "utf8" }).trim(),
+    pending.head_sha,
+  );
+  assert.ok(fs.existsSync(`${r.pending_path}.done`));
+  process.env.OPS_AUTOFIX_LAB_TEST_BIN = path.join(tmp, "no-such-lab-test");
+});
+
+test("push-pending replays the saved patch when the scratch clone is gone", () => {
+  process.env.FAKE_HERMES_MODE = "ok";
+  process.env.FAKE_TOKEN = "0";
+  const name = enqueue("fix", 22);
+  W.main([]);
+  const r = result("fix", name);
+  assert.equal(r.status, "ready_no_token");
+  const scratch = path.dirname(r.pending_path);
+  fs.rmSync(path.join(scratch, "neo"), { recursive: true, force: true });
+  process.env.FAKE_TOKEN = "1";
+  assert.equal(W.main(["--push-pending", scratch]), 0);
+  const pushed = JSON.parse(fs.readFileSync(path.join(data, "results", `push-${path.basename(scratch)}.json`), "utf8"));
+  assert.equal(pushed.status, "awaiting_lab_test", pushed.summary);
+  assert.equal(
+    execFileSync("git", ["-C", fork, "log", "-1", "--format=%s", "fix/searxng-engines"], { encoding: "utf8" }).trim(),
+    "fix(searxng): drop stale engines",
+  );
+});
+
+test("push-pending without token exits non-zero and pushes nothing", () => {
+  process.env.FAKE_HERMES_MODE = "ok";
+  process.env.FAKE_TOKEN = "0";
+  const name = enqueue("fix", 23);
+  W.main([]);
+  const r = result("fix", name);
+  assert.equal(W.main(["--push-pending", path.dirname(r.pending_path)]), 1);
+  assert.ok(fs.existsSync(r.pending_path), "pending kept for a later push");
+  delete process.env.FAKE_TOKEN;
+});
+
+test("missing token does not bypass the redaction gate", () => {
+  process.env.FAKE_HERMES_MODE = "leak";
+  process.env.FAKE_TOKEN = "0";
+  const name = enqueue("fix", 24);
+  W.main([]);
+  const r = result("fix", name);
+  assert.equal(r.status, "redaction_blocked");
+  assert.equal(r.patch_path, undefined);
   delete process.env.FAKE_TOKEN;
 });
 

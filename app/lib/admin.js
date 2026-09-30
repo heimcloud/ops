@@ -16,7 +16,12 @@ import {
   getStatuses,
   listFixAttempts,
 } from "./db.js";
-import { enqueueJob, isAutofixKindEnabled } from "./queue.js";
+import {
+  enqueueJob,
+  isAutofixKindEnabled,
+  getForkPushTokenState,
+  NO_TOKEN_WARNING,
+} from "./queue.js";
 import { ingestResultsDir } from "./results.js";
 import {
   getGithubTokenConfigured,
@@ -215,6 +220,12 @@ export function createAdminRouter() {
             ? `<form method="post" action="${base}/incidents/${id}/start-fix" class="card" onsubmit="return confirm('Enqueue fix job for incident #${id}?');">
           <p><strong>Start fix</strong> enqueues a host-side fix job (status → fixing). The worker runs local Hermes, pushes a fork branch, and prepares a compare link.
              Resolved target: <code>${escapeHtml(resolved)}</code>. No auto-merge.</p>
+          ${(() => {
+            const t = getForkPushTokenState();
+            return t.known && !t.ok
+              ? `<div class="alert warn">${escapeHtml(NO_TOKEN_WARNING)}${t.checked_at ? ` <span class="muted">(worker check ${escapeHtml(t.checked_at)})</span>` : ""}</div>`
+              : "";
+          })()}
           <button class="btn" type="submit">Start fix</button>`
             : `<div class="card">
           <p><strong>Start fix unavailable:</strong> autofix is not enabled on this host
@@ -341,10 +352,12 @@ export function createAdminRouter() {
           job_file: jobPath.split("/").pop(),
           job_kind: job.kind,
         });
-        return res.redirect(
-          303,
-          `${base}/incidents/${id}?msg=${encodeURIComponent(`${kind === "fix" ? "Fix" : "Triage"} job enqueued`)}`,
-        );
+        const t = kind === "fix" ? getForkPushTokenState() : { known: false };
+        const msg =
+          t.known && !t.ok
+            ? `Fix job enqueued. ${NO_TOKEN_WARNING}`
+            : `${kind === "fix" ? "Fix" : "Triage"} job enqueued`;
+        return res.redirect(303, `${base}/incidents/${id}?msg=${encodeURIComponent(msg)}`);
       } catch (err) {
         console.error(`[admin] start-${kind}`, err.code || "", err.message);
         return res.redirect(

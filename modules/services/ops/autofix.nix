@@ -55,6 +55,32 @@
         ${pkgs.coreutils}/bin/install -d -m 2770 -o ${uid} -g ${toString gid} ${concatStringsSep " " exchangeDirs}
       '';
 
+      workerEnv =
+        [
+          "OPS_DATA_DIR=${opsAppdata}"
+          "OPS_AUTOFIX_LOCK=/run/heimcloud-ops-worker/lock"
+          "OPS_AUTOFIX_MAX_ATTEMPTS=${toString af.maxAttempts}"
+          "OPS_AUTOFIX_LAB_SHARES_OPS_HOST=${
+            if af.labSharesOpsHost
+            then "true"
+            else "false"
+          }"
+          "OPS_AUTOFIX_DENY_PATHS=${concatStringsSep "," af.denyPaths}"
+          "OPS_NEO_BASE_REF=${af.neoBaseRef}"
+          "OPS_AUTOFIX_HERMES_TIMEOUT_SEC=${toString af.hermesTimeoutSec}"
+          "OPS_DB_PATH=${opsAppdata}/ops.sqlite"
+          "HOME=${hermesState}"
+          "HERMES_HOME=${hermesHome}"
+          "HERMES_MANAGED=true"
+        ]
+        ++ optional triageOn "OPS_AUTOFIX_TRIAGE=1"
+        ++ optional fixOn "OPS_AUTOFIX_FIX=1";
+
+      workerPath =
+        [workerPkg pkgs.nodejs_22 pkgs.git pkgs.gh pkgs.openssh pkgs.sqlite pkgs.bash pkgs.coreutils pkgs.util-linux]
+        ++ hermesUnitPath
+        ++ ["/run/current-system/sw" "/etc/profiles/per-user/hermes"];
+
       hasMaterialize = config.systemd.services ? heimcloud-autofix-materialize-token;
       hermesUnitPath = config.systemd.services.hermes-agent.path or [];
     in {
@@ -117,10 +143,7 @@
           # hermes CLI + agent tools (same PATH as the hermes-agent gateway), git/gh/node
           # for the worker, and the system profile for heimcloud-autofix-env and
           # heimcloud-lab-test (Fleet-owned, when installed).
-          path =
-            [workerPkg pkgs.nodejs_22 pkgs.git pkgs.gh pkgs.openssh pkgs.sqlite pkgs.bash pkgs.coreutils pkgs.util-linux]
-            ++ hermesUnitPath
-            ++ ["/run/current-system/sw" "/etc/profiles/per-user/hermes"];
+          path = workerPath;
           unitConfig = {
             ConditionPathExists = [opsAppdata];
           };
@@ -136,27 +159,32 @@
             TimeoutStartSec = "${toString (af.hermesTimeoutSec * (af.maxAttempts + 1) + 900)}";
             ExecStartPre = ["+${ensureDirs}"];
             ExecStart = "${workerPkg}/bin/heimcloud-ops-worker --once";
-            Environment =
-              [
-                "OPS_DATA_DIR=${opsAppdata}"
-                "OPS_AUTOFIX_LOCK=/run/heimcloud-ops-worker/lock"
-                "OPS_AUTOFIX_MAX_ATTEMPTS=${toString af.maxAttempts}"
-                "OPS_AUTOFIX_LAB_SHARES_OPS_HOST=${
-                  if af.labSharesOpsHost
-                  then "true"
-                  else "false"
-                }"
-                "OPS_AUTOFIX_DENY_PATHS=${concatStringsSep "," af.denyPaths}"
-                "OPS_NEO_BASE_REF=${af.neoBaseRef}"
-                "OPS_AUTOFIX_HERMES_TIMEOUT_SEC=${toString af.hermesTimeoutSec}"
-                "OPS_DB_PATH=${opsAppdata}/ops.sqlite"
-                "HOME=${hermesState}"
-                "HERMES_HOME=${hermesHome}"
-                "HERMES_MANAGED=true"
-              ]
-              ++ optional triageOn "OPS_AUTOFIX_TRIAGE=1"
-              ++ optional fixOn "OPS_AUTOFIX_FIX=1";
+            Environment = workerEnv;
             # Required (fail-closed): without extra slugs the redaction gate is weaker.
+            EnvironmentFile = mkIf (af.redactExtraSlugsFile != null) [af.redactExtraSlugsFile];
+          };
+        };
+
+        # Push a fix that ended ready_no_token once the token exists, without a
+        # second Hermes run: systemctl start heimcloud-ops-worker-push@<job>.service
+        # (<job> = the job scratch dir name printed in the incident event).
+        systemd.services."heimcloud-ops-worker-push@" = mkIf fixOn {
+          description = "Heimcloud Ops autofix: push saved fix %i";
+          wants = optional hasMaterialize "heimcloud-autofix-materialize-token.service";
+          after = optional hasMaterialize "heimcloud-autofix-materialize-token.service";
+          path = workerPath;
+          serviceConfig = {
+            Type = "oneshot";
+            User = "hermes";
+            Group = "hermes";
+            UMask = "0007";
+            RuntimeDirectory = "heimcloud-ops-worker-push-%i";
+            RuntimeDirectoryMode = "0700";
+            WorkingDirectory = "${hermesState}/workspace";
+            TimeoutStartSec = "3600";
+            ExecStartPre = ["+${ensureDirs}"];
+            ExecStart = "${workerPkg}/bin/heimcloud-ops-worker --push-pending ${hermesState}/workspace/autofix/%i";
+            Environment = workerEnv ++ ["OPS_AUTOFIX_LOCK=/run/heimcloud-ops-worker-push-%i/lock"];
             EnvironmentFile = mkIf (af.redactExtraSlugsFile != null) [af.redactExtraSlugsFile];
           };
         };
