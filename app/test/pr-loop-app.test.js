@@ -102,7 +102,7 @@ async function withAdmin(fn) {
     await new Promise((r) => server.close(r));
   }
 }
-function request(port, method, p, { headers = {} } = {}) {
+function request(port, method, p, { headers = {}, body = "{}" } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, method, path: p, headers: { "content-type": "application/json", accept: "application/json", ...headers } }, (res) => {
       let data = "";
@@ -118,7 +118,7 @@ function request(port, method, p, { headers = {} } = {}) {
       });
     });
     req.on("error", reject);
-    req.end(method === "POST" ? "{}" : undefined);
+    req.end(method === "POST" ? body : undefined);
   });
 }
 
@@ -170,7 +170,7 @@ test("closed without merge → needs_human 'PR closed'; revision cap → needs_h
   prResult(a.id, "closed", { pr_state: "closed", review_state: "closed", summary: "PR #12 was closed without merge." });
   assert.equal(db.getIncident(a.id).status, "needs_human");
   assert.equal(hi(a.id).reasons[0].code, "pr_closed");
-  assert.deepEqual(hi(a.id).reasons[0].actions, ["open_pr", "start_fix", "close"]);
+  assert.deepEqual(hi(a.id).reasons[0].actions, ["open_pr", "start_fix", "adopt_pr", "close"]);
 
   const b = incident();
   labPassed(b.id);
@@ -198,7 +198,7 @@ test("closed without merge → needs_human 'PR closed'; revision cap → needs_h
 test("compare-only lab pass: 'Open the PR now' queues a kind pr job (no badge while queued); cross-origin refused", async () => {
   const inc = incident();
   labPassed(inc.id);
-  assert.deepEqual(hi(inc.id).reasons[0].actions, ["create_pr", "open_compare", "mark_resolved"]);
+  assert.deepEqual(hi(inc.id).reasons[0].actions, ["create_pr", "open_compare", "adopt_pr", "mark_resolved"]);
   await withAdmin(async (port) => {
     const x = await request(port, "POST", `/admin/incidents/${inc.id}/open-pr`, { headers: { origin: "https://evil.example.net", "sec-fetch-site": "cross-site" } });
     assert.equal(x.status, 403);
@@ -303,4 +303,115 @@ test("PR-loop validation: board button + 'PR loop on'; route creates a synthetic
   } finally {
     process.env.OPS_AUTOFIX_PR = "true";
   }
+});
+
+const workerStatus = path.join(tmpDir, "queue", "worker-status.json");
+const GOOD_SHA = "a".repeat(40);
+
+test("open failure (HTTP 403): never PR open without a number; needs_human 'Opening the PR failed' + Retry open PR; the retry adopts", async () => {
+  const inc = incident();
+  labPassed(inc.id);
+  // Worker side result (pr_event error) then the fix result pr_open_failed.
+  applyResult({ kind: "pr", via: "pr", pr_event: "error", incident_id: inc.id, target_repo: "madebydamo/neo", branch: "fix/searxng", pr_error: "HTTP 403: Resource not accessible by personal access token", summary: "Opening the PR failed (HTTP 403); compare link kept, Retry open PR from the card." });
+  applyResult({ kind: "fix", incident_id: inc.id, status: "pr_open_failed", lab: "passed", branch: "fix/searxng", head_sha: GOOD_SHA, pr_title: "fix(searxng): drop stale engines", pr_body: "body", target_repo: "madebydamo/neo", pr_error: "HTTP 403: Resource not accessible by personal access token", compare_url: "https://github.com/madebydamo/neo/compare/master...heimcloud:neo:fix/searxng?expand=1", summary: "Lab passed, but opening the PR failed (HTTP 403)." });
+  let cur = db.getIncident(inc.id);
+  assert.equal(cur.status, "needs_human");
+  assert.equal(cur.draft_pr_number, null);
+  assert.match(cur.compare_url, /compare\/master\.\.\.heimcloud:neo:fix\/searxng/);
+  const r0 = hi(inc.id).reasons[0];
+  assert.equal(r0.code, "pr_open_failed");
+  assert.deepEqual(r0.actions, ["retry_open_pr", "adopt_pr", "open_compare", "close"]);
+  assert.match(r0.detail || "", /HTTP 403/);
+  assert.equal(B.ACTIONS.retry_open_pr, "Retry open PR");
+  const html = renderCard(card(inc.id), "/admin", CAPS);
+  assert.match(html, /action="\/admin\/incidents\/\d+\/open-pr"/);
+  assert.match(html, /Retry open PR/);
+  assert.match(html, /action="\/admin\/incidents\/\d+\/adopt-pr"[\s\S]*name="pr_number"/);
+  await withAdmin(async (port) => {
+    const r = await request(port, "POST", `/admin/incidents/${inc.id}/open-pr`);
+    assert.equal(r.status, 200, r.body);
+  });
+  const [file] = jobs("pr", inc.id);
+  const job = JSON.parse(fs.readFileSync(path.join(tmpDir, "queue", "pr", file), "utf8"));
+  assert.equal(job.mode, "open");
+  assert.equal(job.branch, "fix/searxng");
+  fs.rmSync(path.join(tmpDir, "queue", "pr", file));
+  // The worker found the PR someone opened from the compare link: adopted.
+  prResult(inc.id, "adopted", { pr_number: 31, pr_url: "https://github.com/madebydamo/neo/pull/31", summary: "Adopted PR #31." });
+  cur = db.getIncident(inc.id);
+  assert.equal(cur.status, "pr_opened");
+  assert.equal(cur.draft_pr_number, 31);
+  assert.equal(hi(inc.id).needed, false);
+});
+
+test("an opened / adopted result without a PR number never moves the card to PR open", () => {
+  const inc = incident();
+  labPassed(inc.id);
+  prResult(inc.id, "opened", { pr_number: undefined, pr_url: "", summary: "Opened PR #undefined" });
+  const cur = db.getIncident(inc.id);
+  assert.equal(cur.status, "needs_human");
+  assert.equal(cur.draft_pr_number, null);
+  assert.equal(hi(inc.id).reasons[0].code, "pr_open_failed");
+});
+
+test("Adopt PR: route queues a kind pr job (mode adopt, pr_number); bad numbers and cross-origin refused", async () => {
+  const inc = incident();
+  labPassed(inc.id);
+  await withAdmin(async (port) => {
+    const x = await request(port, "POST", `/admin/incidents/${inc.id}/adopt-pr`, { body: JSON.stringify({ pr_number: 7 }), headers: { origin: "https://evil.example.net", "sec-fetch-site": "cross-site" } });
+    assert.equal(x.status, 403);
+    const bad = await request(port, "POST", `/admin/incidents/${inc.id}/adopt-pr`, { body: JSON.stringify({ pr_number: "7; rm" }) });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json.error, "bad_pr_number");
+    assert.deepEqual(jobs("pr", inc.id), []);
+    const r = await request(port, "POST", `/admin/incidents/${inc.id}/adopt-pr`, { body: JSON.stringify({ pr_number: "#7" }) });
+    assert.equal(r.status, 200, r.body);
+    const again = await request(port, "POST", `/admin/incidents/${inc.id}/adopt-pr`, { body: JSON.stringify({ pr_number: 7 }) });
+    assert.equal(again.status, 409);
+  });
+  const [file] = jobs("pr", inc.id);
+  const job = JSON.parse(fs.readFileSync(path.join(tmpDir, "queue", "pr", file), "utf8"));
+  assert.equal(job.mode, "adopt");
+  assert.equal(job.pr_number, 7);
+  assert.equal(job.target_repo, "madebydamo/neo");
+  assert.ok(events(inc.id).some((e) => e.kind === "pr_enqueued" && JSON.parse(e.meta_json).mode === "adopt"));
+  fs.rmSync(path.join(tmpDir, "queue", "pr", file));
+  // adopt_failed: event only, status unchanged.
+  const before = db.getIncident(inc.id).status;
+  applyResult({ kind: "pr", via: "pr", pr_event: "adopt_failed", incident_id: inc.id, target_repo: "madebydamo/neo", pr_number: 7, summary: "Adopt PR #7 failed: not from heimcloud/neo." });
+  assert.equal(db.getIncident(inc.id).status, before);
+});
+
+test("fine-grained token (worker check pr_ok false): PR loop disabled, board says so, Open PR refused, compare links stay", async () => {
+  fs.writeFileSync(workerStatus, JSON.stringify({ pr_token: { checked_at: new Date().toISOString(), token_kind: "fine-grained", api_ok: true, push_ok: true, pr_ok: false, check_error: false, reason: "fine-grained token: upstream PR creation unsupported" } }));
+  try {
+    assert.equal(Q.isAutofixKindEnabled("pr"), false);
+    assert.match(Q.prLoopState().label, /PR loop disabled: token kind fine-grained, cannot open upstream PRs/);
+    const inc = incident();
+    labPassed(inc.id);
+    await withAdmin(async (port) => {
+      const board = await request(port, "GET", "/admin/", { headers: { accept: "text/html" } });
+      assert.match(board.body, /token kind fine-grained, cannot open upstream PRs/);
+      assert.match(board.body, /classic PAT with public_repo/);
+      assert.doesNotMatch(board.body, /action="\/admin\/validation\/pr-loop"/);
+      const r = await request(port, "POST", `/admin/incidents/${inc.id}/open-pr`);
+      assert.equal(r.status, 409);
+      assert.equal(r.json.error, "autofix_disabled");
+    });
+    // A check that only failed on the network does not disable the loop.
+    fs.writeFileSync(workerStatus, JSON.stringify({ pr_token: { token_kind: "classic", pr_ok: false, check_error: true } }));
+    assert.equal(Q.isAutofixKindEnabled("pr"), true);
+  } finally {
+    fs.rmSync(workerStatus, { force: true });
+  }
+  assert.equal(Q.isAutofixKindEnabled("pr"), true);
+});
+
+test("validation CLI runs when started through a symlinked path (container /app)", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const link = path.join(tmpDir, "applink");
+  fs.symlinkSync(path.resolve(import.meta.dirname, ".."), link);
+  const r = spawnSync(process.execPath, [path.join(link, "lib", "validation.js")], { env: { ...process.env }, encoding: "utf8", timeout: 30_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /PR-loop validation started: incident #\d+, fix job \d+-/);
 });

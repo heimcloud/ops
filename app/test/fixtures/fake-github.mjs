@@ -24,7 +24,8 @@ const server = http.createServer((req, res) => {
     const page = Number(u.searchParams.get("page") || 1);
     const list = (arr) => send(200, page > 1 ? [] : arr || []);
     let m;
-    if (u.pathname === "/user") return send(200, s.user, { "x-oauth-scopes": s.scopes || "public_repo" });
+    // scopes null: no x-oauth-scopes header at all (fine-grained token).
+    if (u.pathname === "/user") return send(200, s.user, s.scopes === null ? {} : { "x-oauth-scopes": s.scopes ?? "public_repo" });
     if ((m = /^\/repos\/([^/]+\/[^/]+)$/.exec(u.pathname))) return send(200, { full_name: m[1], permissions: { push: (s.pushable || []).includes(m[1]) } });
     if ((m = /^\/repos\/([^/]+\/[^/]+)\/pulls$/.exec(u.pathname))) {
       const repo = m[1];
@@ -36,8 +37,12 @@ const server = http.createServer((req, res) => {
           save(s);
           return list([]);
         }
+        const st = u.searchParams.get("state") || "open";
+        const byState = (p) => st === "all" || p.state === st;
+        if (!head) return list(pulls.filter(byState));
         return list(pulls.filter((p) => `${p.head.repo.owner}:${p.head.ref}` === head));
       }
+      if (s.create_fail) return send(s.create_fail.status, { message: s.create_fail.message });
       const [owner, ref] = parsed.head.split(":");
       if (pulls.some((p) => p.state === "open" && p.head.ref === ref && p.head.repo.owner === owner)) return send(422, { message: "A pull request already exists" });
       const number = (s.next || 1);

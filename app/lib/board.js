@@ -97,6 +97,8 @@ export const ACTIONS = {
   open_compare: "Open compare link",
   open_pr: "Open PR on GitHub",
   create_pr: "Open the PR now",
+  retry_open_pr: "Retry open PR",
+  adopt_pr: "Adopt PR",
   mark_config_error: "Mark config error & close",
   mark_resolved: "Mark resolved",
   close: "Close",
@@ -357,13 +359,23 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
       const prEv = latestEvent(events, ["pr_state"]);
       const pm = prEv && (!fix || Number(prEv.id) > Number(fix.id)) ? prEv.meta || {} : null;
       if (pm?.pr_event === "closed") {
-        reasons.push(reason("pr_closed", `PR #${pm.pr_number} closed without merge`, ["open_pr", "start_fix", "close"], pm.summary));
+        reasons.push(reason("pr_closed", `PR #${pm.pr_number} closed without merge`, ["open_pr", "start_fix", ...(opts.prAuto ? ["adopt_pr"] : []), "close"], pm.summary));
       } else if (pm?.pr_event === "halted" && pm.halted === "revision_cap") {
         reasons.push(reason("revision_cap", `Revision cap reached (${pm.round}/${pm.max_rounds}): take over on GitHub`, ["open_pr", "mark_resolved", "close"], pm.summary));
       } else if (pm?.pr_event === "halted") {
         reasons.push(reason("pr_halted", `PR loop stopped on #${pm.pr_number} (${String(pm.halted || "error").replace(/_/g, " ")})`, ["open_pr", "start_fix", "mark_resolved"], pm.summary));
       } else if (pm?.pr_event === "blocked") {
         reasons.push(reason("pr_redaction_blocked", "Redaction gate blocked the PR text", ["start_fix", "close"], pm.summary));
+      } else if (pm?.pr_event === "error" || fm?.status === "pr_open_failed") {
+        const why = String(pm?.pr_error || fm?.pr_error || "unknown error").slice(0, 240);
+        reasons.push(
+          reason(
+            "pr_open_failed",
+            "Opening the PR failed: retry or adopt",
+            [...(opts.prAuto ? ["retry_open_pr", "adopt_pr"] : []), ...(incident.compare_url ? ["open_compare"] : []), "close"],
+            `The worker could not open the upstream PR (${why}). The compare link is kept. Retry open PR (an open PR for the branch is adopted), or open it from the compare link and Adopt PR with its number.`,
+          ),
+        );
       } else if (fm?.status === "lab_unavailable") {
         reasons.push(reason("no_lab_method", `No lab method for ${String(fm.target_repo || "this repo")}: test by hand`, ["skip_lab", "close"], fm.summary));
       } else if (fm?.unknown_target || (!fm && triage?.meta?.target_unknown)) {
@@ -422,7 +434,7 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
         const r = reason(
           "compare_untested",
           "Open the PR from the compare link (NOT lab-tested)",
-          ["open_compare", "mark_resolved"],
+          ["open_compare", ...(opts.prAuto ? ["adopt_pr"] : []), "mark_resolved"],
           `Lab test skipped by admin: the protected change (${p.label}) was NOT lab-tested. Review it carefully, open the upstream PR, merge, then mark resolved.`,
         );
         r.untested = true;
@@ -432,14 +444,14 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
           reason(
             "compare_ready",
             "Open the PR from the compare link",
-            [...(opts.prAuto && fm?.lab === "passed" ? ["create_pr"] : []), "open_compare", "mark_resolved"],
+            [...(opts.prAuto && fm?.lab === "passed" ? ["create_pr"] : []), "open_compare", ...(opts.prAuto ? ["adopt_pr"] : []), "mark_resolved"],
             fm?.lab === "passed" ? "Lab test passed. Open the upstream PR in GitHub, merge, then mark resolved." : undefined,
           ),
         );
       } else if (incident.draft_pr_url) {
         reasons.push(reason("pr_review", "PR open: merge, then mark resolved", ["mark_resolved"]));
       } else {
-        reasons.push(reason("pr_link_missing", "PR open but no compare link", ["mark_resolved"]));
+        reasons.push(reason("pr_link_missing", "PR open but no compare link", [...(opts.prAuto ? ["adopt_pr"] : []), "mark_resolved"]));
       }
       break;
     }

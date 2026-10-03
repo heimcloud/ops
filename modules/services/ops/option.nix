@@ -21,7 +21,7 @@
               githubToken = mkOption {
                 type = types.nullOr types.str;
                 default = null;
-                description = "GitHub token for draft PR creation (GITHUB_TOKEN). Prefer secrets injection.";
+                description = "GitHub token for the board's own draft PR creation (GITHUB_TOKEN). Separate from credentials ops.autofixForkPushToken, which the autofix PR loop uses and which must be a classic PAT with public_repo (one classic PAT may serve both). Prefer secrets injection.";
               };
               targetAllowlist = mkOption {
                 type = types.str;
@@ -372,7 +372,9 @@
                               Open the upstream PR automatically after a lab pass (draft + "NOT
                               lab-tested" after Skip lab), poll it, and revise the branch on review
                               feedback from the reviewer. Never merges. Uses the one GitHub token
-                              (credentials ops.autofixForkPushToken) through heimcloud-autofix-pr.
+                              (credentials ops.autofixForkPushToken) through heimcloud-autofix-pr; it
+                              must be a classic PAT with public_repo. A fine-grained token cannot open
+                              upstream PRs: the loop then stays disabled (compare links only).
                             '';
                             rank = 0;
                           };

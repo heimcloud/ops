@@ -85,16 +85,20 @@ exit "\${FAKE_ACTIVATE_EXIT:-0}"`,
   sh(
     path.join(B, "nix"),
     `echo "nix $*" >> "${F}/log"
+# A commit URL (github:<fork>/<sha>) resolves to that commit; a branch URL
+# resolves through the (stale) ref cache: FAKE_CACHED_REV. FAKE_REV forces a rev.
+pinned=$(printf '%s' "$*" | grep -oE 'github:[^ ]+/[0-9a-f]{40}' | grep -oE '[0-9a-f]{40}$' | head -1)
+rev="\${FAKE_REV:-\${pinned:-\${FAKE_CACHED_REV:-${"1".repeat(40)}}}}"
 case "$*" in
   *"flake metadata"*"--override-input"*)
-    echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2"}},"neo_2":{"locked":{"type":"github","rev":"'"\${FAKE_REV:-${"1".repeat(40)}}"'"}}}}}'
+    echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2","plugin0":"neo_2"}},"neo_2":{"locked":{"type":"github","rev":"'"$rev"'"}}}}}'
     exit 0 ;;
   *"flake metadata --json --no-write-lock-file ${FLAKE}")
     echo '{"locks":{"root":"root","nodes":{"root":{"inputs":{"neo":"neo_2"}},"neo_2":{"locked":{"type":"github","owner":"madebydamo","repo":"neo","rev":"${"9".repeat(40)}","narHash":"sha256-synthetic"}}}}}'
     exit 0 ;;
   *"flake metadata --json "*)
     [ -n "\${FAKE_META_FAIL:-}" ] && exit 1
-    echo '{"path":"${SRC_BRANCH}","revision":"'"\${FAKE_REV:-${"1".repeat(40)}}"'"}'
+    echo '{"path":"${SRC_BRANCH}","revision":"'"$rev"'"}'
     exit 0 ;;
   *" eval --raw --expr "*"builtins.fetchTree"*)
     printf '%s' "${SRC_DEPLOYED}"
@@ -106,6 +110,15 @@ case "\${FAKE_NIX_MODE:-ok}" in
   touchlock) echo '{"changed":true}' > "${FLAKE}/flake.lock" ;;
 esac
 echo "${LAB}"`,
+  );
+  // Fake git: ls-remote answers the live fork tip (FAKE_TIP, default the spec's head).
+  sh(
+    path.join(B, "git"),
+    `echo "git $*" >> "${F}/log"
+[ "$1" = ls-remote ] || exit 2
+[ -n "\${FAKE_TIP_FAIL:-}" ] && { echo "fatal: unable to access" >&2; exit 128; }
+ref="\${@: -1}"
+printf '%s\\t%s\\n' "\${FAKE_TIP:-${"1".repeat(40)}}" "$ref"`,
   );
   sh(
     path.join(B, "systemctl"),
@@ -253,7 +266,7 @@ function reset(s = spec()) {
   fs.rmSync(path.join(OPS, "queue", "control", `cancel-${INST}.json`), { force: true });
   fs.writeFileSync(path.join(OPS, "queue", "processing", `${INST}.json`), JSON.stringify(s));
   health = 200;
-  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG", "FAKE_ACTIVATE_OUT", "FAKE_LAB_SYSSTATE", "FAKE_LAB_KILLS_OPS", "FAKE_LAB_KILLS_HERMES", "FAKE_ROLLBACK_HEALS", "FAKE_OPS_RESTART_FAILS", "FAKE_META_FAIL"]) delete process.env[k];
+  for (const k of ["FAKE_LAB_ONLY_UNIT", "FAKE_STILL_FAILED", "FAKE_REV", "FAKE_NIX_MODE", "FAKE_ACTIVATE_EXIT", "FAKE_LAB_FAILS_UNIT", "FAKE_SDRUN_FAIL", "FAKE_LAB_HANG", "FAKE_ACTIVATE_OUT", "FAKE_LAB_SYSSTATE", "FAKE_LAB_KILLS_OPS", "FAKE_LAB_KILLS_HERMES", "FAKE_ROLLBACK_HEALS", "FAKE_OPS_RESTART_FAILS", "FAKE_META_FAIL", "FAKE_TIP", "FAKE_TIP_FAIL", "FAKE_CACHED_REV"]) delete process.env[k];
   Object.assign(process.env, env());
 }
 
@@ -268,7 +281,11 @@ test("pass: override only the neo input, activate with test, run all checks, rol
   assert.ok(r.checks.every((c) => c.ok), JSON.stringify(r.checks));
   assert.deepEqual(r.checks.slice(0, 5).map((c) => c.id), ["activate", "failed_units", "system_running", "ops_health", "hermes_active"]);
   const l = log();
-  assert.match(l, /nix .*build --no-link --print-out-paths --no-write-lock-file --override-input neo github:heimcloud\/neo\/fix\/labtest-demo .*#nixosConfigurations\.neo\.config\.system\.build\.toplevel/);
+  // Pinned to the gated commit (no branch ref cache), live tip from GitHub.
+  assert.match(l, /nix .*build --no-link --print-out-paths --no-write-lock-file --override-input neo github:heimcloud\/neo\/1{40} .*#nixosConfigurations\.neo\.config\.system\.build\.toplevel/);
+  assert.match(l, /git ls-remote --heads https:\/\/github\.com\/heimcloud\/neo\.git refs\/heads\/fix\/labtest-demo/);
+  assert.doesNotMatch(l, /github:heimcloud\/neo\/fix\//, "never the branch URL");
+  assert.equal(r.flake_url, `github:heimcloud/neo/${"1".repeat(40)}`);
   assert.doesNotMatch(l, /nixos-rebuild|switch-to-configuration switch|switch \S+ switch/);
   // lab activated with "test" (no boot entry / profile change), then the previous system.
   const switches = l.split("\n").filter((x) => x.startsWith("switch "));
@@ -485,13 +502,22 @@ test("trap: SIGTERM during the run still rolls back (separate process)", async (
   assert.equal(fs.realpathSync(CUR), BASE);
 });
 
-test("root refuses a fork branch that moved after gating (tip != head_sha) and a spec without head_sha", async () => {
-  process.env.FAKE_REV = "2".repeat(40);
+test("root refuses a fork branch that moved after gating (live tip != head_sha) and a spec without head_sha", async () => {
+  process.env.FAKE_TIP = "2".repeat(40);
   let r = await lt.runLab(cfg(), INST);
   assert.equal(r.verdict, "error");
-  assert.match(r.reason, /moved after the worker gated it/);
+  assert.match(r.reason, /moved after the worker gated it \(live fork tip 222222222222 is not the gated commit 111111111111, git ls-remote\)/);
   assert.doesNotMatch(log(), /^switch /m, "never activated");
+  assert.doesNotMatch(log(), /nix .*build/, "never built");
   assert.equal(r.watchdog.armed, false);
+  delete process.env.FAKE_TIP;
+  // The pinned override resolving elsewhere is an error, never "moved".
+  reset();
+  process.env.FAKE_REV = "2".repeat(40);
+  r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "error");
+  assert.doesNotMatch(r.reason, /moved/);
+  assert.doesNotMatch(log(), /^switch /m);
   delete process.env.FAKE_REV;
   reset(spec({ head_sha: undefined }));
   r = await lt.runLab(cfg(), INST);
@@ -860,4 +886,58 @@ test("watchdog of a protected run also verifies and restarts ops / Hermes", asyn
   const res = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
   assert.ok(res.evidence.includes("after restart of docker-ops.service: ops /health ok (HTTP 200)"), JSON.stringify(res.evidence));
   assert.equal(res.services_unhealthy, false);
+});
+
+test("revise round: a second lab on the same branch with a new head passes although the Nix ref cache still has the old tip", async () => {
+  // Round 0: head A.
+  let r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", r.reason);
+  // Round 1: the worker pushed B; root's GitHub ref cache still resolves the branch to A.
+  const B2 = "3".repeat(40);
+  reset(spec({ head_sha: B2 }));
+  process.env.FAKE_CACHED_REV = "1".repeat(40);
+  process.env.FAKE_TIP = B2;
+  r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", r.reason);
+  assert.equal(r.tested_rev, B2.slice(0, 12));
+  assert.equal(r.live_tip, B2.slice(0, 12));
+  assert.match(log(), new RegExp(`--override-input neo github:heimcloud/neo/${B2} `));
+});
+
+test("live tip unknown (ls-remote fails): no false 'moved', the pinned gated commit is tested", async () => {
+  process.env.FAKE_TIP_FAIL = "1";
+  const r = await lt.runLab(cfg(), INST);
+  assert.equal(r.verdict, "pass", r.reason);
+  assert.equal(r.live_tip, null);
+  assert.ok(r.evidence.some((l) => /live fork tip not checked \(git ls-remote exit 128\)/.test(l)), JSON.stringify(r.evidence));
+});
+
+test("pinned URLs per target: github / git+https / {rev} templates; fork URL for ls-remote", () => {
+  const sha = "4".repeat(40);
+  assert.equal(lt.pinnedFlakeUrl({ flakeUrl: "github:heimcloud/neo/{branch}" }, "fix/x", sha), `github:heimcloud/neo/${sha}`);
+  assert.equal(lt.pinnedFlakeUrl({ flakeUrl: "github:heimcloud/highsea.neo/{branch}?dir=nix" }, "fix/x", sha), `github:heimcloud/highsea.neo/${sha}?dir=nix`);
+  assert.equal(lt.pinnedFlakeUrl({ flakeUrl: "git+https://github.com/heimcloud/highsea.neo?ref={branch}" }, "fix/x", sha), `git+https://github.com/heimcloud/highsea.neo?ref=fix/x&rev=${sha}`);
+  assert.equal(lt.pinnedFlakeUrl({ flakeUrl: "github:heimcloud/neo/{rev}" }, "fix/x", sha), `github:heimcloud/neo/${sha}`);
+  assert.throws(() => lt.pinnedFlakeUrl({ flakeUrl: "github:heimcloud/neo/{branch}" }, "fix/x", "abc"));
+  assert.equal(lt.forkGitUrl({ flakeUrl: "github:heimcloud/highsea.neo/{branch}" }), "https://github.com/heimcloud/highsea.neo.git");
+  assert.equal(lt.forkGitUrl({ flakeUrl: "git+https://github.com/heimcloud/highsea.neo.git?ref={branch}" }), "https://github.com/heimcloud/highsea.neo.git");
+});
+
+test("non-neo target (highsea.neo): its input is overridden with the pinned commit of its fork, live tip from its fork", async () => {
+  const B2 = "5".repeat(40);
+  reset(spec({ head_sha: B2, target_repo: "madebydamo/highsea.neo" }));
+  process.env.LABTEST_TARGETS = JSON.stringify([{ upstream: "madebydamo/neo" }, { upstream: "madebydamo/highsea.neo", flakeInput: "plugin0" }]);
+  process.env.FAKE_TIP = B2;
+  process.env.FAKE_CACHED_REV = "1".repeat(40);
+  try {
+    const r = await lt.runLab(cfg(), INST);
+    assert.equal(r.verdict, "pass", r.reason);
+    assert.equal(r.flake_input, "plugin0");
+    assert.equal(r.target_repo, "madebydamo/highsea.neo");
+    const l = log();
+    assert.match(l, new RegExp(`--override-input plugin0 github:heimcloud/highsea\\.neo/${B2} `));
+    assert.match(l, /git ls-remote --heads https:\/\/github\.com\/heimcloud\/highsea\.neo\.git refs\/heads\/fix\/labtest-demo/);
+  } finally {
+    delete process.env.LABTEST_TARGETS;
+  }
 });

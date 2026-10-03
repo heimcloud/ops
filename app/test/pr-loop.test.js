@@ -174,8 +174,10 @@ test("wrapper whitelist: the PR / comment / read calls of configured upstreams p
   assert.equal(ok({ ...create(), path: "/repos/madebydamo/highsea.neo/pulls" }).target, HS);
   assert.equal(ok({ method: "GET", path: "/repos/madebydamo/neo/pulls/7" }).kind, "get_pull");
   const patch = ok({ method: "PATCH", path: "/repos/madebydamo/neo/pulls/7", body: { body: "new" } });
-  assert.equal(patch.needsOwnership, true);
-  assert.equal(ok({ method: "POST", path: "/repos/madebydamo/neo/issues/7/comments", body: { body: "Revision 1/3 pushed." } }).needsOwnership, true);
+  assert.equal(patch.needsOwnership, "bot");
+  assert.equal(ok({ method: "POST", path: "/repos/madebydamo/neo/issues/7/comments", body: { body: "Revision 1/3 pushed." } }).needsOwnership, "fork");
+  // Discovery: open PRs of an upstream without head (filtered to the fork by the worker).
+  assert.equal(ok({ method: "GET", path: "/repos/madebydamo/neo/pulls?state=open&per_page=100&page=1" }).kind, "list_open_pulls");
   for (const p of ["issues/7/comments", "pulls/7/comments", "pulls/7/reviews"]) assert.ok(ok({ method: "GET", path: `/repos/madebydamo/neo/${p}?per_page=100&page=2` }));
 });
 
@@ -193,6 +195,8 @@ test("wrapper whitelist: other repos, methods, endpoints, keys, heads, bases and
   no({ method: "GET", path: "/repos/madebydamo/neo/pulls/7%2f..%2f" }, /path not allowed/);
   no({ method: "GET", path: "/repos/madebydamo/neo/pulls?head=someone:fix/x" }, /head=/);
   no({ method: "GET", path: "/repos/madebydamo/neo/pulls?state=all" }, /head=/);
+  no({ method: "GET", path: "/repos/madebydamo/neo/pulls?state=closed" }, /head=/);
+  no({ method: "GET", path: "/repos/madebydamo/neo/pulls" }, /head=/);
   no({ method: "GET", path: "/repos/madebydamo/neo/pulls?head=heimcloud:fix/x&sort=x" }, /sort/);
   no({ method: "GET", path: "/repos/madebydamo/neo/pulls?head=heimcloud:fix/x&head=heimcloud:fix/y" }, /duplicate/);
   no(create({ head: "someone:fix/x" }), /head must be/);
@@ -240,11 +244,15 @@ test("wrapper process: refusals happen before the token is read; missing token �
   assert.ok(!r.raw.includes(TOKEN));
 });
 
-test("wrapper --check: login + public_repo scope + push on every fork; output carries no token", () => {
+test("wrapper --check: per capability (api / push / pr), classic public_repo needed for PRs; output carries no token", () => {
   resetState();
   let r = wrapper(undefined, {}, ["--check"]);
   assert.equal(r.code, 0, r.raw);
-  assert.equal(r.out.ok, true);
+  assert.equal(r.out.ok, undefined, "no ambiguous single ok");
+  assert.equal(r.out.api_ok, true);
+  assert.equal(r.out.push_ok, true);
+  assert.equal(r.out.pr_ok, true);
+  assert.equal(r.out.token_kind, "classic");
   assert.equal(r.out.login, "heimcloud");
   assert.deepEqual(r.out.scopes, ["public_repo"]);
   assert.deepEqual(Object.keys(r.out.forks), ["heimcloud/neo", "heimcloud/highsea.neo"]);
@@ -252,14 +260,41 @@ test("wrapper --check: login + public_repo scope + push on every fork; output ca
   resetState({ scopes: "read:user", pushable: ["heimcloud/neo"] });
   r = wrapper(undefined, {}, ["--check"]);
   assert.equal(r.code, 1);
-  assert.equal(r.out.scope_ok, false);
+  assert.equal(r.out.pr_ok, false);
+  assert.equal(r.out.push_ok, false);
   assert.equal(r.out.forks["heimcloud/highsea.neo"].push, false);
+  // Fine-grained token: no x-oauth-scopes header, push on all forks → push ok, PR creation unsupported.
+  const FG = "github_pat_11FAKE0fineGrained0123456789";
+  const fgFile = path.join(tmp, "token-fg");
+  fs.writeFileSync(fgFile, `${FG}\n`, { mode: 0o400 });
+  resetState({ scopes: null, token: FG });
+  r = wrapper(undefined, { OPS_PR_TOKEN_FILE: fgFile }, ["--check"]);
+  assert.equal(r.code, 2, r.raw);
+  assert.equal(r.out.api_ok, true);
+  assert.equal(r.out.push_ok, true);
+  assert.equal(r.out.pr_ok, false);
+  assert.equal(r.out.token_kind, "fine-grained");
+  assert.ok(r.out.messages.some((m) => /fine-grained token: upstream PR creation unsupported/.test(m)), r.raw);
+  assert.ok(!r.raw.includes(FG));
+  // Empty scopes header, unprefixed token: same verdict.
+  assert.equal(PW.tokenKind("0123abcd", ""), "fine-grained");
+  // Classic without public_repo: pushes, but no PR loop.
+  resetState({ scopes: "" });
+  r = wrapper(undefined, {}, ["--check"]);
+  assert.equal(r.code, 2, r.raw);
+  assert.equal(r.out.token_kind, "classic");
+  assert.equal(r.out.pr_ok, false);
+  assert.ok(r.out.messages.some((m) => /without public_repo/.test(m)));
+  assert.equal(PW.tokenKind("github_pat_x", "public_repo"), "fine-grained");
+  assert.equal(PW.tokenKind("ghp_x", null), "classic");
+  assert.equal(PW.tokenKind("opaque", "repo"), "classic");
+  assert.equal(PW.tokenKind("opaque", null), "fine-grained");
   resetState({ user: { login: "someone", id: 1, type: "User" } });
   assert.equal(wrapper(undefined, {}, ["--check"]).out.login_ok, false);
   assert.equal(wrapper(undefined, { OPS_PR_TOKEN_FILE: path.join(tmp, "nope") }, ["--check"]).code, 4);
 });
 
-test("wrapper ownership: PATCH / comment only on PRs the bot opened from the configured fork", () => {
+test("wrapper ownership: comments on fork PRs (any author: adopted PRs), PATCH only on PRs the bot opened; foreign heads refused", () => {
   resetState();
   const cfg = prCfg();
   const opened = PR.openOrAdoptPr(cfg, { branch: "fix/own", title: "fix: own", body: "b", draft: false });
@@ -268,14 +303,19 @@ test("wrapper ownership: PATCH / comment only on PRs the bot opened from the con
     s.pulls[9] = { ...s.pulls[opened.number], number: 9, user: { login: "someone", id: 5, type: "User" } };
     s.pulls[10] = { ...s.pulls[opened.number], number: 10, head: { ref: "fix/own", sha: "b".repeat(40), repo: { full_name: "someone/neo", owner: "someone" } } };
   });
-  for (const n of [9, 10]) {
-    const r = wrapper({ method: "POST", path: `/repos/madebydamo/neo/issues/${n}/comments`, body: { body: "hello" } });
-    assert.equal(r.code, 3, `PR ${n}`);
-    assert.match(r.out.reason, /not a PR opened by the autofix bot/);
-  }
+  // 10: head on someone else's repo → refused for everything.
+  let r = wrapper({ method: "POST", path: `/repos/madebydamo/neo/issues/10/comments`, body: { body: "hello" } });
+  assert.equal(r.code, 3);
+  assert.match(r.out.reason, /not a PR from the configured fork/);
+  // 9: fork head, opened by another account (adopted PR): reply comments allowed, PATCH not.
+  assert.equal(wrapper({ method: "POST", path: `/repos/madebydamo/neo/issues/9/comments`, body: { body: "Revision 1/3 pushed." } }).out.status, 201);
+  r = wrapper({ method: "PATCH", path: `/repos/madebydamo/neo/pulls/9`, body: { title: "x" } });
+  assert.equal(r.code, 3);
+  assert.match(r.out.reason, /not a PR opened by the autofix bot/);
   assert.equal(wrapper({ method: "POST", path: `/repos/madebydamo/neo/issues/${opened.number}/comments`, body: { body: "hello" } }).out.status, 201);
   assert.equal(wrapper({ method: "PATCH", path: `/repos/madebydamo/neo/pulls/${opened.number}`, body: { title: "fix: own (v2)" } }).out.status, 200);
-  assert.ok(!ghLog().some((l) => l.method === "POST" && /\/issues\/(9|10)\//.test(l.path)));
+  assert.ok(!ghLog().some((l) => l.method === "POST" && /\/issues\/10\//.test(l.path)));
+  assert.ok(!ghLog().some((l) => l.method === "PATCH" && /\/pulls\/(9|10)$/.test(l.path)));
 });
 
 // ------------------------------------------------------------ open / adopt

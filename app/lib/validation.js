@@ -11,7 +11,9 @@
  * or, on the host, `docker exec ops node /app/lib/validation.js`.
  */
 import crypto from "node:crypto";
-import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { upsertIncident, updateIncident, addIncidentEvent } from "./db.js";
 import { enqueueJob, isAutofixKindEnabled, QueueError } from "./queue.js";
 import { loadTargets } from "./targets.js";
@@ -43,7 +45,17 @@ export function startPrLoopValidation({ now = new Date() } = {}) {
   return { incident, job_file };
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+export function isMainModule(metaUrl) {
+  // Node runs the main module from its realpath (symlinks resolved) while
+  // argv[1] keeps the path as typed (/app -> store path in the container).
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(path.resolve(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule(import.meta.url)) {
   try {
     const r = startPrLoopValidation();
     console.log(`PR-loop validation started: incident #${r.incident.id}, fix job ${r.job_file}`);

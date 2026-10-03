@@ -330,6 +330,22 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
     path += "/open-pr";
     hidden = "";
     confirm = `Open the upstream PR for incident #${id} from its lab-tested branch? (never auto-merged)`;
+  } else if (action === "retry_open_pr") {
+    if (!caps.pr) return "";
+    path += "/open-pr";
+    hidden = "";
+    confirm = `Retry opening the upstream PR for incident #${id}? (an already open PR for the fix branch is adopted instead)`;
+  } else if (action === "adopt_pr") {
+    if (!caps.pr) return "";
+    // Number input: the PR was opened outside the worker (e.g. from the compare link).
+    return `<form class="act-form adopt-form" method="post" action="${esc(`${path}/adopt-pr`)}" data-confirm="${esc(
+      `Adopt this PR for incident #${id}? It must be an open PR from the heimcloud fork (fix/* or ops/* branch) on the target upstream. Only comments after adoption drive revisions.`,
+    )}">
+      <input type="hidden" name="return_to" value="board" />
+      <label class="sr-only" for="adopt-${id}">PR number for #${id}</label>
+      <input id="adopt-${id}" class="adopt-num" name="pr_number" type="number" min="1" step="1" required placeholder="PR #" />
+      <button class="${cls}${primary}" type="submit">${esc(label)}</button>
+    </form>`;
   } else if (action === "retry_push") {
     if (!caps.push) return "";
     path += "/retry-push";
@@ -588,7 +604,7 @@ export function renderBoard({ cards, counts, filters, base, caps, status, flash 
     `triage ${caps.triage ? "on" : "off"}`,
     `fix ${caps.fix ? "on" : "off"}`,
     `fork token ${status.token}`,
-    `PR loop ${caps.pr ? "on" : "off"}`,
+    caps.prLoop?.label || `PR loop ${caps.pr ? "on" : "off"}`,
   ];
   const validate =
     caps.pr && caps.fix && !caps.readOnly

@@ -227,8 +227,10 @@ const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/p
  * kind "pr" results (worker PR loop): PR number/url on the incident, a
  * pr_state event (the card reads it) and the status the PR state implies:
  * opened/adopted/revised → PR open, feedback → Fixing (revise job queued),
- * merged → Resolved, closed / halted / blocked → Needs human. A manual close
- * is never undone; "state", "stopped" and "error" change no status.
+ * merged → Resolved, closed / halted / blocked / error (open failed) → Needs
+ * human. A manual close is never undone; "state", "stopped" and
+ * "adopt_failed" change no status. opened / adopted without an allowlisted
+ * PR URL + number never move the card to PR open.
  */
 export function applyPrResult(incident, result) {
   const id = incident.id;
@@ -248,7 +250,15 @@ export function applyPrResult(incident, result) {
     closed: "needs_human",
     halted: "needs_human",
     blocked: "needs_human",
+    // Opening failed (HTTP 403, network, …): never "PR open" without a PR.
+    error: incident.draft_pr_number ? null : "needs_human",
   }[result.pr_event];
+  // "PR open" only with a real PR (allowlisted URL + number).
+  if (next === "pr_opened" && !patch.draft_pr_number && !incident.draft_pr_number) {
+    addIncidentEvent(id, "pr_state", `${result.summary || "PR result"} (ignored: no PR number / URL)`, { ...result, pr_event: "error", pr_error: "result without a PR number" });
+    if (!final) updateIncident(id, { status: "needs_human" });
+    return;
+  }
   if (next && !final && !(incident.status === "resolved" && next === "resolved")) patch.status = next;
   if (Object.keys(patch).length) updateIncident(id, patch);
   const kindOf = result.pr_event === "merged" ? "pr_merged" : "pr_state";
@@ -258,6 +268,7 @@ export function applyPrResult(incident, result) {
 const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed", "cancelled"]);
 const LAB_ATTEMPT_RESULT = {
   compare_ready: "lab_passed",
+  pr_open_failed: "lab_passed",
   lab_retry: "lab_failed",
   needs_human: "lab_failed",
   lab_error: "lab_error",

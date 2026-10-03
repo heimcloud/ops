@@ -18,7 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   redactIdentifyingDetails,
   findIdentifierHits,
@@ -68,6 +68,7 @@ import {
   pollPrs,
   feedbackBlock,
   prStateResult,
+  getForkPr,
 } from "./pr.mjs";
 
 const WORKER_FILE = fileURLToPath(import.meta.url);
@@ -1486,10 +1487,62 @@ function writePrResult(cfg, result) {
   }
 }
 
-/** PR automation usable for this run (enabled + token file present). */
+/**
+ * What the token can do for the PR loop (`heimcloud-autofix-pr --check`),
+ * cached in worker-status.json `pr_token` (15 min; 5 min after a failure;
+ * immediately again when the token file changes). Never the token itself.
+ * @returns {{checked_at, token_kind, pr_ok, push_ok, api_ok, reason, token_mtime}}
+ */
+export function prCapability(cfg, { force = false } = {}) {
+  let mtime = null;
+  try {
+    mtime = fs.statSync(cfg.prTokenFile).mtimeMs;
+  } catch {
+    /* missing */
+  }
+  const cached = readStatus(cfg).pr_token;
+  if (!force && cached && cached.token_mtime === mtime && cached.checked_at) {
+    const age = Date.now() - Date.parse(cached.checked_at);
+    if (age >= 0 && age < (cached.pr_ok || cached.check_error ? 15 : 5) * 60_000) return cached;
+  }
+  const r = spawnSync(cfg.prBin, ["--check"], { encoding: "utf8", env: { ...prWrapperEnv(cfg) }, timeout: 90_000 });
+  let out = null;
+  try {
+    out = JSON.parse(String(r.stdout || "").trim().split("\n").pop());
+  } catch {
+    out = null;
+  }
+  const cap = out
+    ? {
+        checked_at: new Date().toISOString(),
+        token_mtime: mtime,
+        token_kind: out.token_kind || (out.no_token ? "missing" : "unknown"),
+        api_ok: Boolean(out.api_ok),
+        push_ok: Boolean(out.push_ok),
+        pr_ok: Boolean(out.pr_ok),
+        // Network / API trouble is not a token verdict: do not disable the loop for it.
+        check_error: !out.api_ok && !out.no_token ? true : undefined,
+        reason: shortSummary(redactIdentifyingDetails((out.messages || []).join("; ") || out.error || "", { knownSlugs: [] }), 300) || null,
+      }
+    : { checked_at: new Date().toISOString(), token_mtime: mtime, token_kind: "unknown", api_ok: false, push_ok: false, pr_ok: false, check_error: true, reason: r.error ? `${cfg.prBin}: ${r.error.code || r.error.message}` : `${cfg.prBin} --check exit ${r.status}` };
+  updateStatus(cfg, { pr_token: cap }, { heartbeat: false });
+  return cap;
+}
+
+/** PR automation usable for this run (enabled + token present + token can open PRs). */
 function prReady(cfg) {
   if (!cfg.prOn) return { ok: false, reason: "PR automation is off (autofix.pr.enable)" };
   if (!prTokenPresent(cfg)) return { ok: false, reason: "GitHub token missing (autofixForkPushToken)" };
+  const cap = prCapability(cfg);
+  if (!cap.pr_ok && !cap.check_error) {
+    return {
+      ok: false,
+      disabled: true,
+      reason: cap.token_kind === "classic"
+        ? `PR loop disabled: the token cannot open upstream PRs (${cap.reason || "no public_repo scope"})`
+        : `PR loop disabled: token kind ${cap.token_kind}, cannot open upstream PRs (needs a classic PAT with public_repo); compare link only`,
+    };
+  }
   return { ok: true };
 }
 
@@ -1501,7 +1554,7 @@ function prReady(cfg) {
  */
 export function afterLabPass(cfg, job, res, { slugs = [], untested = false, protectedLabel = "" } = {}) {
   const ready = prReady(cfg);
-  if (!ready.ok || !cfg.target) return ready.ok ? res : { ...res, pr_skipped: ready.reason };
+  if (!ready.ok || !cfg.target) return ready.ok ? res : { ...res, pr_skipped: ready.reason, summary: ready.disabled ? `${res.summary} ${ready.reason}.` : res.summary };
   const id = Number(job.incident_id);
   return withPrLock(cfg, () => {
     const rec = readRecord(cfg, id);
@@ -1541,8 +1594,11 @@ export function afterLabPass(cfg, job, res, { slugs = [], untested = false, prot
     const draft = untested || cfg.prDraft;
     const pr = openOrAdoptPr(cfg, { branch: job.branch, title: text.title, body: text.body, draft });
     if (!pr.ok) {
-      writePrResult(cfg, { kind: "pr", via: "pr", pr_event: "error", incident_id: id, target_repo: cfg.target.upstream, branch: job.branch, summary: `Opening the PR failed (${pr.error}); the compare link is the fallback.` });
-      return { ...res, pr_error: pr.error, summary: `${res.summary} Opening the PR failed (${pr.error}); the compare link is the fallback.` };
+      // Never "PR open" without a PR number and a state record: needs_human
+      // with the redacted reason, compare link kept, "Retry open PR".
+      const why = shortSummary(redactIdentifyingDetails(String(pr.error || "unknown error"), { knownSlugs: slugs }), 240);
+      writePrResult(cfg, { kind: "pr", via: "pr", pr_event: "error", incident_id: id, target_repo: cfg.target.upstream, branch: job.branch, pr_error: why, untested, summary: `Opening the PR failed (${why}); compare link kept, Retry open PR from the card.` });
+      return { ...res, status: "pr_open_failed", pr_error: why, summary: `Lab ${untested ? "skipped" : "passed"}, but opening the PR failed (${why}). Compare link kept; Retry open PR (an open PR for the branch is adopted).` };
     }
     const keep = rec && Number(rec.number) === pr.number ? rec : null;
     const nrec = keep ? { ...keep, state: pr.state, draft: pr.draft, url: pr.url } : newRecord(cfg, job, pr, { untested });
@@ -1565,6 +1621,7 @@ export function handlePr(cfg, job, ctx) {
     target_repo: cfg.target.upstream,
     branch: job.branch,
   };
+  if (job.mode === "adopt") return adoptPrJob(cfg, job, base);
   if (!isValidBranch(job.branch)) return { ...base, pr_event: "error", summary: "PR job without a valid fix branch." };
   const ready = prReady(cfg);
   if (!ready.ok) return { ...base, pr_event: "error", summary: `${ready.reason}; use the compare link.` };
@@ -1577,6 +1634,34 @@ export function handlePr(cfg, job, ctx) {
   const out = afterLabPass(cfg, job, res, { slugs: ctx.slugs, untested, protectedLabel: label });
   // The PR outcome itself went out as a side result; this one only logs.
   return { ...out, kind: "pr", via: "pr", pr_event: out.status === "redaction_blocked" ? "blocked_job" : "job", status: undefined, _noIngest: true };
+}
+
+/**
+ * Admin "Adopt PR" (kind pr, mode adopt, pr_number): track an existing open
+ * PR from the target fork. Comments made before adoption are the baseline.
+ */
+function adoptPrJob(cfg, job, base) {
+  const fail = (summary) => {
+    writePrResult(cfg, { ...base, pr_event: "adopt_failed", pr_number: Number(job.pr_number) || undefined, summary });
+    return { ...base, pr_event: "adopt_failed", summary, _noIngest: true };
+  };
+  const ready = prReady(cfg);
+  if (!ready.ok) return fail(`Adopt PR #${Number(job.pr_number)}: ${ready.reason}.`);
+  const n = Number(job.pr_number);
+  if (!Number.isInteger(n) || n < 1) return fail("Adopt PR: no valid PR number.");
+  return withPrLock(cfg, () => {
+    const cur = readRecord(cfg, base.incident_id);
+    if (cur && cur.state === "open" && Number(cur.number) !== n) return fail(`Adopt PR #${n}: incident already tracks open PR #${cur.number}.`);
+    const pr = getForkPr(cfg, n);
+    if (!pr.ok) return fail(`Adopt PR #${n} failed: ${shortSummary(redactIdentifyingDetails(pr.error, { knownSlugs: [] }), 200)}.`);
+    const rec =
+      cur && Number(cur.number) === n
+        ? { ...cur, state: pr.state, draft: pr.draft, url: pr.url }
+        : { ...newRecord(cfg, { ...job, branch: pr.branch, pr_title: pr.title.slice(0, 300), pr_body: pr.body.slice(0, 20000) }, pr, { adopted_by: "admin", untested: null }), baseline_pending: true };
+    writeRecord(cfg, rec);
+    writePrResult(cfg, prStateResult(rec, "adopted", `Adopted PR #${n} on ${cfg.target.upstream} (branch ${pr.branch}); review comments from now on drive revise rounds.`));
+    return { ...base, branch: pr.branch, pr_event: "job", pr_number: n, summary: `Adopted PR #${n}.`, _noIngest: true };
+  });
 }
 
 /** Stop the PR loop for an incident (cap / lab fail / redaction): needs_human, nothing posted. */
@@ -1612,14 +1697,50 @@ function incidentJobPending(cfg, incidentId) {
   }
 }
 
+/**
+ * Incident a discovered fork PR belongs to, from the DB (read-only sqlite3):
+ * the incident whose fix / lab-skip / PR events name that branch, else the id
+ * the branch or body names. The incident's target must be the PR's upstream.
+ */
+export function findIncident(cfg, { branch, id, target }) {
+  if (!fs.existsSync(cfg.dbPath)) return null;
+  const cols = "i.id, i.status, i.report_hash, i.unit, i.severity, i.class, i.neo_version, i.logs_excerpt, i.target_repo";
+  const q = (sql) => {
+    const r = run("sqlite3", ["-readonly", "-json", cfg.dbPath, sql], { timeout: 15_000 });
+    if (r.status !== 0) return [];
+    try {
+      const rows = JSON.parse(r.stdout || "[]");
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  };
+  const fits = (row) => row && String(row.target_repo || "madebydamo/neo").toLowerCase() === String(target).toLowerCase();
+  // Branch charset is fix/|ops/ + [A-Za-z0-9._/-] (checked by the caller): no quoting issues.
+  if (/^(fix|ops)\/[A-Za-z0-9._\/-]+$/.test(String(branch || ""))) {
+    const rows = q(
+      `SELECT ${cols} FROM incidents i WHERE i.id IN (SELECT incident_id FROM incident_events WHERE kind IN ('fix_result','lab_skipped','pr_state') AND json_extract(meta_json,'$.branch') = '${branch}') ORDER BY i.id DESC LIMIT 5;`,
+    ).filter(fits);
+    if (rows.length) return rows[0];
+  }
+  if (Number.isInteger(Number(id)) && Number(id) > 0) {
+    const row = q(`SELECT ${cols} FROM incidents i WHERE i.id = ${Number(id)};`)[0];
+    if (fits(row)) return row;
+  }
+  return null;
+}
+
 /** `--pr-poll`: one pass over the tracked PRs (timer every 2–5 min). */
 export function prPoll(cfg) {
   if (!cfg.prOn) return { skipped: "PR automation off" };
   if (!prTokenPresent(cfg)) return { skipped: "no token" };
   mkdirs(cfg);
+  const ready = prReady(cfg);
+  if (!ready.ok) return { skipped: ready.reason };
   const slugs = knownSlugs(cfg);
   return pollPrs(cfg, {
     slugs,
+    findIncident: (q) => findIncident(cfg, q),
     writeResult: (r) => writePrResult(cfg, r),
     jobPending: (id) => incidentJobPending(cfg, id),
     enqueueRevise: (tcfg, rec, items) => {
@@ -2286,7 +2407,8 @@ export function processOne(cfg, entry) {
       summary: shortSummary(result?.summary),
     },
   });
-  log(`${entry.kind} incident ${result?.incident_id}: ${result?.status}${reason ? ` (${reason.code})` : ""}`);
+  const outcome = result?.status || result?.pr_event || (result ? "done" : "no result");
+  log(`${entry.kind} incident ${result?.incident_id ?? (idFromName || "?")}: ${outcome}${reason ? ` (${reason.code})` : ""}${result?.summary ? ` - ${shortSummary(result.summary, 160)}` : ""}`);
   return result;
 }
 
@@ -2307,18 +2429,28 @@ export function writeWorkerStatus(cfg) {
  *  api:  heimcloud-autofix-pr --check (token login = bot login, classic scope
  *        public_repo, push permission on every allowlisted fork)
  */
+/**
+ * `--check-token`: per capability, never the token.
+ *   push (git): heimcloud-autofix-env --check (the credential git uses)
+ *   push (API): permissions.push on every allowlisted fork
+ *   pr:         classic PAT with public_repo (upstream PR creation)
+ *   api:        token valid / GitHub reachable
+ * Exit 0 all ok; 2 push ok but no PR capability (PR loop disabled, compare
+ * links); 1 push not ok.
+ */
 export function checkToken(cfg) {
   const push = tokenAvailable(cfg);
-  console.log(`push scope (git credential via ${cfg.envBin}): ${push.ok ? "ok" : `FAIL: ${push.reason}`}`);
-  const r = spawnSync(cfg.prBin, ["--check"], { encoding: "utf8", env: { ...prWrapperEnv(cfg) }, timeout: 90_000 });
-  let api = null;
-  try {
-    api = JSON.parse(String(r.stdout || "").trim().split("\n").pop());
-  } catch {
-    api = { ok: false, error: r.error ? String(r.error.code || r.error.message) : `exit ${r.status}` };
-  }
-  console.log(`api scope (${cfg.prBin}): ${api.ok ? "ok" : "FAIL"} ${JSON.stringify(api)}`);
-  return push.ok && api.ok ? 0 : 1;
+  console.log(`push (git credential via ${cfg.envBin}): ${push.ok ? "ok" : `FAIL: ${push.reason}`}`);
+  const cap = prCapability(cfg, { force: true });
+  console.log(`token kind: ${cap.token_kind}${cap.token_kind === "fine-grained" ? ", cannot open upstream PRs" : ""}`);
+  console.log(`api (GitHub REST, ${cfg.prBin}): ${cap.api_ok ? "ok" : `FAIL${cap.reason ? `: ${cap.reason}` : ""}`}`);
+  console.log(`push (API: push permission on ${cfg.targets.map((t) => t.fork).join(", ")}): ${cap.push_ok ? "ok" : "FAIL"}`);
+  console.log(`pr (open upstream PRs, comment): ${cap.pr_ok ? "ok" : `FAIL${cap.reason ? `: ${cap.reason}` : ""}`}`);
+  console.log(`PR loop: ${!cfg.prOn ? "off (autofix.pr.enable)" : cap.pr_ok ? "on" : "disabled (compare links only)"}`);
+  // 0 push + PR loop ok, 2 push ok but no PR capability (compare links), 1 push broken.
+  const pushOk = push.ok && cap.push_ok;
+  if (pushOk && cap.pr_ok) return 0;
+  return pushOk ? 2 : 1;
 }
 
 // ---------------------------------------------------------------- kick
@@ -2466,6 +2598,12 @@ function drain(cfg, lockInfo) {
   updateStatus(cfg, { state: paused ? "paused" : "idle", pid: undefined, job: null, run_finished_at: new Date().toISOString() });
 }
 
+/** One pr-poll log line; never a bare "undefined". */
+export function prPollLine(o) {
+  const what = o?.event || o?.result || o?.skipped || (o?.error ? `error: ${o.error}` : "no change");
+  return `pr-poll incident ${o?.incident_id ?? "?"}${o?.pr_number ? ` PR #${o.pr_number}` : ""}: ${what}${o?.summary ? ` - ${shortSummary(o.summary, 160)}` : ""}`;
+}
+
 export function main(argv = process.argv.slice(2)) {
   if (argv.includes("-h") || argv.includes("--help")) {
     console.error("usage: heimcloud-ops-worker [--once] | --push-pending <job scratch dir> | --kick | --pr-poll | --check-token");
@@ -2477,7 +2615,7 @@ export function main(argv = process.argv.slice(2)) {
     try {
       const out = prPoll(cfg);
       if (out.skipped) log(`pr-poll: skipped (${out.skipped})`);
-      else for (const o of out) log(`pr-poll incident ${o.incident_id}: ${o.event || o.skipped || `error: ${o.error}`}`);
+      else for (const o of out) log(prPollLine(o));
     } catch (err) {
       console.error(`heimcloud-ops-worker: pr-poll failed: ${err.message || err}`);
     }
@@ -2501,7 +2639,7 @@ export function main(argv = process.argv.slice(2)) {
       if (result.incident_id) {
         writeResult(cfg, path.join(scratch, `push-${path.basename(scratch)}-${Date.now()}.json`), result);
       }
-      log(`push-pending incident ${result.incident_id}: ${result.status}`);
+      log(`push-pending incident ${result.incident_id ?? "?"}: ${result.status || "no status"}${result.summary ? ` - ${shortSummary(result.summary, 160)}` : ""}`);
       return ["compare_ready", "awaiting_lab_test"].includes(result.status) ? 0 : 1;
     } catch (err) {
       console.error(`heimcloud-ops-worker: push-pending failed: ${err.message || err}`);
@@ -2550,8 +2688,17 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-const invokedDirectly =
-  process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+function isMainModule(metaUrl) {
+  // Node runs the main module from its realpath (symlinks resolved) while
+  // argv[1] keeps the path as typed (/app -> store path in the container).
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(path.resolve(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
+
+const invokedDirectly = isMainModule(import.meta.url);
 if (invokedDirectly) {
   const si = process.argv.indexOf("--supervise");
   if (si >= 0) superviseMain(process.argv[si + 1]);

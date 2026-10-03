@@ -36,9 +36,55 @@ const TRUE = ["1", "true", "yes", "on"];
 export function isAutofixKindEnabled(kind) {
   const on = (k) => TRUE.includes(String(process.env[k] || "").toLowerCase());
   if (kind === "lab") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_LAB");
-  // pr (open the upstream PR / post a revise reply) rides on fix + autofix.pr.enable.
-  if (kind === "pr") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_PR");
+  // pr (open the upstream PR / post a revise reply) rides on fix + autofix.pr.enable,
+  // and is off while the worker found the token unable to open upstream PRs
+  // (fine-grained token: compare-link fallback, not a half-working loop).
+  if (kind === "pr") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_PR") && getPrTokenState().pr_ok !== false;
   return on(kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX");
+}
+
+/**
+ * PR capability of the token as last checked by the host worker
+ * (worker-status.json `pr_token`, from `heimcloud-autofix-pr --check`).
+ * pr_ok false only on a real verdict (fine-grained token, no public_repo, wrong
+ * account); a network error during the check leaves it unknown (null).
+ * @returns {{ known: boolean, pr_ok: boolean|null, token_kind?: string, reason?: string, checked_at?: string }}
+ */
+export function getPrTokenState() {
+  try {
+    const st = JSON.parse(fs.readFileSync(path.join(getDataDir(), "queue", "worker-status.json"), "utf8"));
+    const t = st.pr_token;
+    if (t && typeof t === "object" && typeof t.pr_ok === "boolean") {
+      return {
+        known: true,
+        pr_ok: t.check_error && !t.pr_ok ? null : t.pr_ok,
+        token_kind: typeof t.token_kind === "string" ? t.token_kind.slice(0, 20) : undefined,
+        reason: typeof t.reason === "string" ? t.reason.slice(0, 300) : undefined,
+        checked_at: t.checked_at,
+      };
+    }
+  } catch {
+    /* unknown */
+  }
+  return { known: false, pr_ok: null };
+}
+
+/** Board status line for the PR loop: on / off (setting) / disabled (token). */
+export function prLoopState() {
+  const on = (k) => TRUE.includes(String(process.env[k] || "").toLowerCase());
+  if (!(on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_PR"))) return { on: false, label: "PR loop off" };
+  const t = getPrTokenState();
+  if (t.pr_ok === false) {
+    return {
+      on: false,
+      token: true,
+      label:
+        t.token_kind === "fine-grained"
+          ? "PR loop disabled: token kind fine-grained, cannot open upstream PRs (needs a classic PAT with public_repo); compare links"
+          : `PR loop disabled: the token cannot open upstream PRs${t.reason ? ` (${t.reason})` : ""}; compare links`,
+    };
+  }
+  return { on: true, label: `PR loop on${t.token_kind ? ` (token ${t.token_kind})` : ""}` };
 }
 
 /**
@@ -108,6 +154,12 @@ export function ensureDir(d) {
     }
     throw err;
   }
+}
+
+/** The incident fields every job carries, redacted like buildJobPayload. */
+export function redactedIncidentFields(incident) {
+  const p = buildJobPayload("pr", incident);
+  return { report_hash: p.report_hash, unit: p.unit, severity: p.severity, class: p.class, neo_version: p.neo_version, logs_excerpt: p.logs_excerpt };
 }
 
 /**
@@ -280,12 +332,7 @@ export function enqueueLabRetry(incident, prev) {
     job_version: 1,
     kind: "lab",
     incident_id: incident.id,
-    report_hash: incident.report_hash,
-    unit: incident.unit,
-    severity: incident.severity,
-    class: incident.class,
-    neo_version: incident.neo_version,
-    logs_excerpt: incident.logs_excerpt,
+    ...redactedIncidentFields(incident),
     branch,
     fix_job: pick("fix_job", /^fix-\d+-[A-Za-z0-9-]+$/),
     attempt: Math.max(1, Math.floor(Number(prev.attempt) || 1)),
@@ -347,13 +394,15 @@ export function labRetrySource(incident, latestFixEvent, latestCancelEvent = nul
  * (token added later, PR automation switched on, API error): a kind "pr" job
  * from the DB's latest lab-passed fix_result, never from the form.
  */
-export function enqueueOpenPrJob(incident, fixMeta) {
+export function enqueueOpenPrJob(incident, fixMeta, { skipped = null } = {}) {
   if (!isAutofixKindEnabled("pr")) {
-    throw new QueueError("autofix_disabled", "PR automation is not enabled on this host (autofix.pr.enable).");
+    throw new QueueError("autofix_disabled", "PR automation is not enabled on this host (autofix.pr.enable), or the token cannot open upstream PRs.");
   }
   const branch = String(fixMeta?.branch || "");
-  if (!fixMeta || fixMeta.lab !== "passed" || !LAB_BRANCH.test(branch) || branch.includes("..")) {
-    throw new QueueError("no_tested_branch", `Incident #${incident.id} has no lab-passed fix branch to open a PR from.`);
+  // Lab passed, or the admin skipped the lab test (retry of a draft "NOT lab-tested" PR).
+  const untested = Boolean(skipped && skipped.branch === branch);
+  if (!fixMeta || (fixMeta.lab !== "passed" && !untested) || !LAB_BRANCH.test(branch) || branch.includes("..")) {
+    throw new QueueError("no_tested_branch", `Incident #${incident.id} has no lab-passed (or lab-skipped) fix branch to open a PR from.`);
   }
   if (findPendingJobs("pr", incident.id).length) throw new QueueError("already_queued", `A PR job for incident #${incident.id} is already queued.`);
   const target = fixMeta.target_repo || resolveTargetRepo(incident);
@@ -361,20 +410,51 @@ export function enqueueOpenPrJob(incident, fixMeta) {
   const job = {
     job_version: 1,
     kind: "pr",
-    mode: "open",
+    mode: untested ? "untested" : "open",
+    protected: untested && skipped.protected ? normalizeProtected(skipped.protected) || undefined : undefined,
     incident_id: incident.id,
-    report_hash: incident.report_hash,
-    unit: incident.unit,
-    severity: incident.severity,
-    class: incident.class,
-    neo_version: incident.neo_version,
-    logs_excerpt: incident.logs_excerpt,
+    ...redactedIncidentFields(incident),
     target_repo: target,
     branch,
     head_sha: /^[0-9a-f]{40}$/.test(String(fixMeta.head_sha || "")) ? fixMeta.head_sha : undefined,
     pr_title: typeof fixMeta.pr_title === "string" ? fixMeta.pr_title.slice(0, 300) : incident.prepared_pr_title || undefined,
     pr_body: typeof fixMeta.pr_body === "string" ? fixMeta.pr_body.slice(0, 20000) : incident.prepared_pr_body || undefined,
     lab_report: fixMeta.lab_report && typeof fixMeta.lab_report === "object" ? fixMeta.lab_report : undefined,
+    enqueued_at: new Date().toISOString(),
+    enqueued_by: "admin",
+  };
+  const dir = queueDir("pr");
+  ensureDir(dir);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.join(dir, `${incident.id}-${ts}.json`);
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o660 });
+  fs.renameSync(tmp, dest);
+  return { path: dest, job };
+}
+
+/**
+ * Admin "Adopt PR": a kind "pr" job (mode adopt) for an existing open PR on
+ * the incident's target upstream. The worker verifies it is a PR from the
+ * heimcloud fork (fix/* | ops/*) before tracking it.
+ */
+export function enqueueAdoptPrJob(incident, prNumber) {
+  if (!isAutofixKindEnabled("pr")) {
+    throw new QueueError("autofix_disabled", "PR automation is not enabled on this host (autofix.pr.enable), or the token cannot open upstream PRs.");
+  }
+  const n = Number(prNumber);
+  if (!Number.isInteger(n) || n < 1 || n > 1e9) throw new QueueError("bad_pr_number", "Give the number of the open PR to adopt.");
+  if (findPendingJobs("pr", incident.id).length) throw new QueueError("already_queued", `A PR job for incident #${incident.id} is already queued.`);
+  const target = resolveTargetRepo(incident);
+  if (!isRepoAllowed(target)) throw new QueueError("unknown_target", `Target repo ${String(target).slice(0, 120)} is not allowlisted.`);
+  const job = {
+    job_version: 1,
+    kind: "pr",
+    mode: "adopt",
+    pr_number: n,
+    incident_id: incident.id,
+    ...redactedIncidentFields(incident),
+    target_repo: target,
     enqueued_at: new Date().toISOString(),
     enqueued_by: "admin",
   };

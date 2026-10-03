@@ -281,3 +281,198 @@ test("--check-token: both scopes checked, exit 1 when the API side fails, never 
   assert.equal(code, 0, out.join("\n"));
   assert.ok(!out.join("\n").includes(TOKEN));
 });
+
+// ------------------------------------------------ open failure / adoption
+
+const forkPr = (number, ref, extra = {}) => ({
+  number,
+  html_url: `https://github.com/madebydamo/neo/pull/${number}`,
+  state: "open",
+  draft: false,
+  merged: false,
+  merged_at: null,
+  title: `fix: ${ref}`,
+  body: "Opened from the compare link.",
+  user: REVIEWER,
+  head: { ref, sha: "c".repeat(40), repo: { full_name: "heimcloud/neo", owner: "heimcloud" } },
+  base: { ref: "dev", repo: { full_name: "madebydamo/neo" } },
+  requested_reviewers: [],
+  ...extra,
+});
+const recordFile = (id) => path.join(tmp, "pr-state", `${id}.json`);
+function captureLog(fn) {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    return { ret: fn(), lines };
+  } finally {
+    console.log = orig;
+  }
+}
+
+test("open failure (HTTP 403): pr_open_failed with a redacted reason, no PR record; Retry open PR adopts the PR opened from the compare link", () => {
+  patchState((s) => (s.create_fail = { status: 403, message: "Resource not accessible by personal access token" }));
+  const name = enqueue("fix", 50, { validation: true, report_hash: "validation-pr-loop-50", unit: "docker-ops.service" });
+  const { lines } = captureLog(() => W.main([]));
+  const r = result("fix", name);
+  assert.equal(r.status, "pr_open_failed", r.summary);
+  assert.equal(r.pr_number, undefined);
+  assert.match(r.pr_error, /HTTP 403/);
+  assert.match(r.compare_url, /compare\/dev\.\.\.heimcloud:neo:ops\/validation-pr-loop-50/);
+  assert.match(r.summary, /Retry open PR/);
+  const side = prResults(50).pop();
+  assert.equal(side.pr_event, "error");
+  assert.equal(side.pr_number, undefined);
+  assert.equal(fs.existsSync(recordFile(50)), false, "no autofix-pr record without a PR");
+  // BUG-7: the job log line names the status, never "undefined".
+  assert.ok(lines.some((l) => /fix incident 50: pr_open_failed - /.test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => /undefined/.test(l)), lines.join("\n"));
+
+  // Damo opened it from the compare link; Retry open PR adopts it (no second create).
+  patchState((s) => {
+    delete s.create_fail;
+    s.pulls[60] = forkPr(60, "ops/validation-pr-loop-50");
+  });
+  const posts = ghLog().filter((l) => l.method === "POST" && /\/pulls$/.test(l.path)).length;
+  enqueue("pr", 50, { mode: "open", branch: "ops/validation-pr-loop-50", head_sha: r.head_sha, pr_title: r.pr_title, pr_body: r.pr_body, target_repo: "madebydamo/neo" });
+  W.main([]);
+  const adopted = prResults(50).pop();
+  assert.equal(adopted.pr_event, "adopted");
+  assert.equal(adopted.pr_number, 60);
+  assert.equal(JSON.parse(fs.readFileSync(recordFile(50), "utf8")).number, 60);
+  assert.equal(ghLog().filter((l) => l.method === "POST" && /\/pulls$/.test(l.path)).length, posts, "adopted, not created");
+});
+
+test("pr-poll discovery: untracked fork PRs mapping to an incident are adopted with a baseline; only new reviewer comments drive a revise", async () => {
+  // Fake sqlite3 CLI (worker contract: -readonly -json db sql) over the app DB.
+  fs.writeFileSync(
+    path.join(bin, "sqlite3"),
+    `#!${process.execPath}
+const Database = require(${JSON.stringify(path.resolve(here, "..", "node_modules", "better-sqlite3"))});
+const a = process.argv.slice(2);
+if (a[0] !== "-readonly" || a[1] !== "-json") process.exit(2);
+const db = new Database(a[2], { readonly: true, fileMustExist: true });
+const rows = db.prepare(a[3]).all();
+process.stdout.write(rows.length ? JSON.stringify(rows) : "");
+`,
+    { mode: 0o755 },
+  );
+  const db = await import("../lib/db.js");
+  const byBranch = db.upsertIncident({ report_hash: "disc-1", unit: "docker-searxng.service", severity: "warning", logs_excerpt: "engine x failed" }).incident;
+  db.addIncidentEvent(byBranch.id, "fix_result", "pushed", { branch: "fix/discovered-a", status: "compare_ready" });
+  const byBody = db.upsertIncident({ report_hash: "disc-2", unit: "docker-searxng.service", severity: "warning", logs_excerpt: "engine y failed" }).incident;
+  const closed = db.upsertIncident({ report_hash: "disc-3", unit: "docker-searxng.service", severity: "warning", logs_excerpt: "z" }).incident;
+  db.updateIncident(closed.id, { status: "closed" });
+  db._resetDbForTests?.();
+  patchState((s) => {
+    s.pulls[70] = forkPr(70, "fix/discovered-a");
+    s.pulls[71] = forkPr(71, "fix/some-change", { body: `Heimcloud Ops incident #${byBody.id}\n\nhand-made PR` });
+    s.pulls[72] = forkPr(72, "fix/unrelated");
+    s.pulls[73] = forkPr(73, `ops/incident-${closed.id}`);
+    s.pulls[74] = forkPr(74, "fix/discovered-a", { head: { ref: "fix/discovered-a", sha: "d".repeat(40), repo: { full_name: "someone/neo", owner: "someone" } } });
+    s.issue_comments = { ...(s.issue_comments || {}), 70: [{ id: 700, user: REVIEWER, body: "old remark before adoption", created_at: "2026-10-01T09:00:00Z" }] };
+  });
+  const before = queued("fix").length;
+  const { lines } = captureLog(() => W.main(["--pr-poll"]));
+  const a = prResults(byBranch.id);
+  assert.deepEqual(a.map((x) => x.pr_event).slice(0, 1), ["adopted"], JSON.stringify(a));
+  assert.equal(a[0].pr_number, 70);
+  assert.equal(prResults(byBody.id)[0].pr_number, 71);
+  assert.deepEqual(prResults(closed.id), [], "closed incident: not adopted");
+  for (const n of [72, 74]) assert.ok(!fs.readdirSync(path.join(tmp, "pr-state")).some((f) => JSON.parse(fs.readFileSync(path.join(tmp, "pr-state", f), "utf8")).number === n), `PR ${n} not adopted`);
+  assert.equal(JSON.parse(fs.readFileSync(recordFile(byBranch.id), "utf8")).adopted_by, "discovery");
+  assert.equal(queued("fix").length, before, "comments before adoption are the baseline");
+  assert.ok(lines.some((l) => new RegExp(`pr-poll incident ${byBranch.id} PR #70: adopted`).test(l)), lines.join("\n"));
+  assert.ok(!lines.some((l) => /undefined/.test(l)), lines.join("\n"));
+  // A second poll does not adopt again.
+  W.main(["--pr-poll"]);
+  assert.equal(prResults(byBranch.id).filter((x) => x.pr_event === "adopted").length, 1);
+  // A new reviewer comment → revise round on the adopted PR's branch.
+  patchState((s) => s.issue_comments[70].push({ id: 701, user: REVIEWER, body: "Please also keep the old engine list.", created_at: "2026-10-02T09:00:00Z" }));
+  W.main(["--pr-poll"]);
+  assert.equal(prResults(byBranch.id).pop().pr_event, "feedback");
+  const jobs = queued("fix").filter((n) => n.startsWith(`${byBranch.id}-`));
+  assert.equal(jobs.length, 1);
+  const rj = JSON.parse(fs.readFileSync(path.join(data, "queue", "fix", jobs[0]), "utf8"));
+  assert.equal(rj.branch, "fix/discovered-a");
+  assert.deepEqual(rj.revise, { round: 1, pr_number: 70 });
+  assert.match(rj.revise_feedback, /keep the old engine list/);
+  assert.doesNotMatch(rj.revise_feedback, /old remark/);
+  for (const n of queued("fix")) fs.rmSync(path.join(data, "queue", "fix", n));
+  patchState((s) => {
+    for (const n of [70, 71, 72, 73, 74]) s.pulls[n].state = "closed";
+  });
+  W.main(["--pr-poll"]);
+});
+
+test("admin Adopt PR (kind pr, mode adopt): fork PR tracked with a baseline; a foreign head → adopt_failed, nothing tracked", () => {
+  patchState((s) => {
+    s.pulls[80] = forkPr(80, "fix/by-hand");
+    s.pulls[81] = forkPr(81, "fix/by-hand", { head: { ref: "fix/by-hand", sha: "e".repeat(40), repo: { full_name: "someone/neo", owner: "someone" } } });
+  });
+  enqueue("pr", 55, { mode: "adopt", pr_number: 81, target_repo: "madebydamo/neo" });
+  W.main([]);
+  const bad = prResults(55).pop();
+  assert.equal(bad.pr_event, "adopt_failed");
+  assert.match(bad.summary, /not from heimcloud\/neo/);
+  assert.equal(fs.existsSync(recordFile(55)), false);
+  enqueue("pr", 55, { mode: "adopt", pr_number: 80, target_repo: "madebydamo/neo" });
+  W.main([]);
+  const ok = prResults(55).pop();
+  assert.equal(ok.pr_event, "adopted");
+  assert.equal(ok.pr_number, 80);
+  assert.equal(ok.branch, "fix/by-hand");
+  const rec = JSON.parse(fs.readFileSync(recordFile(55), "utf8"));
+  assert.equal(rec.adopted_by, "admin");
+  assert.equal(rec.baseline_pending, true);
+  patchState((s) => (s.pulls[80].state = "closed"));
+  W.main(["--pr-poll"]);
+});
+
+test("fine-grained token: --check-token says so (exit 2, push ok), the PR loop is disabled and a lab pass falls back to the compare link", () => {
+  const tf = path.join(tmp, "github-token");
+  const FG = "github_pat_11FAKE0fineGrained0123456789";
+  const setToken = (t, bump) => {
+    fs.chmodSync(tf, 0o600);
+    fs.writeFileSync(tf, `${t}\n`);
+    fs.chmodSync(tf, 0o400);
+    const at = new Date(Date.now() + bump * 1000);
+    fs.utimesSync(tf, at, at);
+  };
+  setToken(FG, 10);
+  patchState((s) => {
+    s.token = FG;
+    s.scopes = null;
+    s.pushable = ["heimcloud/neo", "heimcloud/highsea.neo"];
+  });
+  try {
+    const { ret, lines } = captureLog(() => W.main(["--check-token"]));
+    const text = lines.join("\n");
+    assert.equal(ret, 2, text);
+    assert.match(text, /token kind: fine-grained, cannot open upstream PRs/);
+    assert.match(text, /pr \(open upstream PRs, comment\): FAIL: .*fine-grained token: upstream PR creation unsupported/);
+    assert.match(text, /PR loop: disabled \(compare links only\)/);
+    assert.ok(!text.includes(FG));
+    const st = JSON.parse(fs.readFileSync(path.join(data, "queue", "worker-status.json"), "utf8"));
+    assert.equal(st.pr_token.pr_ok, false);
+    assert.equal(st.pr_token.token_kind, "fine-grained");
+
+    const posts = ghLog().filter((l) => l.method === "POST").length;
+    const name = enqueue("fix", 56, { validation: true, report_hash: "validation-pr-loop-56", unit: "docker-ops.service" });
+    W.main([]);
+    const r = result("fix", name);
+    assert.equal(r.status, "compare_ready", r.summary);
+    assert.equal(r.pr_number, undefined);
+    assert.match(r.summary, /PR loop disabled: token kind fine-grained, cannot open upstream PRs/);
+    assert.equal(ghLog().filter((l) => l.method === "POST").length, posts, "no PR attempt");
+    assert.match(W.main(["--pr-poll"]) === 0 ? "ok" : "x", /ok/);
+  } finally {
+    setToken(TOKEN, 20);
+    patchState((s) => {
+      s.token = TOKEN;
+      s.scopes = "public_repo";
+    });
+  }
+  assert.equal(W.prCapability(W.config(), { force: true }).pr_ok, true);
+});

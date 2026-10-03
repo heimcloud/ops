@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   GENERIC_CHECKS,
   checkLabel,
@@ -95,6 +95,7 @@ export function labConfig(env = process.env) {
     systemdRun: env.LABTEST_SYSTEMD_RUN_BIN || "systemd-run",
     journalctl: env.LABTEST_JOURNALCTL_BIN || "journalctl",
     flock: env.LABTEST_FLOCK_BIN || "flock",
+    git: env.LABTEST_GIT_BIN || "git",
     docker: env.LABTEST_DOCKER_BIN || "docker",
     node: env.LABTEST_NODE_BIN || process.execPath,
     self: env.LABTEST_SELF || SELF,
@@ -647,13 +648,14 @@ export async function detectProtected(cfg, branch, headSha) {
   if (!cfg.labSharesOps || !cfg.protectedPaths.length) return { checked: false, hit: false, unknown: false, paths: [] };
   const nixArgs = ["--extra-experimental-features", "nix-command flakes"];
   const unknown = (detail) => ({ checked: true, hit: false, unknown: true, paths: [], detail });
-  const bm = await runCmd(cfg.nix, [...nixArgs, "flake", "metadata", "--json", flakeUrlFor(cfg, branch)], { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake });
+  const bm = await runCmd(cfg.nix, [...nixArgs, "flake", "metadata", "--json", pinnedFlakeUrl(cfg, branch, headSha)], { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake });
   let branchSrc;
   try {
     const j = JSON.parse(bm.stdout);
     branchSrc = j.path;
     const rev = j.revision || j.locked?.rev;
-    if (rev !== headSha) return { ...unknown("fork branch tip is not the gated commit"), moved: /^[0-9a-f]{40}$/.test(String(rev || "")) };
+    // Pinned URL: any other revision is a fetcher oddity, not a moved branch.
+    if (rev !== headSha) return unknown("the pinned fork source is not the gated commit");
   } catch {
     return unknown(`nix flake metadata of the fork branch failed (exit ${bm.status})`);
   }
@@ -793,7 +795,52 @@ export function flakeUrlFor(cfg, branch) {
   return cfg.flakeUrl.replace("{branch}", branch);
 }
 
-async function build(cfg, run, branch) {
+/**
+ * Override URL pinned to the gated commit. A branch URL
+ * (github:<fork>/<branch>) goes through root's Nix GitHub ref cache and can
+ * resolve to an older tip; a commit URL is immutable. One-off
+ * --override-input, never written to persistent config.
+ *   github:<owner>/<repo>/{branch}[?…]  → github:<owner>/<repo>/<sha>[?…]
+ *   git+https://…?ref={branch}          → …?ref=<branch>&rev=<sha>
+ *   a template with {rev}               → {branch} and {rev} substituted
+ */
+export function pinnedFlakeUrl(cfg, branch, sha) {
+  const t = String(cfg.flakeUrl);
+  if (!/^[0-9a-f]{40}$/.test(String(sha || ""))) throw new Error("pinnedFlakeUrl needs a full commit id");
+  if (t.includes("{rev}")) return t.replace("{branch}", branch).replace("{rev}", sha);
+  if (/^github:/.test(t)) return t.replace("{branch}", sha);
+  const u = t.replace("{branch}", branch);
+  return `${u}${u.includes("?") ? "&" : "?"}rev=${sha}`;
+}
+
+/** https clone URL of the fork behind the override template (for git ls-remote). */
+export function forkGitUrl(cfg) {
+  const t = String(cfg.flakeUrl);
+  let m = /^github:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)/.exec(t);
+  if (!m) m = /^git\+https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[?#]|$)/.exec(t);
+  return m ? `https://github.com/${m[1]}/${m[2]}.git` : null;
+}
+
+/**
+ * Live tip of the fork branch straight from GitHub (git ls-remote, no Nix
+ * cache, unauthenticated). {sha} or {sha:null, detail} when it cannot tell.
+ */
+export async function liveTip(cfg, branch) {
+  const url = forkGitUrl(cfg);
+  if (!url) return { sha: null, detail: "no GitHub fork URL in the override template" };
+  const r = await runCmd(cfg.git, ["ls-remote", "--heads", url, `refs/heads/${branch}`], {
+    timeoutSec: 60,
+    graceSec: cfg.killGraceSec,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "/bin/false" },
+  });
+  if (r.status !== 0) return { sha: null, detail: `git ls-remote exit ${r.status}` };
+  const line = String(r.stdout || "").split("\n").find((l) => l.endsWith(`\trefs/heads/${branch}`));
+  if (!line) return { sha: null, missing: true, detail: "branch not found on the fork" };
+  const sha = line.split("\t")[0];
+  return /^[0-9a-f]{40}$/.test(sha) ? { sha } : { sha: null, detail: "unparsable git ls-remote output" };
+}
+
+async function build(cfg, run, branch, sha) {
   const attr = `${cfg.flake}#nixosConfigurations.${cfg.nixosConfig}.config.system.build.toplevel`;
   const args = [
     "--extra-experimental-features",
@@ -804,7 +851,7 @@ async function build(cfg, run, branch) {
     "--no-write-lock-file",
     "--override-input",
     cfg.input,
-    flakeUrlFor(cfg, branch),
+    pinnedFlakeUrl(cfg, branch, sha),
     attr,
   ];
   const r = await runCmd(cfg.nix, args, { timeoutSec: cfg.buildSec, graceSec: cfg.killGraceSec, cwd: cfg.flake });
@@ -824,10 +871,10 @@ async function build(cfg, run, branch) {
  * Revision the override resolved to (same fetcher cache as the build). Used to
  * refuse activating a fork branch that moved after the worker gated it.
  */
-async function resolvedRev(cfg, branch) {
+async function resolvedRev(cfg, branch, sha) {
   const r = await runCmd(
     cfg.nix,
-    ["--extra-experimental-features", "nix-command flakes", "flake", "metadata", "--json", "--no-write-lock-file", "--override-input", cfg.input, flakeUrlFor(cfg, branch), cfg.flake],
+    ["--extra-experimental-features", "nix-command flakes", "flake", "metadata", "--json", "--no-write-lock-file", "--override-input", cfg.input, pinnedFlakeUrl(cfg, branch, sha), cfg.flake],
     { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake },
   );
   if (r.status !== 0) return { rev: null, infra: true, detail: `nix flake metadata exit ${r.status}` };
@@ -1070,7 +1117,7 @@ export async function runLab(cfg, instance) {
     cfg = lt.cfg;
     result.target_repo = lt.target?.upstream || spec.targetRepo || "madebydamo/neo";
     result.flake_input = cfg.input;
-    result.flake_url = flakeUrlFor(cfg, spec.branch);
+    result.flake_url = pinnedFlakeUrl(cfg, spec.branch, spec.headSha);
     result.plan_errors = spec.planErrors.map(red);
     // A check the runner drops must be visible on the card, never vanish.
     for (const e of result.plan_errors.slice(0, 6)) run.note(`check ${e.replace(/^(#\d+):\s*/, "$1 dropped: ")}`);
@@ -1113,12 +1160,18 @@ export async function runLab(cfg, instance) {
     // Protected change (ops / Hermes / swag / base system)? Detected here from
     // the deployed neo source vs the fork branch, independent of what the
     // worker claims. Protected → only with a valid admin approval.
-    const prot = await detectProtected(cfg, spec.branch, spec.headSha);
-    if (prot.moved) {
+    // The build is pinned to the gated commit (head_sha), so Nix's ref cache
+    // cannot hand us an older tip. "Moved" only when GitHub itself says the
+    // branch now points elsewhere (git ls-remote); unknown → test the pin.
+    const tip = await liveTip(cfg, spec.branch);
+    result.live_tip = tip.sha ? tip.sha.slice(0, 12) : null;
+    if (tip.sha && tip.sha !== spec.headSha) {
       result.failed_stage = "validating";
-      result.reason = "fix branch moved after the worker gated it (fork tip is not the gated commit); not activating";
+      result.reason = `fix branch moved after the worker gated it (live fork tip ${tip.sha.slice(0, 12)} is not the gated commit ${spec.headSha.slice(0, 12)}, git ls-remote); not activating`;
       return result;
     }
+    if (!tip.sha) run.note(`live fork tip not checked (${tip.detail}); testing the gated commit ${spec.headSha.slice(0, 12)} (pinned)`);
+    const prot = await detectProtected(cfg, spec.branch, spec.headSha);
     protectedRun = prot.hit || prot.unknown || Boolean(spec.approval) || spec.claimsProtected;
     if (protectedRun) {
       const desc = describeProtected(prot.paths, cfg.basePaths);
@@ -1158,7 +1211,7 @@ export async function runLab(cfg, instance) {
     result.pre = { failed_units: pre.failed.length, state: pre.state };
 
     run.setStage("building");
-    const b = await build(cfg, run, spec.branch);
+    const b = await build(cfg, run, spec.branch, spec.headSha);
     if (!b.ok) {
       result.verdict = b.infra ? "error" : "fail";
       result.failed_stage = "build";
@@ -1167,13 +1220,13 @@ export async function runLab(cfg, instance) {
       run.note(b.log);
       return result;
     }
-    const rev = await resolvedRev(cfg, spec.branch);
+    const rev = await resolvedRev(cfg, spec.branch, spec.headSha);
     result.tested_rev = rev.rev ? rev.rev.slice(0, 12) : null;
     if (rev.rev !== spec.headSha) {
       result.failed_stage = "building";
       result.reason = rev.rev
-        ? "fix branch moved after the worker gated it (fork tip is not the gated commit); not activating"
-        : `could not confirm the fork tip is the gated commit (${rev.detail}); not activating`;
+        ? `the pinned override resolved to ${rev.rev.slice(0, 12)}, not the gated commit; not activating`
+        : `could not confirm the override is the gated commit (${rev.detail}); not activating`;
       return result;
     }
     result.generation.lab_toplevel = path.basename(b.toplevel).slice(0, 44);
@@ -1504,7 +1557,17 @@ export async function main(argv = process.argv.slice(2)) {
   return 2;
 }
 
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+function isMainModule(metaUrl) {
+  // Node runs the main module from its realpath (symlinks resolved) while
+  // argv[1] keeps the path as typed (/app -> store path in the container).
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(path.resolve(process.argv[1]));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule(import.meta.url)) {
   main().then((code) => process.exit(code), (err) => {
     console.error(`heimcloud-ops-labtest: ${err?.stack || err}`);
     process.exit(1);

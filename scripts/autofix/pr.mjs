@@ -294,12 +294,26 @@ function prSummary(p) {
   };
 }
 
-function ours(cfg, p, branch) {
-  return (
+const PR_BRANCH_RE = /^(fix|ops)\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+
+/** PR from the target fork (fix/* | ops/*) into the upstream base branch. */
+export function isForkPr(cfg, p) {
+  return Boolean(
     p &&
-    String(p.user?.login || "").toLowerCase() === cfg.botLogin.toLowerCase() &&
-    String(p.head?.repo?.full_name || "").toLowerCase() === cfg.target.fork.toLowerCase() &&
-    p.head?.ref === branch
+      String(p.head?.repo?.full_name || "").toLowerCase() === cfg.target.fork.toLowerCase() &&
+      PR_BRANCH_RE.test(String(p.head?.ref || "")) &&
+      String(p.base?.repo?.full_name || "").toLowerCase() === cfg.target.upstream.toLowerCase() &&
+      (!p.base?.ref || p.base.ref === cfg.target.baseRef),
+  );
+}
+
+/** Ours to adopt: a fork PR opened by the bot or by the reviewer (compare link). */
+function ours(cfg, p, branch) {
+  const author = String(p?.user?.login || "").toLowerCase();
+  return Boolean(
+    isForkPr(cfg, p) &&
+      p.head?.ref === branch &&
+      (author === cfg.botLogin.toLowerCase() || isTrustedAuthor(cfg, p.user)),
   );
 }
 
@@ -332,6 +346,34 @@ export function openOrAdoptPr(cfg, { branch, title, body, draft }) {
     if (again.pr) return { ok: true, adopted: true, ...prSummary(again.pr) };
   }
   return { ok: false, error: apiError(c), code: c.no_token ? "no_token" : c.refused ? "refused" : "api" };
+}
+
+/**
+ * Adopt one PR by number (admin "Adopt PR"): must be open and from the target
+ * fork. @returns {{ok:true, number, url, state, draft, head_sha, branch} | {ok:false, error}}
+ */
+export function getForkPr(cfg, number) {
+  const r = ghCall(cfg, "GET", `/repos/${cfg.target.upstream}/pulls/${Number(number)}`);
+  if (!okStatus(r, 200)) return { ok: false, error: apiError(r) };
+  if (!isForkPr(cfg, r.data)) return { ok: false, error: `PR #${Number(number)} is not from ${cfg.target.fork} (fix/* | ops/* branch into ${cfg.target.baseRef})` };
+  const sum = prSummary(r.data);
+  if (sum.state !== "open") return { ok: false, error: `PR #${sum.number} is ${sum.state}` };
+  return { ok: true, ...sum, branch: r.data.head.ref, title: String(r.data.title || ""), body: String(r.data.body || "") };
+}
+
+/** Open PRs of the upstream whose head is the target fork (discovery). */
+export function listForkPrs(cfg) {
+  const r = listAll(cfg, `/repos/${cfg.target.upstream}/pulls?state=open`);
+  if (!r.ok) return { ok: false, error: r.error, items: [] };
+  return { ok: true, items: r.items.filter((p) => isForkPr(cfg, p) && p.state === "open") };
+}
+
+/** Incident id a fork PR names: branch ops/incident-N | ops/validation-pr-loop-N, or the body/title. */
+export function incidentIdFromPr(p) {
+  const b = /(?:^|\/)(?:incident|validation-pr-loop)-(\d{1,9})$/.exec(String(p?.head?.ref || ""));
+  if (b) return Number(b[1]);
+  const t = /Heimcloud Ops incident #(\d{1,9})\b/.exec(String(p?.body || "")) || /\bincident #(\d{1,9})\b/i.exec(String(p?.title || ""));
+  return t ? Number(t[1]) : null;
 }
 
 export function postComment(cfg, number, body) {
@@ -444,6 +486,13 @@ export function feedbackBlock(cfg, number, items, slugs = []) {
  */
 export function pollPrs(cfg, deps) {
   const outcomes = [];
+  if (deps.findIncident) {
+    try {
+      outcomes.push(...withPrLock(cfg, () => discoverPrs(cfg, deps)));
+    } catch (err) {
+      outcomes.push({ discovery: true, error: String(err.message || err).slice(0, 200) });
+    }
+  }
   for (const rec0 of listRecords(cfg)) {
     if (["merged", "closed"].includes(rec0.state)) continue;
     const target = (cfg.targets || []).find((t) => t.upstream.toLowerCase() === String(rec0.upstream).toLowerCase());
@@ -459,6 +508,45 @@ export function pollPrs(cfg, deps) {
     }
   }
   return outcomes;
+}
+
+/**
+ * Discovery: open PRs on every allowlisted upstream whose head is
+ * <heimcloud fork>:<fix/*|ops/*> and that map to an incident (the incident has
+ * that branch, or the branch / body names it) are adopted: a record is written
+ * (comments so far = baseline) and an "adopted" result goes to the app.
+ * deps.findIncident({branch, id}) → {id, status, report_hash, …} | null (DB).
+ * Only tracked or adopted PRs get the feedback loop.
+ */
+export function discoverPrs(cfg, deps) {
+  const out = [];
+  const recs = listRecords(cfg);
+  const tracked = new Set(recs.map((r) => `${String(r.upstream).toLowerCase()}#${r.number}`));
+  const openByIncident = new Map(recs.filter((r) => r.state === "open").map((r) => [Number(r.incident_id), r]));
+  for (const target of cfg.targets || []) {
+    const tcfg = { ...cfg, target };
+    const l = listForkPrs(tcfg);
+    if (!l.ok) {
+      out.push({ discovery: true, target: target.upstream, error: l.error });
+      continue;
+    }
+    for (const p of l.items) {
+      if (tracked.has(`${target.upstream.toLowerCase()}#${p.number}`)) continue;
+      const inc = deps.findIncident({ branch: p.head.ref, id: incidentIdFromPr(p), target: target.upstream });
+      if (!inc || ["closed", "resolved"].includes(inc.status)) continue;
+      const cur = openByIncident.get(Number(inc.id));
+      if (cur && Number(cur.number) !== Number(p.number)) continue; // incident already has an open PR
+      const pr = prSummary(p);
+      const job = { incident_id: inc.id, branch: p.head.ref, report_hash: inc.report_hash, unit: inc.unit, severity: inc.severity, class: inc.class, neo_version: inc.neo_version, logs_excerpt: inc.logs_excerpt, pr_title: String(p.title || "").slice(0, 300), pr_body: String(p.body || "").slice(0, 20000) };
+      const rec = { ...newRecord(tcfg, job, pr, { adopted_by: "discovery", untested: null }), baseline_pending: true };
+      writeRecord(cfg, rec);
+      tracked.add(`${target.upstream.toLowerCase()}#${p.number}`);
+      openByIncident.set(Number(inc.id), rec);
+      deps.writeResult(stateResult(rec, "adopted", `Adopted PR #${pr.number} on ${target.upstream} (found by pr-poll: head ${target.fork.split("/")[0]}:${p.head.ref}); review comments from now on drive revise rounds.`));
+      out.push({ incident_id: inc.id, event: "adopted", pr_number: pr.number });
+    }
+  }
+  return out;
 }
 
 function stateResult(rec, event, summary, extra = {}) {
@@ -536,6 +624,15 @@ export function pollOne(cfg, rec, deps) {
   const markSeen = () => {
     for (const k of Object.keys(fb.newIds)) rec.seen[k] = [...new Set([...(rec.seen[k] || []), ...fb.newIds[k]])].slice(-2000);
   };
+  // Adopted PR (discovery / admin "Adopt PR"): what was there before adoption
+  // is the baseline, never acted on; only new reviewer comments drive rounds.
+  if (rec.baseline_pending) {
+    markSeen();
+    rec.baseline_pending = false;
+    writeRecord(cfg, rec);
+    deps.writeResult(stateResult(rec, "state", `PR #${n}: tracking from now on (${fb.feedback.length} earlier reviewer item(s) not acted on).`, { ignored: fb.ignored }));
+    return { incident_id: rec.incident_id, event: "baseline", ignored: fb.ignored };
+  }
   // A revise round still in flight: wait (unseen items are picked up after it).
   if (rec.revise_pending && deps.jobPending(rec.incident_id)) {
     writeRecord(cfg, rec);

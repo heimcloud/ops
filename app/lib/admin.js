@@ -37,7 +37,9 @@ import {
   enqueueLabRetry,
   labRetrySource,
   enqueueOpenPrJob,
+  enqueueAdoptPrJob,
   isAutofixKindEnabled,
+  prLoopState,
   getForkPushTokenState,
   NO_TOKEN_WARNING,
 } from "./queue.js";
@@ -515,15 +517,50 @@ export function createAdminRouter() {
     const incident = getIncident(id);
     if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
     try {
-      if (incident.status !== "pr_opened" || incident.draft_pr_number) throw Object.assign(new Error(`Incident #${id} has no lab-tested branch waiting for a PR.`), { status: 409, code: "no_tested_branch" });
-      const { path: jobPath } = enqueueOpenPrJob(incident, getLatestIncidentEvent(id, "fix_result")?.meta);
+      const fix = getLatestIncidentEvent(id, "fix_result");
+      const prEv = getLatestIncidentEvent(id, "pr_state");
+      const skip = getLatestIncidentEvent(id, "lab_skipped");
+      // "Open the PR now" (compare-only pass) or "Retry open PR" (open failed → Needs human).
+      const failed = fix?.meta?.status === "pr_open_failed" || (prEv?.meta?.pr_event === "error" && (!fix || prEv.id > fix.id));
+      const eligible = !incident.draft_pr_number && (incident.status === "pr_opened" || (incident.status === "needs_human" && failed));
+      if (!eligible) throw Object.assign(new Error(`Incident #${id} has no lab-tested branch waiting for a PR.`), { status: 409, code: "no_tested_branch" });
+      const skipped = skip && fix && skip.id > fix.id ? skip.meta : null;
+      const { path: jobPath, job } = enqueueOpenPrJob(incident, fix?.meta, { skipped });
       const file = jobPath.split("/").pop();
-      addIncidentEvent(id, "pr_enqueued", "PR job queued (open the upstream PR from the lab-tested branch)", { job_file: file, job_kind: "pr" });
+      addIncidentEvent(id, "pr_enqueued", `PR job queued (${failed ? "retry: " : ""}open the upstream PR from the ${job.mode === "untested" ? "NOT lab-tested" : "lab-tested"} branch; an open PR for it is adopted)`, { job_file: file, job_kind: "pr", retry: failed || undefined });
       if (json) return res.json({ ok: true, message: "PR job queued", ...cardPayload(id, base) });
       return res.redirect(303, backTo(req, base, id, "msg", "PR job queued"));
     } catch (err) {
       const message = err.message || "Open PR failed";
       if (json) return res.status(err.status || 409).json({ ok: false, error: err.code || "open_pr_failed", message, ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "err", message));
+    }
+  });
+  // "Adopt PR": track a PR opened outside the worker (compare link, after a
+  // failed open, by hand). The worker checks it is an open fork PR.
+  router.post("/incidents/:id/adopt-pr", (req, res) => {
+    const base = req.adminBase;
+    const json = wantsJson(req);
+    if (ADMIN_READ_ONLY && json) return res.status(403).json({ ok: false, error: "read_only", message: "Admin is read-only (ADMIN_READ_ONLY)." });
+    if (refuseMutations(res, base)) return;
+    const id = Number(req.params.id);
+    const incident = getIncident(id);
+    if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
+    try {
+      if (["closed", "resolved"].includes(incident.status)) throw Object.assign(new Error(`Incident #${id} is ${incident.status}.`), { status: 409, code: "incident_closed" });
+      const raw = String(req.body?.pr_number ?? "").trim().replace(/^#/, "");
+      if (!/^\d{1,9}$/.test(raw)) throw Object.assign(new Error("Give the number of the open PR to adopt."), { status: 400, code: "bad_pr_number" });
+      const n = Number(raw);
+      if (incident.draft_pr_number && Number(incident.draft_pr_number) === n) throw Object.assign(new Error(`PR #${n} is already tracked for incident #${id}.`), { status: 409, code: "already_tracked" });
+      const { path: jobPath } = enqueueAdoptPrJob(incident, n);
+      const file = jobPath.split("/").pop();
+      addIncidentEvent(id, "pr_enqueued", `PR job queued (adopt PR #${n})`, { job_file: file, job_kind: "pr", pr_number: n, mode: "adopt" });
+      const msg = `Adopt PR #${n} queued`;
+      if (json) return res.json({ ok: true, message: msg, ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "msg", msg));
+    } catch (err) {
+      const message = err.message || "Adopt PR failed";
+      if (json) return res.status(err.status || 409).json({ ok: false, error: err.code || "adopt_pr_failed", message, ...cardPayload(id, base) });
       return res.redirect(303, backTo(req, base, id, "err", message));
     }
   });
@@ -603,6 +640,7 @@ function capabilities() {
     push: isAutofixKindEnabled("push"),
     lab: isAutofixKindEnabled("lab"),
     pr: isAutofixKindEnabled("pr"),
+    prLoop: prLoopState(),
     protectedWatchdogSec: Math.max(60, Number(process.env.OPS_LAB_PROTECTED_WATCHDOG_SEC) || 600),
   };
 }

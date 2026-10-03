@@ -13,7 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { getDataDir, queueDir, ensureDir, findPendingJobs, isAutofixKindEnabled, QueueError } from "./queue.js";
+import { getDataDir, queueDir, ensureDir, findPendingJobs, isAutofixKindEnabled, QueueError, redactedIncidentFields } from "./queue.js";
 import { labApprovalMessage, normalizeProtected } from "./lab-checks.js";
 import { addIncidentEvent, updateIncident } from "./db.js";
 import { loadTargets, findTarget } from "./targets.js";
@@ -171,12 +171,7 @@ export function approveProtectedLab(incident, src, { now = new Date() } = {}) {
       job_version: 1,
       kind: "lab",
       incident_id: incident.id,
-      report_hash: incident.report_hash,
-      unit: incident.unit,
-      severity: incident.severity,
-      class: incident.class,
-      neo_version: incident.neo_version,
-      logs_excerpt: incident.logs_excerpt,
+      ...redactedIncidentFields(incident),
       branch: src.branch,
       fix_job: src.fix_job,
       attempt: src.attempt,
@@ -231,12 +226,7 @@ export function skipProtectedLab(incident, src) {
       kind: "pr",
       mode: "untested",
       incident_id: incident.id,
-      report_hash: incident.report_hash,
-      unit: incident.unit,
-      severity: incident.severity,
-      class: incident.class,
-      neo_version: incident.neo_version,
-      logs_excerpt: incident.logs_excerpt,
+      ...redactedIncidentFields(incident),
       target_repo: src.target_repo,
       branch: src.branch,
       head_sha: src.head_sha,
