@@ -11,6 +11,7 @@ import {
 } from "./redact.js";
 import { listDistinctCustomerRepoSlugs } from "./db.js";
 import { normalizeProtected } from "./lab-checks.js";
+import { resolveTargetRepo, isRepoAllowed } from "./github.js";
 
 export function getDataDir() {
   if (process.env.OPS_DATA_DIR) return process.env.OPS_DATA_DIR;
@@ -35,6 +36,8 @@ const TRUE = ["1", "true", "yes", "on"];
 export function isAutofixKindEnabled(kind) {
   const on = (k) => TRUE.includes(String(process.env[k] || "").toLowerCase());
   if (kind === "lab") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_LAB");
+  // pr (open the upstream PR / post a revise reply) rides on fix + autofix.pr.enable.
+  if (kind === "pr") return on("OPS_AUTOFIX_FIX") && on("OPS_AUTOFIX_PR");
   return on(kind === "triage" ? "OPS_AUTOFIX_TRIAGE" : "OPS_AUTOFIX_FIX");
 }
 
@@ -112,7 +115,7 @@ export function ensureDir(d) {
  * @param {'triage'|'fix'} kind
  * @param {object} incident
  */
-export function buildJobPayload(kind, incident) {
+export function buildJobPayload(kind, incident, extra = {}) {
   const knownSlugs = mergeKnownSlugs(
     listDistinctCustomerRepoSlugs(),
     ...getExtraRedactSlugs(),
@@ -129,6 +132,9 @@ export function buildJobPayload(kind, incident) {
     class: redact(incident.class || "unknown"),
     neo_version: redact(incident.neo_version || ""),
     logs_excerpt: redact(incident.logs_excerpt || ""),
+    // Allowlisted target (fix jobs): the worker clones / pushes / tests it.
+    ...(kind === "fix" ? { target_repo: resolveTargetRepo(incident) } : {}),
+    ...(extra.validation ? { validation: true } : {}),
     enqueued_at: new Date().toISOString(),
   };
 }
@@ -137,7 +143,7 @@ export function buildJobPayload(kind, incident) {
  * Atomic enqueue: write tmp then rename into queue/<kind>/.
  * @returns {{ path: string, job: object }}
  */
-export function enqueueJob(kind, incident) {
+export function enqueueJob(kind, incident, extra = {}) {
   if (kind !== "triage" && kind !== "fix") {
     throw new Error("invalid_job_kind");
   }
@@ -155,7 +161,13 @@ export function enqueueJob(kind, incident) {
       `A ${kind} job for incident #${incident.id} is already queued or running (${path.basename(pending[0])}).`,
     );
   }
-  const job = buildJobPayload(kind, incident);
+  if (kind === "fix" && incident.target_repo && !isRepoAllowed(incident.target_repo)) {
+    throw new QueueError(
+      "unknown_target",
+      `Target repo ${String(incident.target_repo).slice(0, 120)} is not allowlisted (services.ops.targets); set an allowlisted target on the incident first.`,
+    );
+  }
+  const job = buildJobPayload(kind, incident, extra);
   // Defense: never allow slug field
   if ("customer_repo_slug" in job) delete job.customer_repo_slug;
 
@@ -283,6 +295,9 @@ export function enqueueLabRetry(incident, prev) {
     pr_body: typeof prev.pr_body === "string" ? prev.pr_body.slice(0, 20000) : undefined,
     base_sha: pick("base_sha", /^[0-9a-f]{7,64}$/),
     head_sha: pick("head_sha", /^[0-9a-f]{7,64}$/),
+    target_repo: isRepoAllowed(prev.target_repo) ? prev.target_repo : prev.target_repo ? "(not allowlisted)" : undefined,
+    pr_number: Number.isInteger(prev.pr_number) && Number.isInteger(prev.revise_round) ? prev.pr_number : undefined,
+    revise_round: Number.isInteger(prev.pr_number) && Number.isInteger(prev.revise_round) ? prev.revise_round : undefined,
     // A protected job keeps its flag but never its approval: the worker turns
     // it back into "approve lab test" (fresh admin approval, fresh signature).
     protected: prev.protected || prev.approval ? normalizeProtected(prev.protected) || { areas: ["unverified"], paths: [], core: false, label: "unverified" } : undefined,
@@ -325,4 +340,50 @@ export function labRetrySource(incident, latestFixEvent, latestCancelEvent = nul
   } catch {
     return null;
   }
+}
+
+/**
+ * "Open PR" (admin) after a lab pass that ended with the compare link only
+ * (token added later, PR automation switched on, API error): a kind "pr" job
+ * from the DB's latest lab-passed fix_result, never from the form.
+ */
+export function enqueueOpenPrJob(incident, fixMeta) {
+  if (!isAutofixKindEnabled("pr")) {
+    throw new QueueError("autofix_disabled", "PR automation is not enabled on this host (autofix.pr.enable).");
+  }
+  const branch = String(fixMeta?.branch || "");
+  if (!fixMeta || fixMeta.lab !== "passed" || !LAB_BRANCH.test(branch) || branch.includes("..")) {
+    throw new QueueError("no_tested_branch", `Incident #${incident.id} has no lab-passed fix branch to open a PR from.`);
+  }
+  if (findPendingJobs("pr", incident.id).length) throw new QueueError("already_queued", `A PR job for incident #${incident.id} is already queued.`);
+  const target = fixMeta.target_repo || resolveTargetRepo(incident);
+  if (!isRepoAllowed(target)) throw new QueueError("unknown_target", `Target repo ${String(target).slice(0, 120)} is not allowlisted.`);
+  const job = {
+    job_version: 1,
+    kind: "pr",
+    mode: "open",
+    incident_id: incident.id,
+    report_hash: incident.report_hash,
+    unit: incident.unit,
+    severity: incident.severity,
+    class: incident.class,
+    neo_version: incident.neo_version,
+    logs_excerpt: incident.logs_excerpt,
+    target_repo: target,
+    branch,
+    head_sha: /^[0-9a-f]{40}$/.test(String(fixMeta.head_sha || "")) ? fixMeta.head_sha : undefined,
+    pr_title: typeof fixMeta.pr_title === "string" ? fixMeta.pr_title.slice(0, 300) : incident.prepared_pr_title || undefined,
+    pr_body: typeof fixMeta.pr_body === "string" ? fixMeta.pr_body.slice(0, 20000) : incident.prepared_pr_body || undefined,
+    lab_report: fixMeta.lab_report && typeof fixMeta.lab_report === "object" ? fixMeta.lab_report : undefined,
+    enqueued_at: new Date().toISOString(),
+    enqueued_by: "admin",
+  };
+  const dir = queueDir("pr");
+  ensureDir(dir);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const dest = path.join(dir, `${incident.id}-${ts}.json`);
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 2), { mode: 0o660 });
+  fs.renameSync(tmp, dest);
+  return { path: dest, job };
 }

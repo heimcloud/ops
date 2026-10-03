@@ -26,7 +26,75 @@
               targetAllowlist = mkOption {
                 type = types.str;
                 default = "madebydamo/neo,heimcloud/*";
-                description = "Comma-separated Create-PR allowlist (exact owner/repo or owner/*).";
+                description = "Deprecated and ignored: the allowlist is `targets` (one entry per upstream repo).";
+              };
+              targets = mkOption {
+                type = types.listOf (types.submodule {
+                  options = {
+                    upstream = lib.mkOption {
+                      type = types.strMatching "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+";
+                      description = "owner/repo the PR goes to (the incident's target repo), e.g. madebydamo/highsea.neo.";
+                    };
+                    fork = lib.mkOption {
+                      type = types.nullOr (types.strMatching "heimcloud/[A-Za-z0-9_.-]+");
+                      default = null;
+                      description = "heimcloud/<repo> the worker pushes fix/* and ops/* branches to (default heimcloud/<upstream repo>).";
+                    };
+                    baseRef = lib.mkOption {
+                      type = types.nullOr types.str;
+                      default = null;
+                      description = "Base branch / PR base (default master; the neo entry uses autofix.neoBaseRef).";
+                    };
+                    flakeInput = lib.mkOption {
+                      type = types.nullOr types.str;
+                      default = null;
+                      description = ''
+                        Host flake input the lab test overrides with the fork branch. null = find
+                        the one root input whose source is the upstream or the fork (a Neo plugin
+                        is input plugin<N>, N = its index in core.plugins). The neo entry uses
+                        autofix.lab.input.
+                      '';
+                    };
+                    lab = lib.mkOption {
+                      type = types.enum ["flake-override" "none"];
+                      default = "flake-override";
+                      description = "Lab method: flake-override (automated lab test) or none (needs_human, test by hand, then Skip lab).";
+                    };
+                    flakeUrl = lib.mkOption {
+                      type = types.nullOr types.str;
+                      default = null;
+                      description = "Override URL with {branch} (default github:<fork>/{branch}).";
+                    };
+                    units = lib.mkOption {
+                      type = types.listOf types.str;
+                      default = [];
+                      description = "Routing hint for triage: systemd unit names / globs (docker-sonarr*).";
+                    };
+                    paths = lib.mkOption {
+                      type = types.listOf types.str;
+                      default = [];
+                      description = "Routing hint: repo path prefixes.";
+                    };
+                    keywords = lib.mkOption {
+                      type = types.listOf types.str;
+                      default = [];
+                      description = "Routing hint: words in the logs.";
+                    };
+                    protectedPaths = lib.mkOption {
+                      type = types.nullOr (types.listOf types.str);
+                      default = null;
+                      description = "Path prefixes whose lab test needs an admin approval (default none; the neo entry uses autofix.denyPaths).";
+                    };
+                  };
+                });
+                default = [];
+                description = ''
+                  Allowlisted upstream repos of the autofix loop (settings.toml
+                  [[services.ops.targets]]). madebydamo/neo -> heimcloud/neo is always the
+                  first entry (an entry for it here only adds hints / overrides). Triage
+                  picks one; fix, push, lab and PR use it; unknown repos go to a human.
+                '';
+                rank = 9;
               };
               siteUrl = mkOption {
                 type = types.nullOr types.str;
@@ -293,6 +361,68 @@
                       default = {};
                       description = "Automated lab test of pushed fix branches on this host (default off).";
                       rank = 70;
+                    };
+                    pr = mkOption {
+                      type = types.submodule {
+                        options = {
+                          enable = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = ''
+                              Open the upstream PR automatically after a lab pass (draft + "NOT
+                              lab-tested" after Skip lab), poll it, and revise the branch on review
+                              feedback from the reviewer. Never merges. Uses the one GitHub token
+                              (credentials ops.autofixForkPushToken) through heimcloud-autofix-pr.
+                            '';
+                            rank = 0;
+                          };
+                          pollMinutes = mkOption {
+                            type = types.ints.between 2 5;
+                            default = 3;
+                            description = "Poll interval for PR state and review feedback (minutes).";
+                            rank = 10;
+                          };
+                          reviewerLogin = mkOption {
+                            type = types.str;
+                            default = "madebydamo";
+                            description = "The only GitHub login whose comments / reviews drive a revision (with reviewerId).";
+                            rank = 20;
+                          };
+                          reviewerId = mkOption {
+                            type = types.ints.positive;
+                            default = 94169482;
+                            description = "Numeric GitHub user id of reviewerLogin (login AND id must match; renames cannot spoof it).";
+                            rank = 21;
+                          };
+                          botLogin = mkOption {
+                            type = types.str;
+                            default = "heimcloud";
+                            description = "GitHub account the token belongs to (PR author; its own comments are ignored).";
+                            rank = 22;
+                          };
+                          maxRounds = mkOption {
+                            type = types.ints.between 1 10;
+                            default = 3;
+                            description = "Revision rounds per PR; after that new feedback goes to a human and nothing more is posted.";
+                            rank = 30;
+                          };
+                          stopPhrase = mkOption {
+                            type = types.str;
+                            default = "/ops stop";
+                            description = "A reviewer comment line equal to this stops the automation on that PR.";
+                            rank = 40;
+                          };
+                          draft = mkOption {
+                            type = types.bool;
+                            default = false;
+                            description = "Open lab-passed PRs as drafts too (untested ones always are).";
+                            rank = 50;
+                          };
+                        };
+                      };
+                      default = {};
+                      description = "Automatic upstream PR + review feedback loop (default off).";
+                      rank = 75;
                     };
                   };
                 };

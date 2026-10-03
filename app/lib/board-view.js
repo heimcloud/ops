@@ -12,6 +12,7 @@ import {
   ACTIONS,
   columnForStatus,
   needsHumanInput,
+  prInfo,
   incidentSummary,
   interpretTriage,
   safeLink,
@@ -56,7 +57,11 @@ export function severityClass(sev) {
  */
 export function buildCardModel(incident, events, attempts, redact, opts = {}) {
   const now = opts.now || new Date();
-  const hi = needsHumanInput(incident, events, attempts, { labAuto: opts.labAuto ?? isAutofixKindEnabled("lab") });
+  const hi = needsHumanInput(incident, events, attempts, {
+    labAuto: opts.labAuto ?? isAutofixKindEnabled("lab"),
+    prAuto: opts.prAuto ?? isAutofixKindEnabled("pr"),
+  });
+  const pri = prInfo(incident, events);
   const reasons = hi.reasons.map((r) => ({
     code: r.code,
     label: redact(r.label),
@@ -98,7 +103,23 @@ export function buildCardModel(incident, events, attempts, redact, opts = {}) {
     labQueued: Boolean(hi.labQueued),
     // Protected fix waiting for "Approve lab test" / skipped lab (warning chip).
     protectedLab: reasons.find((r) => r.protected)?.protected || null,
-    untested: reasons.some((r) => r.untested),
+    untested: reasons.some((r) => r.untested) || Boolean(pri?.untested && pri.state === "open"),
+    pr: pri
+      ? {
+          number: pri.number,
+          url: safeLink(pri.url, redact),
+          state: pri.state,
+          reviewState: pri.reviewState,
+          label: pri.label,
+          draft: pri.draft,
+          round: pri.round,
+          maxRounds: pri.maxRounds,
+          lastFeedback: pri.lastFeedbackAt ? formatZurich(pri.lastFeedbackAt) : "",
+          revisePending: pri.revisePending,
+          stopped: pri.stopped,
+          halted: pri.halted,
+        }
+      : null,
   };
   model.searchText = [
     `#${model.id}`,
@@ -255,6 +276,10 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
     if (!card.compareUrl) return "";
     return `<a class="${cls}${primary}" href="${esc(card.compareUrl)}" target="_blank" rel="noopener">${esc(ACTIONS.open_compare)} ${ICONS.ext}</a>`;
   }
+  if (action === "open_pr") {
+    if (!card.pr?.url) return "";
+    return `<a class="${cls}${primary}" href="${esc(card.pr.url)}" target="_blank" rel="noopener">${esc(ACTIONS.open_pr)} ${ICONS.ext}</a>`;
+  }
   if (caps.readOnly) return "";
   let path = `${base}/incidents/${id}`;
   let hidden = `<input type="hidden" name="_action" value="${esc(action)}" />`;
@@ -297,7 +322,14 @@ function actionForm(base, card, action, caps, { compact = false } = {}) {
   } else if (action === "skip_lab") {
     path += "/skip-lab";
     hidden = "";
-    confirm = `Open the compare link for incident #${id} WITHOUT a lab test? The card moves to Awaiting PR marked "NOT lab-tested".`;
+    confirm = caps.pr
+      ? `Skip the lab test for incident #${id}? The worker opens the upstream PR as a DRAFT marked "NOT lab-tested" (or, in a review round, pushes the reply marked so).`
+      : `Open the compare link for incident #${id} WITHOUT a lab test? The card moves to PR open marked "NOT lab-tested".`;
+  } else if (action === "create_pr") {
+    if (!caps.pr) return "";
+    path += "/open-pr";
+    hidden = "";
+    confirm = `Open the upstream PR for incident #${id} from its lab-tested branch? (never auto-merged)`;
   } else if (action === "retry_push") {
     if (!caps.push) return "";
     path += "/retry-push";
@@ -368,10 +400,27 @@ export function renderCard(card, base, caps, { hidden = false } = {}) {
     }
     ${card.protectedLab?.core ? `<div class="kc-warn" title="The fix touches the base system of the shared ops/lab host">BASE SYSTEM change: lab test needs your approval</div>` : ""}
     ${card.untested ? `<div class="kc-warn" title="Lab test skipped by admin">NOT lab-tested</div>` : ""}
+    ${card.pr?.number ? renderPrLine(card.pr) : ""}
     ${caps.runningJob && caps.runningJob.incidentId === card.id ? renderRunLine(caps.runningJob) : card.labQueued ? `<div class="kc-labq" title="Automated lab test: the worker runs it; no action needed">Automated lab test queued</div>` : ""}
     ${card.labRun && ["testing", "needs_human", "pr_opened", "fixing"].includes(card.status) ? renderLabLine(card.labRun) : ""}
     ${actions || (!caps.readOnly && card.allowedMoves.length) ? `<div class="kc-actions">${actions}${moveForm(base, card, caps)}</div>` : ""}
   </article>`;
+}
+
+/** One-line PR loop state on a card: #n, state, draft, round, last feedback. */
+export function renderPrLine(pr) {
+  const st = pr.state === "open" ? pr.reviewState : pr.state;
+  const bits = [
+    pr.draft && pr.state === "open" ? "draft" : "",
+    pr.maxRounds ? `round ${pr.round}/${pr.maxRounds}` : "",
+    pr.revisePending ? "revision running" : "",
+    pr.stopped ? "automation stopped" : "",
+    pr.halted ? `halted: ${String(pr.halted).replace(/_/g, " ")}` : "",
+  ].filter(Boolean);
+  const link = pr.url ? `<a href="${esc(pr.url)}" target="_blank" rel="noopener">PR #${esc(pr.number)} ${ICONS.ext}</a>` : `PR #${esc(pr.number)}`;
+  return `<div class="kc-pr pr-${esc(st)}" data-pr-state="${esc(st)}" title="${esc(pr.lastFeedback ? `Last reviewer comment ${pr.lastFeedback} (Zurich)` : "No reviewer comment yet")}">
+      ${link} <span class="chip pr-st">${esc(pr.label)}</span>${bits.length ? ` <span class="muted">${esc(bits.join(" · "))}</span>` : ""}${pr.lastFeedback ? ` <span class="muted">· feedback ${esc(pr.lastFeedback)}</span>` : ""}
+    </div>`;
 }
 
 const VERDICT_LABEL = { pass: "passed", fail: "failed", error: "error", cancelled: "cancelled" };
@@ -539,12 +588,20 @@ export function renderBoard({ cards, counts, filters, base, caps, status, flash 
     `triage ${caps.triage ? "on" : "off"}`,
     `fix ${caps.fix ? "on" : "off"}`,
     `fork token ${status.token}`,
+    `PR loop ${caps.pr ? "on" : "off"}`,
   ];
+  const validate =
+    caps.pr && caps.fix && !caps.readOnly
+      ? `<form class="act-form board-validate" method="post" action="${esc(`${base}/validation/pr-loop`)}" data-confirm="${esc(
+          "Run the PR-loop validation? Creates a synthetic incident, pushes a harmless doc-only branch (ops/validation-pr-loop-<id>) to heimcloud/neo, lab-tests it and opens a real PR on madebydamo/neo labelled [validation] DO NOT MERGE. Review-comment it once to drive one feedback round, then close it.",
+        )}"><input type="hidden" name="return_to" value="board" /><button class="kbtn" type="submit">Run PR-loop validation</button></form>`
+      : "";
   return `<div class="board-wrap${caps.readOnly ? " is-ro" : ""}">
     <div class="board-head">
       <h1>Incidents</h1>
       <p class="board-status muted">Autofix: ${statusBits.map(esc).join(" · ")}${status.allowlist ? ` · allowlist <code>${esc(status.allowlist.join(", "))}</code>` : ""}${caps.readOnly ? ` · <strong class="ro">read-only</strong>` : ""}</p>
       ${liveIndicator()}
+      ${validate}
     </div>
     ${flash}
     <div data-worker-slot>${panel}</div>
@@ -626,7 +683,8 @@ export function renderDrawer(d, base, caps) {
         ${kv("Triage verdict", triage)}
         ${kv("Lab test", d.lab ? `<span class="chip lab-${esc(d.lab)}">${esc(d.lab)}</span>` : `<span class="muted">no result</span>`)}
         ${kv("Draft branch", d.branch ? `<code>${esc(d.branch)}</code>` : `<span class="muted">—</span>`)}
-        ${kv("Compare / PR", `${compare}${d.draftPrUrl ? ` · <a href="${esc(d.draftPrUrl)}" target="_blank" rel="noopener">Draft PR ${ICONS.ext}</a>` : ""}`)}
+        ${kv("Compare / PR", `${compare}${d.pr?.url ? ` · <a href="${esc(d.pr.url)}" target="_blank" rel="noopener">PR #${esc(d.pr.number)} ${ICONS.ext}</a>` : d.draftPrUrl ? ` · <a href="${esc(d.draftPrUrl)}" target="_blank" rel="noopener">PR ${ICONS.ext}</a>` : ""}`)}
+        ${d.pr ? kv("PR loop", `<span class="chip pr-st">${esc(d.pr.label)}</span>${d.pr.draft && d.pr.state === "open" ? " · draft" : ""}${d.pr.maxRounds ? ` · round ${esc(d.pr.round)}/${esc(d.pr.maxRounds)}` : ""}${d.pr.revisePending ? " · revision running" : ""}${d.pr.stopped ? " · automation stopped" : ""}${d.pr.halted ? ` · halted (${esc(String(d.pr.halted).replace(/_/g, " "))})` : ""} · last reviewer comment ${d.pr.lastFeedback ? `${esc(d.pr.lastFeedback)} <span class="muted">Zurich</span>` : `<span class="muted">none</span>`}`) : ""}
       </dl>
       ${d.labRun ? renderLabReport(d.labRun) : d.labSummary ? `<section><h3>Lab-test result</h3><p class="mono">${esc(d.labSummary)}</p></section>` : ""}
       <section><h3>Fix attempts <span class="muted">(${d.attemptsTable.length})</span></h3>${attempts}</section>

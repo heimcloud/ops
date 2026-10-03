@@ -94,7 +94,7 @@ test("board renders every column with per-column counts instead of tiles", async
     for (const col of ["open", "triaged", "fixing", "testing", "needs_human", "pr_opened", "done"]) {
       assert.match(res.body, new RegExp(`data-col="${col}"`), col);
     }
-    assert.match(res.body, /Awaiting PR/);
+    assert.match(res.body, /PR open/);
     assert.match(res.body, /\d+ resolved · \d+ closed/);
     assert.match(res.body, new RegExp(`id="incident-${a.id}"[^>]*data-status="open"`));
     assert.match(res.body, /draggable="true"/);

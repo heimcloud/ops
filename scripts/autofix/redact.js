@@ -30,6 +30,9 @@ const HOME_PATH = /\/home\/[A-Za-z0-9._-]+/g;
 const URL_LIKE =
   /\b(?:github:[^\s`'"]+|git\+https:\/\/[^\s`'"]+|git\+ssh:\/\/[^\s`'"]+|https?:\/\/[^\s`'"]+)/gi;
 
+/** owner/repo of the public GitHub accounts the autofix loop works with. */
+const PUBLIC_REPO = /(?<![A-Za-z0-9_.-])(?:madebydamo|heimcloud)\/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?<![.])/g;
+
 const FQDN =
   /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b/gi;
 
@@ -98,6 +101,13 @@ export function redactIdentifyingDetails(text, opts = {}) {
     }
   });
 
+  // Repo names of the public upstreams / forks (madebydamo/highsea.neo) are
+  // not host names: keep "<owner>/<repo>" intact through the FQDN rule.
+  const keptRepos = [];
+  out = out.replace(PUBLIC_REPO, (m) => {
+    keptRepos.push(m);
+    return `\uE002${keptRepos.length - 1}\uE002`;
+  });
   out = out.replace(FQDN, (match) => {
     const lower = match.toLowerCase();
     if (DOMAIN_ALLOWLIST.has(lower)) return match;
@@ -108,6 +118,7 @@ export function redactIdentifyingDetails(text, opts = {}) {
     }
     return "[redacted-host]";
   });
+  out = out.replace(/\uE002(\d+)\uE002/g, (_, i) => keptRepos[Number(i)] ?? "");
 
   return out;
 }

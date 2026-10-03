@@ -15,7 +15,7 @@ export const COLUMNS = [
   { key: "fixing", label: "Fixing", statuses: ["fixing"], workerOwned: true },
   { key: "testing", label: "Testing", statuses: ["testing"], workerOwned: true },
   { key: "needs_human", label: "Needs human", statuses: ["needs_human"] },
-  { key: "pr_opened", label: "Awaiting PR", statuses: ["pr_opened"] },
+  { key: "pr_opened", label: "PR open", statuses: ["pr_opened"] },
   { key: "done", label: "Done", statuses: ["resolved", "closed"] },
 ];
 
@@ -25,7 +25,7 @@ export const STATUS_LABELS = {
   fixing: "Fixing",
   testing: "Testing",
   needs_human: "Needs human",
-  pr_opened: "Awaiting PR",
+  pr_opened: "PR open",
   resolved: "Resolved",
   closed: "Closed",
 };
@@ -49,7 +49,7 @@ export const TRANSITIONS = Object.freeze({
   triaged: ["open", "needs_human", "resolved", "closed"],
   // Only to unstick a job whose worker died; the worker otherwise owns it.
   fixing: ["needs_human"],
-  // Lab test skipped on the host: Damo tests manually, then Awaiting PR.
+  // Lab test skipped on the host: Damo tests manually, then PR open.
   testing: ["pr_opened", "needs_human", "triaged", "resolved", "closed"],
   needs_human: ["triaged", "resolved", "closed"],
   pr_opened: ["triaged", "needs_human", "resolved", "closed"],
@@ -93,8 +93,10 @@ export const ACTIONS = {
   retry_push: "Retry push",
   retry_lab: "Retry lab test",
   approve_lab: "Approve lab test",
-  skip_lab: "Skip lab, open compare link",
+  skip_lab: "Skip lab (NOT lab-tested)",
   open_compare: "Open compare link",
+  open_pr: "Open PR on GitHub",
+  create_pr: "Open the PR now",
   mark_config_error: "Mark config error & close",
   mark_resolved: "Mark resolved",
   close: "Close",
@@ -212,6 +214,47 @@ function pushReason(fixMeta, job) {
  * @param {object[]} attempts fix_attempts rows
  * @returns {{ needed: boolean, reasons: {code:string,label:string,action:string|null,actions:string[],detail?:string}[] }}
  */
+export const PR_STATE_LABELS = {
+  open: "open",
+  review_requested: "review requested",
+  changes_requested: "changes requested",
+  approved: "approved",
+  merged: "merged",
+  closed: "closed",
+};
+
+/**
+ * PR loop state of an incident from its latest pr_state / pr_merged event
+ * (worker PR results) plus the row's draft_pr_* columns, or null.
+ * { number, url, state, reviewState, label, draft, round, maxRounds,
+ *   lastFeedbackAt, revisePending, stopped, halted, untested, event, eventId }
+ */
+export function prInfo(incident, events = []) {
+  const ev = latestEvent(events, ["pr_state", "pr_merged"]);
+  const m = ev?.meta || {};
+  const number = Number(m.pr_number || incident?.draft_pr_number) || null;
+  if (!number && !ev) return null;
+  const state = ["merged", "closed"].includes(m.pr_state) ? m.pr_state : m.pr_state === "open" || number ? "open" : null;
+  const review = state === "open" && PR_STATE_LABELS[m.review_state] ? m.review_state : state || "open";
+  return {
+    number,
+    url: incident?.draft_pr_url || null,
+    state,
+    reviewState: review,
+    label: PR_STATE_LABELS[review] || review,
+    draft: Boolean(m.pr_draft),
+    round: Number(m.round) || 0,
+    maxRounds: Number(m.max_rounds) || null,
+    lastFeedbackAt: typeof m.last_feedback_at === "string" ? m.last_feedback_at : null,
+    revisePending: Boolean(m.revise_pending) && !["revised", "halted", "merged", "closed"].includes(m.pr_event),
+    stopped: Boolean(m.stopped),
+    halted: typeof m.halted === "string" ? m.halted : null,
+    untested: Boolean(m.untested),
+    event: m.pr_event || null,
+    eventId: ev ? Number(ev.id) : null,
+  };
+}
+
 export function needsHumanInput(incident, events = [], attempts = [], opts = {}) {
   // Automated lab stage enabled on the host (autofix.lab.enable): a queued /
   // running lab test is worker progress, not a human task.
@@ -268,7 +311,7 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
             "lab_cancelled",
             "Lab test cancelled",
             ["retry_lab", ...(incident.compare_url ? ["open_compare"] : [])],
-            "The lab job was cancelled before it ran. Retry it, or test the branch manually and move the card to Awaiting PR.",
+            "The lab job was cancelled before it ran. Retry it, or test the branch manually and move the card to PR open.",
           ),
         );
         break;
@@ -283,7 +326,7 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
             "lab_cancelled",
             "Lab test cancelled",
             ["retry_lab", ...(incident.compare_url ? ["open_compare"] : [])],
-            "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to Awaiting PR.",
+            "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to PR open.",
           ),
         );
         break;
@@ -299,10 +342,10 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
             "Lab test needed",
             incident.compare_url ? ["open_compare"] : [],
             fm?.lab === "cancelled"
-              ? "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to Awaiting PR."
+              ? "The automated lab test was cancelled before activation. Retry it, or test the branch manually and move the card to PR open."
               : fm?.status === "lab_queued"
-                ? "A lab job is queued but automated lab testing is off on the host. Test the branch manually, then move the card to Awaiting PR."
-                : "No lab result on the host (lab test skipped). Test the branch manually, then move the card to Awaiting PR.",
+                ? "A lab job is queued but automated lab testing is off on the host. Test the branch manually, then move the card to PR open."
+                : "No lab result on the host (lab test skipped). Test the branch manually, then move the card to PR open.",
           ),
         );
       }
@@ -311,7 +354,22 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
     case "needs_human": {
       if (fixBusy) break;
       const job = pushRetryJob(incident, fix);
-      if (fm?.status === "lab_approval_needed") {
+      const prEv = latestEvent(events, ["pr_state"]);
+      const pm = prEv && (!fix || Number(prEv.id) > Number(fix.id)) ? prEv.meta || {} : null;
+      if (pm?.pr_event === "closed") {
+        reasons.push(reason("pr_closed", `PR #${pm.pr_number} closed without merge`, ["open_pr", "start_fix", "close"], pm.summary));
+      } else if (pm?.pr_event === "halted" && pm.halted === "revision_cap") {
+        reasons.push(reason("revision_cap", `Revision cap reached (${pm.round}/${pm.max_rounds}): take over on GitHub`, ["open_pr", "mark_resolved", "close"], pm.summary));
+      } else if (pm?.pr_event === "halted") {
+        reasons.push(reason("pr_halted", `PR loop stopped on #${pm.pr_number} (${String(pm.halted || "error").replace(/_/g, " ")})`, ["open_pr", "start_fix", "mark_resolved"], pm.summary));
+      } else if (pm?.pr_event === "blocked") {
+        reasons.push(reason("pr_redaction_blocked", "Redaction gate blocked the PR text", ["start_fix", "close"], pm.summary));
+      } else if (fm?.status === "lab_unavailable") {
+        reasons.push(reason("no_lab_method", `No lab method for ${String(fm.target_repo || "this repo")}: test by hand`, ["skip_lab", "close"], fm.summary));
+      } else if (fm?.unknown_target || (!fm && triage?.meta?.target_unknown)) {
+        const t = fm?.unknown_target || triage.meta.target_unknown;
+        reasons.push(reason("unknown_target", `Unknown target repo (${t}): not allowlisted`, ["start_fix", "close"], "Triage or the job named a repo outside services.ops.targets. Set an allowlisted target repo on the incident (or add the repo to the allowlist), then Start fix."));
+      } else if (fm?.status === "lab_approval_needed") {
         // Protected path (ops / Hermes / swag / base system on the shared
         // ops/lab host): pushed, the lab test waits for the admin. The badge
         // stays until he approves or skips.
@@ -355,6 +413,10 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
     case "pr_opened": {
       const skipped = latestEvent(events, ["lab_skipped"]);
       const untested = Boolean(skipped && (!fix || skipped.id > fix.id));
+      const pr = prInfo(incident, events);
+      const prJobPending = Boolean(latestEvent(events, ["pr_enqueued"]) && (!pr?.eventId || latestEvent(events, ["pr_enqueued"]).id > pr.eventId));
+      // A tracked PR is worker progress (polling, revise rounds): no badge.
+      if ((pr && pr.number && pr.state === "open") || (untested && skipped?.meta?.pr_job && !(pr?.eventId > Number(skipped.id))) || prJobPending) break;
       if (incident.compare_url && untested) {
         const p = protectedInfo(skipped.meta?.protected);
         const r = reason(
@@ -370,14 +432,14 @@ export function needsHumanInput(incident, events = [], attempts = [], opts = {})
           reason(
             "compare_ready",
             "Open the PR from the compare link",
-            ["open_compare", "mark_resolved"],
+            [...(opts.prAuto && fm?.lab === "passed" ? ["create_pr"] : []), "open_compare", "mark_resolved"],
             fm?.lab === "passed" ? "Lab test passed. Open the upstream PR in GitHub, merge, then mark resolved." : undefined,
           ),
         );
       } else if (incident.draft_pr_url) {
         reasons.push(reason("pr_review", "PR open: merge, then mark resolved", ["mark_resolved"]));
       } else {
-        reasons.push(reason("pr_link_missing", "Awaiting PR but no compare link", ["mark_resolved"]));
+        reasons.push(reason("pr_link_missing", "PR open but no compare link", ["mark_resolved"]));
       }
       break;
     }

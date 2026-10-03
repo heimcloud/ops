@@ -17,6 +17,7 @@ import {
   getExtraRedactSlugs,
 } from "./redact.js";
 import { listDistinctCustomerRepoSlugs } from "./db.js";
+import { loadTargets, findTarget, routeTarget } from "./targets.js";
 
 function getToken() {
   return (
@@ -31,59 +32,43 @@ export function getGithubTokenConfigured() {
   return Boolean(getToken());
 }
 
-/** Default allowlist: madebydamo/neo + heimcloud/* */
+/**
+ * Allowlisted upstream repos = the autofix targets (OPS_TARGETS, see
+ * targets.js). One source of truth: the old OPS_TARGET_ALLOWLIST is gone;
+ * without settings the built-in madebydamo/neo → heimcloud/neo entry applies.
+ */
+export function getTargets() {
+  return loadTargets();
+}
+
 export function getAllowlist() {
-  const raw =
-    process.env.OPS_TARGET_ALLOWLIST || "madebydamo/neo,heimcloud/*";
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return getTargets().map((t) => t.upstream);
 }
 
-export function isRepoAllowed(repo, allowlist = getAllowlist()) {
-  const slug = String(repo || "").trim();
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(slug)) return false;
-  const [owner] = slug.split("/");
-  for (const rule of allowlist) {
-    if (rule === slug) return true;
-    if (rule.endsWith("/*")) {
-      const prefix = rule.slice(0, -2);
-      if (owner === prefix) return true;
-    }
-  }
-  if (slug === "madebydamo/neo") return true;
-  if (owner === "heimcloud") return true;
-  return false;
-}
-
-export function resolveTargetRepo(incident) {
-  const hint = (incident.target_repo || incident.target_hint || "").trim();
-  if (hint && isRepoAllowed(hint)) return hint;
-  if (hint && !hint.includes("/")) {
-    const candidate = `heimcloud/${hint}`;
-    if (isRepoAllowed(candidate)) return candidate;
-  }
-  return "madebydamo/neo";
+export function isRepoAllowed(repo, targets = getTargets()) {
+  return Boolean(findTarget(targets, repo));
 }
 
 /**
- * Logical allowlisted target vs writable head repo.
- * heimcloud token cannot push to madebydamo/neo — push to fork heimcloud/neo.
+ * Target repo of an incident: its target_repo (set by triage / the admin) when
+ * allowlisted, else an allowlisted target_hint, else routing by the hints
+ * (unit / keywords). Never an unknown repo.
  */
-export function resolveWriteRepo(logicalRepo) {
-  const slug = String(logicalRepo || "").trim();
-  if (slug === "madebydamo/neo") return "heimcloud/neo";
-  return slug;
+export function resolveTargetRepo(incident, targets = getTargets()) {
+  for (const v of [incident.target_repo, incident.target_hint]) {
+    const t = findTarget(targets, v);
+    if (t) return t.upstream;
+  }
+  return routeTarget(targets, { unit: incident.unit, logs: incident.logs_excerpt }).target.upstream;
 }
 
-export function resolvePrBaseRepo(logicalRepo, writeRepo) {
-  const logical = String(logicalRepo || "").trim();
-  const write = String(writeRepo || "").trim();
-  if (logical === "madebydamo/neo" && write === "heimcloud/neo") {
-    return "madebydamo/neo";
-  }
-  return write;
+/** Fork the loop pushes to for an allowlisted upstream (null when unknown). */
+export function resolveWriteRepo(logicalRepo, targets = getTargets()) {
+  return findTarget(targets, logicalRepo)?.fork || null;
+}
+
+export function resolvePrBaseRepo(logicalRepo, targets = getTargets()) {
+  return findTarget(targets, logicalRepo)?.upstream || null;
 }
 
 /**

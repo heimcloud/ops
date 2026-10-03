@@ -6,7 +6,7 @@
  * scripts/autofix (a test enforces it); only node builtins may be imported.
  *
  * Layout under <queue root> (= $OPS_DATA_DIR/queue):
- *   <kind>/<incident>-<ts>.json        pending job (kind = triage | fix | push | lab)
+ *   <kind>/<incident>-<ts>.json        pending job (kind = triage | fix | push | lab | pr)
  *   processing/<kind>-<name>           claimed job
  *   done/ failed/                      finished jobs (+ optional <base>.reason.json)
  *   control/paused.json                pause flag: worker claims nothing new
@@ -19,7 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-export const KINDS = ["triage", "fix", "push", "lab"];
+export const KINDS = ["triage", "fix", "push", "lab", "pr"];
 export const PRIORITIES = ["high", "normal", "low"];
 export const PRIORITY_RANK = { high: 0, normal: 1, low: 2 };
 /**
@@ -27,7 +27,7 @@ export const PRIORITY_RANK = { high: 0, normal: 1, low: 2 };
  * fix that is already pushed (and holds the host's activation lock briefly);
  * triage is quick; fix is long.
  */
-export const KIND_RANK = { push: 0, lab: 1, triage: 2, fix: 3 };
+export const KIND_RANK = { push: 0, pr: 0, lab: 1, triage: 2, fix: 3 };
 export const JOB_NAME_RE = /^(\d+)-[A-Za-z0-9-]+\.json$/;
 export const STALE_HEARTBEAT_SEC_DEFAULT = 300;
 

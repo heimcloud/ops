@@ -50,6 +50,25 @@ import {
   describeProtected,
   normalizeProtected,
 } from "./lab-checks.js";
+import { guardedPush } from "./push-guard.mjs";
+import { loadTargets, findTarget, compareOpts, targetHints, routeTarget } from "./targets.js";
+import {
+  wrapperEnv as prWrapperEnv,
+  prConfig,
+  prTokenPresent,
+  buildPrText,
+  buildReplyText,
+  outboundHits,
+  openOrAdoptPr,
+  postComment,
+  readRecord,
+  writeRecord,
+  newRecord,
+  withPrLock,
+  pollPrs,
+  feedbackBlock,
+  prStateResult,
+} from "./pr.mjs";
 
 const WORKER_FILE = fileURLToPath(import.meta.url);
 /** A job whose run died this many times (claims without a finish) is quarantined. */
@@ -57,7 +76,7 @@ export const POISON_CLAIMS = 2;
 
 const TRUE = ["1", "true", "yes", "on"];
 const FALSE = ["0", "false", "no", "off"];
-const KINDS = ["triage", "fix", "push", "lab"];
+const KINDS = ["triage", "fix", "push", "lab", "pr"];
 const JOB_NAME_RE = /^fix-(\d+)-[A-Za-z0-9-]+$/;
 const BRANCH_RE = /^(fix|ops)\/[A-Za-z0-9._/-]+$/;
 const CLASSES = ["software", "human_config", "unknown"];
@@ -110,7 +129,40 @@ export function config() {
     upstreamUrl: e.OPS_AUTOFIX_UPSTREAM_URL || "https://github.com/madebydamo/neo.git",
     baseRef: readNeoBaseRef(),
     dbPath: e.OPS_DB_PATH || path.join(dataDir, "ops.sqlite"),
+    // Allowlisted upstream targets (OPS_TARGETS; built-in neo entry without it).
+    targets: loadTargets(e),
+    // Tests only: clone/push URLs <base>/<owner>/<repo>.git instead of github.com.
+    githubBase: e.OPS_AUTOFIX_GITHUB_BASE || "",
+    denyFromEnv: Boolean(e.OPS_AUTOFIX_DENY_PATHS),
+    ...prConfig(e),
   };
+}
+
+/**
+ * Config for one allowlisted target: clone/push URLs, base ref, protected
+ * paths, compare-link parts. The neo entry keeps the legacy env overrides
+ * (OPS_AUTOFIX_UPSTREAM_URL / _FORK_URL / _DENY_PATHS).
+ */
+export function targetCfg(cfg, target) {
+  const isNeo = target.upstream.toLowerCase() === "madebydamo/neo";
+  const url = (slug) => (cfg.githubBase ? `${cfg.githubBase.replace(/\/+$/, "")}/${slug}.git` : `https://github.com/${slug}.git`);
+  const e = process.env;
+  return {
+    ...cfg,
+    target,
+    upstreamUrl: isNeo && e.OPS_AUTOFIX_UPSTREAM_URL ? e.OPS_AUTOFIX_UPSTREAM_URL : url(target.upstream),
+    forkUrl: isNeo && e.OPS_AUTOFIX_FORK_URL ? e.OPS_AUTOFIX_FORK_URL : url(target.fork),
+    baseRef: target.baseRef,
+    deny: isNeo && cfg.denyFromEnv ? cfg.deny : normalizePathPrefixes(target.protectedPaths),
+    basePaths: isNeo ? cfg.basePaths : [],
+    compare: compareOpts(target),
+  };
+}
+
+/** Target of a job: its target_repo (must be allowlisted), else the first entry. */
+export function jobTarget(cfg, job) {
+  if (job && job.target_repo != null && job.target_repo !== "") return findTarget(cfg.targets, job.target_repo);
+  return cfg.targets[0];
 }
 
 function log(...a) {
@@ -197,7 +249,7 @@ function mkdirs(cfg) {
 
 export function enabledKinds(cfg) {
   // push (retry a saved fix) rides on autofix.fix.enable; lab needs fix + lab automation.
-  return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : k === "lab" ? cfg.fixOn && cfg.labAuto : cfg.fixOn));
+  return KINDS.filter((k) => (k === "triage" ? cfg.triageOn : k === "lab" ? cfg.fixOn && cfg.labAuto : k === "pr" ? cfg.fixOn && cfg.prOn : cfg.fixOn));
 }
 
 /**
@@ -291,6 +343,7 @@ function failureStatus(kind) {
 }
 
 function failureResult(kind, incidentId, summary, extra = {}) {
+  if (kind === "pr") return { kind: "pr", via: "pr", pr_event: "error", incident_id: incidentId, summary, ...extra };
   return {
     kind: kind === "push" || kind === "lab" ? "fix" : kind,
     incident_id: incidentId,
@@ -731,13 +784,26 @@ export function protectedHit(files, cfg) {
 }
 
 /**
- * Result for a pushed fix whose lab test needs an admin approval (protected
- * path). No compare link yet (pending_compare_url is only used by the admin
- * "Skip lab" action); everything the app needs to build the approved lab job
- * comes from this result, never from the form.
+ * Result for a fix whose lab test needs an admin approval (protected path).
+ * No compare link yet (pending_compare_url is only used by the admin "Skip
+ * lab" action); everything the app needs to build the approved lab job comes
+ * from this result, never from the form. origin says what happened:
+ *   "fix"     this run pushed the branch and found protected paths in its diff
+ *   "lab_job" a lab job was marked protected without an approval: nothing was
+ *             pushed or tested by this run
+ *   "runner"  the root lab runner found protected changes (nothing activated)
  */
-export function approvalNeededResult(common, info, extra = "") {
-  const prot = normalizeProtected(info.protected) || info.protected;
+export const UNVERIFIED_PROTECTED = Object.freeze({ areas: ["unverified"], paths: [], core: false, label: "unverified (claimed by the job)" });
+
+export function approvalNeededResult(common, info, extra = "", origin = "fix") {
+  const prot = normalizeProtected(info.protected) || { ...UNVERIFIED_PROTECTED };
+  const where = prot.paths.length ? `${prot.paths.join(", ")}${prot.core ? " (base system)" : ""}` : "";
+  const why =
+    origin === "lab_job"
+      ? `Lab job marked protected (${prot.paths.length ? prot.label : "no paths named"}) without an admin approval; nothing was pushed or tested by this run.`
+      : origin === "runner"
+        ? `The root lab runner found protected changes${where ? ` (${where})` : ""} on branch ${info.branch} and no valid admin approval; nothing was activated.`
+        : `Branch ${info.branch} was pushed to the fork; the automated lab test did not run because the change touches ${where || "a protected path"}.`;
   return {
     ...common,
     branch: info.branch,
@@ -748,14 +814,16 @@ export function approvalNeededResult(common, info, extra = "") {
     base_sha: info.base_sha,
     pr_title: info.pr_title,
     pr_body: info.pr_body,
+    target_repo: info.target_repo,
+    pr_number: info.pr_number,
+    revise_round: info.revise_round,
+    change_summary: info.change_summary,
     compare_url: undefined,
     pending_compare_url: info.compare_url,
     protected: prot,
     status: "lab_approval_needed",
     lab: "awaiting_approval",
-    summary:
-      `Protected path (${prot.label}): approve lab test. Branch ${info.branch} was pushed to the fork; the automated lab test did not run ` +
-      `because the change touches ${prot.paths.join(", ")}${prot.core ? " (base system)" : ""}.${extra ? ` ${extra}` : ""}`,
+    summary: `Protected path (${prot.label}): approve lab test. ${why}${extra ? ` ${extra}` : ""}`,
   };
 }
 
@@ -838,6 +906,9 @@ export function handleTriage(cfg, job, ctx) {
       "logs_excerpt (redacted):",
       job.logs_excerpt || "(none)",
       "",
+      "Allowlisted target repos (target_repo MUST be one of these; the first is the default):",
+      ...targetHints(cfg.targets),
+      "",
       "Respond with the JSON verdict only.",
     ].join("\n"),
   );
@@ -857,6 +928,11 @@ export function handleTriage(cfg, job, ctx) {
     };
   }
   const slugs = ctx.slugs;
+  // target_repo must be allowlisted; none named → route by the hints; an
+  // unknown repo is reported (needs_human), never used.
+  const named = typeof verdict.target_repo === "string" ? verdict.target_repo.trim() : "";
+  const known = named ? findTarget(cfg.targets, named) : null;
+  const routed = known || (named ? null : routeTarget(cfg.targets, { unit: job.unit, logs: job.logs_excerpt }).target);
   return {
     kind: "triage",
     incident_id: job.incident_id,
@@ -864,9 +940,10 @@ export function handleTriage(cfg, job, ctx) {
     class: CLASSES.includes(verdict.class) ? verdict.class : "unknown",
     severity: redactIdentifyingDetails(verdict.severity || "", { knownSlugs: slugs }),
     summary: redactIdentifyingDetails(verdict.summary || "Triage verdict", { knownSlugs: slugs }),
-    target_repo: /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(verdict.target_repo || "")
-      ? verdict.target_repo
-      : "madebydamo/neo",
+    target_repo: routed ? routed.upstream : undefined,
+    ...(named && !known
+      ? { target_unknown: /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(named) ? redactIdentifyingDetails(named, { knownSlugs: slugs }) : "(invalid)" }
+      : {}),
     fixable: Boolean(verdict.fixable),
     ...triageVerdictFields(verdict),
     evidence_path: logPath,
@@ -923,9 +1000,13 @@ function cloneNeo(cfg, neoDir) {
 }
 
 function fixPrompt(job, neoDir, cfg, attempt, previousFailure, continueBranch = "") {
+  const repo = cfg.target?.upstream || "madebydamo/neo";
+  const revise = job.revise && typeof job.revise_feedback === "string";
   return [
-    `Fix Ops incident #${job.incident_id} in the neo clone at ${neoDir} (attempt ${attempt}/${cfg.maxAttempts}).`,
-    `Base neo ref the host runs: ${cfg.baseRef} (already checked out; branch from here).`,
+    revise
+      ? `Revise the open PR #${Number(job.revise.pr_number)} of Ops incident #${job.incident_id} (${repo}, clone at ${neoDir}; review round ${Number(job.revise.round)}, attempt ${attempt}/${cfg.maxAttempts}).`
+      : `Fix Ops incident #${job.incident_id} in the ${repo} clone at ${neoDir} (attempt ${attempt}/${cfg.maxAttempts}).`,
+    `Target repo: ${repo}. Base ref the host runs: ${cfg.baseRef} (already checked out; branch from here).`,
     `report_hash: ${job.report_hash}`,
     `unit: ${job.unit}`,
     `severity: ${job.severity}`,
@@ -938,8 +1019,14 @@ function fixPrompt(job, neoDir, cfg, attempt, previousFailure, continueBranch = 
     ...(previousFailure
       ? ["Previous attempt failed the lab test. Evidence (redacted tail):", previousFailure, ""]
       : []),
+    ...(revise ? [job.revise_feedback, ""] : []),
     ...(continueBranch
-      ? [`Branch ${continueBranch} (the previous attempt) is checked out: fix forward with a NEW commit on it and keep the branch name.`, ""]
+      ? [
+          revise
+            ? `Branch ${continueBranch} (the PR head) is checked out: address the feedback with NEW commit(s) on it, keep the branch name, never rewrite or squash existing commits.`
+            : `Branch ${continueBranch} (the previous attempt) is checked out: fix forward with a NEW commit on it and keep the branch name.`,
+          "",
+        ]
       : []),
     `Create branch fix/<topic> or ops/incident-${job.incident_id} and COMMIT the change (git identity is preset; do not change git config).`,
     "Minimal change. No identifiers. Do NOT push and do NOT open a PR; the worker pushes after its redaction gate.",
@@ -984,7 +1071,7 @@ export function tokenAvailable(cfg) {
  */
 export function gateCommits(cfg, neoDir, baseSha, { branch, prTitle, prBody, slugs }) {
   try {
-    buildCompareUrl(branch, { base: cfg.baseRef }); // validates branch shape
+    buildCompareUrl(branch, cfg.compare || { base: cfg.baseRef }); // validates branch shape
     scanOutbound("branch", branch, slugs);
   } catch (err) {
     return { ok: false, result: { status: "redaction_blocked", summary: `branch rejected: ${err.message}`, hits: err.hits } };
@@ -1058,25 +1145,102 @@ function retryHint(job) {
 }
 
 /** Push HEAD to the fork branch, build the compare link, run the lab test. */
-function pushAndLab(cfg, neoDir, branch, klass, { skipLab = false } = {}) {
+function pushAndLab(cfg, neoDir, branch, klass, { skipLab = false, force = true } = {}) {
   // Fork branch namespace fix/*|ops/* is owned by this loop: force keeps
-  // re-runs of the same incident idempotent.
-  const push = run(
-    cfg.envBin,
-    ["git", "-C", neoDir, "push", "--force", "fork", `HEAD:refs/heads/${branch}`],
-    { env: gitEnv(), timeout: 900_000, supervise: superviseOpts(cfg, { cancel: false }) },
-  );
-  if (push.status !== 0) {
+  // re-runs of the same incident idempotent. A PR revision is a plain
+  // fast-forward push (the open PR's history is never rewritten).
+  // The PR token never reaches git: GH_PR_TOKEN / GH_TOKEN are dropped after
+  // heimcloud-autofix-env injected its fork-scoped credential helper.
+  // Push guard (push-guard.mjs): allowlisted fork URL only, fix/* | ops/*
+  // only, hooks off, no config redirects.
+  const push = guardedPush(cfg, neoDir, branch, {
+    force,
+    deps: { run, git, envBin: cfg.envBin, gitEnv, supervise: superviseOpts(cfg, { cancel: false }) },
+  });
+  if (!push.pushed) {
+    if (push.refused) {
+      log(`push refused by the guard: ${push.error}`);
+      return { pushed: false, error: { class: "refused", message: `push guard: ${push.error}` } };
+    }
     // Journal only, with any URL userinfo stripped; never in results/DB.
-    log(`git push failed: ${tail(String(push.stderr || push.error || "").replace(/:\/\/[^@\s/]+@/g, "://***@"), 300)}`);
-    return { pushed: false, error: classifyPushError(`${push.stderr}\n${push.stdout}\n${push.error || ""}`) };
+    log(`git push failed: ${tail(String(push.error || "").replace(/:\/\/[^@\s/]+@/g, "://***@"), 300)}`);
+    return { pushed: false, error: classifyPushError(push.error) };
   }
-  const compare_url = buildCompareUrl(branch, { base: cfg.baseRef });
+  const compare_url = buildCompareUrl(branch, cfg.compare || { base: cfg.baseRef });
   return { pushed: true, compare_url, lab: skipLab ? null : labTest(cfg, branch, klass || "default") };
 }
 
+export const VALIDATION_FILE = "docs/ops-autofix-validation.md";
+
+/**
+ * Validation fix (synthetic incident from the admin "Run PR-loop validation"):
+ * one markdown file, no code or config. Returns a Hermes-like run result.
+ */
+export function validationCommit(neoDir, job, logPath) {
+  const id = Number(job.incident_id);
+  const branch = `ops/validation-pr-loop-${id}`;
+  const text = [
+    "# Heimcloud Ops autofix: PR-loop validation",
+    "",
+    `This file exists only on the validation branch \`${branch}\`.`,
+    "It checks that the autofix loop can push a branch to the fork, lab-test it, open a",
+    "pull request and address one review comment. It changes no code and no configuration.",
+    "",
+    "**Do not merge.** Close the pull request when the check is done.",
+    "",
+  ].join("\n");
+  const steps = [
+    git(neoDir, ["checkout", "-q", "-B", branch]),
+    (fs.mkdirSync(path.join(neoDir, "docs"), { recursive: true }), fs.writeFileSync(path.join(neoDir, VALIDATION_FILE), text), { status: 0 }),
+    git(neoDir, ["add", "--", VALIDATION_FILE]),
+    git(neoDir, ["-c", "commit.gpgsign=false", "commit", "-q", "-m", "docs: autofix PR-loop validation (do not merge)"]),
+  ];
+  const bad = steps.find((x) => x.status !== 0);
+  const verdict = {
+    status: "ready_to_push",
+    branch,
+    pr_title: `[validation] Heimcloud Ops autofix PR-loop check (incident #${id}) - DO NOT MERGE`,
+    summary:
+      "**Validation only, do not merge.** Adds one doc-only file to check the autofix loop end to end (push, lab test, PR, one review round). " +
+      "To exercise the feedback loop, leave one review comment asking for a small wording change in that file.",
+  };
+  try {
+    fs.writeFileSync(logPath, `# validation commit (no Hermes)\n${bad ? `failed: ${bad.stderr}` : "ok"}\n`, { mode: 0o640 });
+  } catch {
+    /* ignore */
+  }
+  return { status: bad ? 1 : 0, stdout: bad ? "" : JSON.stringify(verdict), stderr: bad ? String(bad.stderr || "") : "", error: null };
+}
+
+/** Fields a fix / lab / approval result carries for the PR loop. */
+function prFields(cfg, job) {
+  const out = { target_repo: cfg.target?.upstream };
+  if (job.revise && Number(job.revise.pr_number)) {
+    out.pr_number = Number(job.revise.pr_number);
+    out.revise_round = Number(job.revise.round) || 1;
+  } else if (Number(job.pr_number) && Number(job.revise_round)) {
+    out.pr_number = Number(job.pr_number);
+    out.revise_round = Number(job.revise_round);
+  }
+  return out;
+}
+
+/** Result for a target without an automated lab method (needs_human). */
+function noLabMethodResult(cfg, last, extra = {}) {
+  return {
+    ...last,
+    ...extra,
+    compare_url: undefined,
+    pending_compare_url: last.compare_url,
+    status: "lab_unavailable",
+    lab: "no_method",
+    summary: `No lab method for ${cfg.target.upstream} (lab = "none"): branch ${last.branch} is pushed. Test it by hand, then use "Skip lab" to open the PR (marked NOT lab-tested).`,
+  };
+}
+
 export function handleFix(cfg, job, ctx) {
-  const base = { kind: "fix", incident_id: job.incident_id, base_ref: cfg.baseRef };
+  const pf = prFields(cfg, job);
+  const base = { kind: "fix", incident_id: job.incident_id, base_ref: cfg.baseRef, ...pf };
   fs.mkdirSync(ctx.scratch, { recursive: true });
   const neoDir = path.join(ctx.scratch, "neo");
   stage(cfg, "cloning");
@@ -1096,10 +1260,16 @@ export function handleFix(cfg, job, ctx) {
   // Lab retry (enqueued by a failed lab job): continue on the pushed branch
   // with the redacted lab evidence; the attempt budget carries over.
   const startAttempt = Math.max(1, Math.floor(Number(job.attempt) || 1));
+  const revise = Boolean(pf.revise_round);
   let continueBranch = "";
-  if (startAttempt > 1 && isValidBranch(job.branch)) {
+  if ((startAttempt > 1 || revise) && isValidBranch(job.branch)) {
     const f = git(neoDir, ["fetch", "--quiet", "fork", `+refs/heads/${job.branch}:refs/remotes/fork/${job.branch}`]);
     if (f.status === 0 && git(neoDir, ["checkout", "-q", "-B", job.branch, `fork/${job.branch}`]).status === 0) continueBranch = job.branch;
+  }
+  // PR revision: the PR head every new commit must descend from.
+  const prevHead = continueBranch ? git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() : "";
+  if (revise && !continueBranch) {
+    return { ...base, branch: job.branch, status: "needs_human", summary: `Revise round ${pf.revise_round}: PR branch ${job.branch} could not be fetched from the fork.` };
   }
   let previousFailure = typeof job.lab_failure === "string" ? tail(redactIdentifyingDetails(job.lab_failure, { knownSlugs: slugs }), 3000) : "";
   let last = null;
@@ -1111,7 +1281,11 @@ export function handleFix(cfg, job, ctx) {
     fs.writeFileSync(prompt, fixPrompt(job, neoDir, cfg, attempt, previousFailure, attempt === startAttempt ? continueBranch : ""));
     const logPath = path.join(ctx.scratch, `fix-hermes-${attempt}.log`);
     stage(cfg, "hermes", { attempt, max_attempts: cfg.maxAttempts });
-    const r = hermesChat(cfg, "heimcloud-ops-fix", prompt, { cwd: neoDir, logPath });
+    // PR-loop validation: the first commit is the worker's own doc-only file.
+    const r =
+      job.validation === true && !revise && attempt === startAttempt && !continueBranch
+        ? validationCommit(neoDir, job, logPath)
+        : hermesChat(cfg, "heimcloud-ops-fix", prompt, { cwd: neoDir, logPath });
     const verdict = extractJson(r.stdout) || extractJson(r.stderr) || {};
     const common = { ...base, attempts: attempt, max_attempts: cfg.maxAttempts, base_sha: baseSha, evidence_path: logPath };
 
@@ -1122,18 +1296,37 @@ export function handleFix(cfg, job, ctx) {
         summary: `Hermes gave up: ${redactIdentifyingDetails(verdict.summary || "", { knownSlugs: slugs })}`,
       };
     }
-    const branch = String(verdict.branch || `ops/incident-${job.incident_id}`).trim();
-    const prTitle = String(verdict.pr_title || `ops: incident #${job.incident_id} (${job.severity || "unspecified"})`);
-    const prBody = [
-      `# Heimcloud Ops incident #${job.incident_id}`,
-      "",
-      `report_hash: \`${job.report_hash}\``,
-      "",
-      redactIdentifyingDetails(verdict.summary || "Automated fix (lab test pending).", { knownSlugs: slugs }),
-      "",
-      "Opened manually from the compare link — **do not auto-merge**.",
-      "",
-    ].join("\n");
+    // A revision stays on the PR branch whatever Hermes names.
+    const branch = revise ? job.branch : String(verdict.branch || `ops/incident-${job.incident_id}`).trim();
+    const prTitle = revise && job.pr_title ? String(job.pr_title) : String(verdict.pr_title || `ops: incident #${job.incident_id} (${job.severity || "unspecified"})`);
+    const prBody = revise && job.pr_body
+      ? String(job.pr_body)
+      : [
+          `# Heimcloud Ops incident #${job.incident_id}`,
+          "",
+          `report_hash: \`${job.report_hash}\``,
+          "",
+          redactIdentifyingDetails(verdict.summary || "Automated fix (lab test pending).", { knownSlugs: slugs }),
+          "",
+          "**Never auto-merged**: merging is a human decision.",
+          "",
+        ].join("\n");
+    let changeSummary;
+    if (revise) {
+      const head = git(neoDir, ["rev-parse", "HEAD"]).stdout.trim();
+      if (head === prevHead) {
+        return { ...common, branch, status: "needs_human", summary: `Revise round ${pf.revise_round}: Hermes made no new commit for the feedback (${hermesFailure(r)}). Log: ${logPath}` };
+      }
+      if (git(neoDir, ["merge-base", "--is-ancestor", prevHead, "HEAD"]).status !== 0) {
+        return { ...common, branch, status: "needs_human", summary: `Revise round ${pf.revise_round}: the new commits do not build on the PR head (history rewritten); nothing pushed.` };
+      }
+      const subjects = git(neoDir, ["log", "--format=%s", `${prevHead}..HEAD`]).stdout.split("\n").filter(Boolean).slice(0, 10);
+      changeSummary = {
+        commits: subjects.map((x) => redactIdentifyingDetails(x, { knownSlugs: slugs }).slice(0, 200)),
+        summary: redactIdentifyingDetails(String(verdict.summary || ""), { knownSlugs: slugs }).slice(0, 800),
+        prev_head: prevHead,
+      };
+    }
 
     stage(cfg, "checks");
     const gate = gateCommits(cfg, neoDir, baseSha, { branch, prTitle, prBody, slugs });
@@ -1161,6 +1354,8 @@ export function handleFix(cfg, job, ctx) {
         base_sha: baseSha,
         pr_title: prTitle,
         pr_body: prBody,
+        target_repo: cfg.target?.upstream,
+        attempt,
       }, slugs);
     const kept = (pending) => ({
       ...common,
@@ -1185,7 +1380,8 @@ export function handleFix(cfg, job, ctx) {
       };
     }
 
-    const pushed = pushAndLab(cfg, neoDir, branch, job.class, { skipLab: cfg.labAuto || Boolean(gate.protected) });
+    const noLab = cfg.target?.lab === "none";
+    const pushed = pushAndLab(cfg, neoDir, branch, job.class, { skipLab: cfg.labAuto || Boolean(gate.protected) || noLab, force: !revise });
     if (!pushed.pushed) {
       // Not a Hermes failure: no retry loop, attempt budget untouched.
       return {
@@ -1195,18 +1391,22 @@ export function handleFix(cfg, job, ctx) {
         summary: `Fix branch ${branch} is committed locally; push to the fork failed (${pushed.error.class}: ${pushed.error.message}). ${retryHint(jobName)}`,
       };
     }
-    last = { ...common, branch, compare_url: pushed.compare_url, pr_title: prTitle, pr_body: prBody };
+    last = { ...common, branch, compare_url: pushed.compare_url, pr_title: prTitle, pr_body: prBody, change_summary: changeSummary };
+    const headSha = git(neoDir, ["rev-parse", "HEAD"]).stdout.trim();
+    if (noLab) return noLabMethodResult(cfg, { ...last, job: jobName, fix_job: jobName, head_sha: headSha, protected: gate.protected || undefined });
     if (gate.protected) {
       const info = {
         protected: gate.protected,
         branch,
         fix_job: jobName,
         attempt,
-        head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim(),
+        head_sha: headSha,
         base_sha: baseSha,
         pr_title: prTitle,
         pr_body: prBody,
         compare_url: pushed.compare_url,
+        change_summary: changeSummary,
+        ...pf,
       };
       if (cfg.labAuto) return approvalNeededResult(common, info);
       return {
@@ -1229,7 +1429,10 @@ export function handleFix(cfg, job, ctx) {
         pr_title: prTitle,
         pr_body: prBody,
         base_sha: baseSha,
-        head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim(),
+        head_sha: headSha,
+        change_summary: changeSummary,
+        ...(revise ? { revise_feedback: job.revise_feedback } : {}),
+        ...pf,
       });
       return {
         ...common,
@@ -1255,12 +1458,14 @@ export function handleFix(cfg, job, ctx) {
       };
     }
     if (lab.ok) {
-      return { ...last, status: "compare_ready", lab: "passed", summary: "Lab test passed; open the compare link to create the upstream PR." };
+      const res = { ...last, status: "compare_ready", lab: "passed", summary: "Lab test passed; open the compare link to create the upstream PR." };
+      return afterLabPass(cfg, { ...job, ...pf, branch, head_sha: headSha, pr_title: prTitle, pr_body: prBody, change_summary: changeSummary }, res, { slugs });
     }
     previousFailure = redactIdentifyingDetails(lab.output, { knownSlugs: slugs });
     log(`incident ${job.incident_id}: lab test failed (attempt ${attempt})`);
   }
   // Out of attempts: no compare link (design: no PR after failed lab tests).
+  if (pf.revise_round) haltPr(cfg, { incident_id: job.incident_id, ...pf }, "lab_failed", `Revise round ${pf.revise_round} failed the lab test; nothing posted on PR #${pf.pr_number}.`);
   return {
     ...last,
     compare_url: undefined,
@@ -1268,6 +1473,167 @@ export function handleFix(cfg, job, ctx) {
     lab: "failed",
     summary: `Lab test failed after ${cfg.maxAttempts} attempt(s): ${tail(previousFailure, 500)}`,
   };
+}
+
+// ---------------------------------------------------------------- PR loop
+
+/** Side result (kind "pr") next to the job's own result. */
+function writePrResult(cfg, result) {
+  try {
+    writeResult(cfg, path.join(cfg.results, `pr-${result.incident_id}-${jobStamp()}-${process.pid}.json`), result);
+  } catch (err) {
+    log(`cannot write PR result for incident ${result.incident_id}: ${err.code || err.message}`);
+  }
+}
+
+/** PR automation usable for this run (enabled + token file present). */
+function prReady(cfg) {
+  if (!cfg.prOn) return { ok: false, reason: "PR automation is off (autofix.pr.enable)" };
+  if (!prTokenPresent(cfg)) return { ok: false, reason: "GitHub token missing (autofixForkPushToken)" };
+  return { ok: true };
+}
+
+/**
+ * After a lab pass (or the admin "Skip lab": untested): open / adopt the
+ * upstream PR, or, for a revise round, post the reply on the open PR. Returns
+ * the job result (fix_result) with the PR outcome folded in; the PR state goes
+ * to the app as a separate kind "pr" result. Redaction hit → no PR, no reply.
+ */
+export function afterLabPass(cfg, job, res, { slugs = [], untested = false, protectedLabel = "" } = {}) {
+  const ready = prReady(cfg);
+  if (!ready.ok || !cfg.target) return ready.ok ? res : { ...res, pr_skipped: ready.reason };
+  const id = Number(job.incident_id);
+  return withPrLock(cfg, () => {
+    const rec = readRecord(cfg, id);
+    // ---- revise round: reply on the PR
+    if (Number(job.revise_round) && Number(job.pr_number)) {
+      if (!rec || Number(rec.number) !== Number(job.pr_number)) return { ...res, summary: `${res.summary} PR #${job.pr_number} is not tracked; no reply posted.` };
+      if (rec.state !== "open" || rec.stopped || rec.halted) {
+        rec.revise_pending = null;
+        writeRecord(cfg, rec);
+        return { ...res, summary: `${res.summary} PR #${rec.number} is ${rec.state !== "open" ? rec.state : rec.stopped ? "stopped" : "halted"}; no reply posted.` };
+      }
+      const cs = job.change_summary || {};
+      const text = buildReplyText(cfg, { round: Number(job.revise_round), changes: cs.commits || [], summary: cs.summary || "", labReport: res.lab_report, untested, protectedLabel }, slugs);
+      const hits = outboundHits(text, slugs);
+      if (hits.length) {
+        rec.halted = "redaction_blocked";
+        rec.revise_pending = null;
+        writeRecord(cfg, rec);
+        writePrResult(cfg, prStateResult(rec, "blocked", `Reply on PR #${rec.number} blocked by the redaction gate (${hits.join(", ")}); nothing posted.`));
+        return { ...res, status: "redaction_blocked", summary: `Revision pushed and ${untested ? "not lab-tested" : "lab-tested"}, but the PR reply was blocked by the redaction gate (${hits.join(", ")}).` };
+      }
+      const c = postComment(cfg, rec.number, text);
+      rec.revise_pending = null;
+      if (job.head_sha) rec.head_sha = job.head_sha;
+      writeRecord(cfg, rec);
+      writePrResult(cfg, prStateResult(rec, "revised", c.ok ? `Revision ${rec.round}/${rec.max_rounds} pushed; reply posted on PR #${rec.number}.` : `Revision ${rec.round}/${rec.max_rounds} pushed; the reply could not be posted (${c.error}).`, { reply_posted: c.ok }));
+      return { ...res, pr_number: rec.number, pr_url: rec.url, summary: `${res.summary} Revision ${rec.round}/${rec.max_rounds} pushed to PR #${rec.number}${c.ok ? "; reply posted" : `; reply failed (${c.error})`}.` };
+    }
+    // ---- open / adopt
+    const text = buildPrText(cfg, { prTitle: job.pr_title, prBody: job.pr_body, labReport: res.lab_report, untested, protectedLabel }, slugs);
+    const hits = [...outboundHits(text.title, slugs), ...outboundHits(text.body, slugs)];
+    if (!text.title.trim()) hits.push("empty_title");
+    if (hits.length) {
+      writePrResult(cfg, { kind: "pr", via: "pr", pr_event: "blocked", incident_id: id, target_repo: cfg.target.upstream, branch: job.branch, summary: `PR not opened: the redaction gate blocked the title/body (${hits.join(", ")}).` });
+      return { ...res, status: "redaction_blocked", compare_url: undefined, pr_blocked: true, summary: `Lab ${untested ? "skipped" : "passed"}, but the PR was NOT opened: the redaction gate blocked its title/body (${hits.join(", ")}).` };
+    }
+    const draft = untested || cfg.prDraft;
+    const pr = openOrAdoptPr(cfg, { branch: job.branch, title: text.title, body: text.body, draft });
+    if (!pr.ok) {
+      writePrResult(cfg, { kind: "pr", via: "pr", pr_event: "error", incident_id: id, target_repo: cfg.target.upstream, branch: job.branch, summary: `Opening the PR failed (${pr.error}); the compare link is the fallback.` });
+      return { ...res, pr_error: pr.error, summary: `${res.summary} Opening the PR failed (${pr.error}); the compare link is the fallback.` };
+    }
+    const keep = rec && Number(rec.number) === pr.number ? rec : null;
+    const nrec = keep ? { ...keep, state: pr.state, draft: pr.draft, url: pr.url } : newRecord(cfg, job, pr, { untested });
+    writeRecord(cfg, nrec);
+    writePrResult(cfg, prStateResult(nrec, pr.adopted ? "adopted" : "opened", `${pr.adopted ? "Adopted" : "Opened"} ${draft ? "draft " : ""}PR #${pr.number} on ${cfg.target.upstream}${untested ? " (NOT lab-tested)" : ""}.`));
+    return { ...res, pr_number: pr.number, pr_url: pr.url, summary: `${res.summary.replace(/; open the compare link to create the upstream PR\.?$/, ".")} ${pr.adopted ? "Adopted" : "Opened"} ${draft ? "draft " : ""}PR #${pr.number}.` };
+  });
+}
+
+/**
+ * kind "pr" job (app: "Skip lab" with PR automation, or "Open PR" after a
+ * compare-only lab pass): open the PR / post the revise reply without a lab run.
+ */
+export function handlePr(cfg, job, ctx) {
+  const untested = job.mode === "untested";
+  const base = {
+    kind: "pr",
+    via: "pr",
+    incident_id: Number(job.incident_id),
+    target_repo: cfg.target.upstream,
+    branch: job.branch,
+  };
+  if (!isValidBranch(job.branch)) return { ...base, pr_event: "error", summary: "PR job without a valid fix branch." };
+  const ready = prReady(cfg);
+  if (!ready.ok) return { ...base, pr_event: "error", summary: `${ready.reason}; use the compare link.` };
+  const res = {
+    ...base,
+    summary: untested ? "Lab test skipped by the admin." : "Lab test passed.",
+    lab_report: job.lab_report && typeof job.lab_report === "object" ? job.lab_report : undefined,
+  };
+  const label = job.protected ? (normalizeProtected(job.protected)?.label || "") : "";
+  const out = afterLabPass(cfg, job, res, { slugs: ctx.slugs, untested, protectedLabel: label });
+  // The PR outcome itself went out as a side result; this one only logs.
+  return { ...out, kind: "pr", via: "pr", pr_event: out.status === "redaction_blocked" ? "blocked_job" : "job", status: undefined, _noIngest: true };
+}
+
+/** Stop the PR loop for an incident (cap / lab fail / redaction): needs_human, nothing posted. */
+function haltPr(cfg, base, why, summary) {
+  try {
+    withPrLock(cfg, () => {
+      const rec = readRecord(cfg, base.incident_id);
+      if (!rec || Number(rec.number) !== Number(base.pr_number)) return;
+      rec.halted = why;
+      rec.revise_pending = null;
+      writeRecord(cfg, rec);
+      writePrResult(cfg, prStateResult(rec, "halted", summary));
+    });
+  } catch (err) {
+    log(`cannot halt PR loop for incident ${base.incident_id}: ${err.message}`);
+  }
+}
+
+/** Pending (queued or claimed) job of any kind for this incident. */
+function incidentJobPending(cfg, incidentId) {
+  const pre = `${Number(incidentId)}-`;
+  for (const d of [...KINDS.map((k) => path.join(cfg.queue, k))]) {
+    try {
+      if (fs.readdirSync(d).some((n) => n.startsWith(pre) && n.endsWith(".json"))) return true;
+    } catch {
+      /* none */
+    }
+  }
+  try {
+    return fs.readdirSync(path.join(cfg.queue, "processing")).some((n) => KINDS.some((k) => n.startsWith(`${k}-${pre}`)));
+  } catch {
+    return false;
+  }
+}
+
+/** `--pr-poll`: one pass over the tracked PRs (timer every 2–5 min). */
+export function prPoll(cfg) {
+  if (!cfg.prOn) return { skipped: "PR automation off" };
+  if (!prTokenPresent(cfg)) return { skipped: "no token" };
+  mkdirs(cfg);
+  const slugs = knownSlugs(cfg);
+  return pollPrs(cfg, {
+    slugs,
+    writeResult: (r) => writePrResult(cfg, r),
+    jobPending: (id) => incidentJobPending(cfg, id),
+    enqueueRevise: (tcfg, rec, items) => {
+      const j = enqueueSelf(cfg, "fix", rec.incident_id, {
+        ...rec.job,
+        target_repo: rec.upstream,
+        branch: rec.branch,
+        attempt: 1,
+        revise: { round: rec.round, pr_number: rec.number },
+        revise_feedback: feedbackBlock(tcfg, rec.number, items, slugs),
+      });
+      return j.instance;
+    },
+  });
 }
 
 // ---------------------------------------------------------------- lab
@@ -1406,12 +1772,13 @@ export function handleLab(cfg, job, ctx) {
     lab_job: instance,
     attempts: attempt,
     max_attempts: maxAttempts,
+    ...prFields(cfg, job),
   };
   const err = (summary, extra = {}) => ({ ...base, status: "lab_error", lab: "error", summary, _bucket: "failed", _reason: { code: "lab_error", reason: summary.slice(0, 160) }, ...extra });
   if (!isValidInstance(instance) || !isValidBranch(job.branch)) return err("lab job has an invalid name or branch");
   const unit = `${cfg.labUnitPrefix}@${instance}.service`;
   const labInfo = (prot) => ({
-    protected: normalizeProtected(prot) || describeProtected(["(unknown)"]),
+    protected: normalizeProtected(prot) || { ...UNVERIFIED_PROTECTED },
     branch: job.branch,
     fix_job: job.fix_job,
     attempt,
@@ -1420,11 +1787,16 @@ export function handleLab(cfg, job, ctx) {
     pr_title: job.pr_title,
     pr_body: job.pr_body,
     compare_url: job.compare_url,
+    change_summary: job.change_summary,
+    ...prFields(cfg, job),
   });
+  if (cfg.target?.lab === "none") {
+    return { ...noLabMethodResult(cfg, { ...base, compare_url: job.compare_url, pr_title: job.pr_title, pr_body: job.pr_body, head_sha: job.head_sha, change_summary: job.change_summary }), _bucket: "failed", _reason: { code: "no_lab_method", reason: "target has no lab method" } };
+  }
   // A protected lab job without the app's approval never reaches the root
-  // unit (the runner would refuse it anyway).
+  // unit (the runner would refuse it anyway). Nothing was pushed by this run.
   if (job.protected && !job.approval) {
-    return { ...approvalNeededResult(base, labInfo(job.protected)), _bucket: "failed", _reason: { code: "approval_required", reason: "protected lab job without admin approval" } };
+    return { ...approvalNeededResult(base, labInfo(job.protected), "", "lab_job"), _bucket: "failed", _reason: { code: "approval_required", reason: "protected lab job without admin approval" } };
   }
 
   let report = readLabFile(cfg, instance, "result.json");
@@ -1498,7 +1870,7 @@ export function handleLab(cfg, job, ctx) {
   if (report.approval_required || report.approval_invalid) {
     const extra = report.approval_invalid ? `The runner rejected the approval (${redact(report.reason || "")}); approve again.` : "";
     return {
-      ...approvalNeededResult({ ...base, lab_report, evidence_path: path.join(cfg.labStateDir, instance, "result.json") }, labInfo(report.protected), extra.slice(0, 300)),
+      ...approvalNeededResult({ ...base, lab_report, evidence_path: path.join(cfg.labStateDir, instance, "result.json") }, labInfo(report.protected), extra.slice(0, 300), "runner"),
       _bucket: "failed",
       _reason: { code: "approval_required", reason: report.approval_invalid ? "approval rejected by the lab runner" : "protected change without admin approval" },
     };
@@ -1525,15 +1897,18 @@ export function handleLab(cfg, job, ctx) {
     };
   }
   if (norm.verdict === "pass") {
-    return {
+    const res = {
       ...withReport,
       status: "compare_ready",
       lab: "passed",
       compare_url: job.compare_url,
       pr_title: job.pr_title,
       pr_body: job.pr_body,
+      head_sha: job.head_sha,
       summary: `Lab test passed (${counts}${gen}); open the compare link to create the upstream PR.`,
     };
+    const prot = job.protected ? normalizeProtected(job.protected) : null;
+    return afterLabPass(cfg, job, res, { slugs, protectedLabel: prot?.label || "" });
   }
   if (norm.verdict === "cancelled") {
     return { ...cancelledResult("lab", job, report.failed_stage || "lab"), ...withReport, status: "awaiting_lab_test", lab: "cancelled", compare_url: job.compare_url, _bucket: "failed", _reason: { code: "cancelled", reason: "lab test cancelled before activation" } };
@@ -1551,6 +1926,9 @@ export function handleLab(cfg, job, ctx) {
         attempt: attempt + 1,
         branch: job.branch,
         lab_failure: failure,
+        target_repo: cfg.target?.upstream,
+        // A revise round keeps its PR / round (same branch, same feedback).
+        ...(base.revise_round ? { revise: { round: base.revise_round, pr_number: base.pr_number }, revise_feedback: job.revise_feedback, pr_title: job.pr_title, pr_body: job.pr_body } : {}),
       });
       return {
         ...withReport,
@@ -1560,6 +1938,7 @@ export function handleLab(cfg, job, ctx) {
         summary: `Lab test failed (${counts}${gen}): ${redact(report.reason || "")}. Retrying the fix with this evidence (attempt ${attempt + 1}/${maxAttempts}).`.slice(0, 700),
       };
     }
+    if (base.revise_round) haltPr(cfg, base, "lab_failed", `Revise round ${base.revise_round} failed the lab test after ${attempt} attempt(s); nothing posted on PR #${base.pr_number}.`);
     return {
       ...withReport,
       status: "needs_human",
@@ -1702,8 +2081,12 @@ function pushPendingLocked(cfg, scratch) {
       ...(err.gate || { status: "needs_human", summary: `cannot push saved fix: ${err.message}` }),
     };
   }
-  const baseRes = { kind: "fix", via: "push-pending", job: jobName, incident_id: p.incident_id, base_ref: p.base_ref, base_sha: p.base_sha, branch: p.branch, pending_path: pendingPath, patch_path: p.patch_path };
-  const cfgP = { ...cfg, baseRef: p.base_ref || cfg.baseRef };
+  const baseRes = { kind: "fix", via: "push-pending", job: jobName, incident_id: p.incident_id, base_ref: p.base_ref, base_sha: p.base_sha, branch: p.branch, pending_path: pendingPath, patch_path: p.patch_path, target_repo: p.target_repo };
+  const target = p.target_repo ? findTarget(cfg.targets, p.target_repo) : cfg.target || cfg.targets[0];
+  if (!target) return { ...baseRes, status: "needs_human", summary: `Saved fix targets ${p.target_repo}, which is no longer allowlisted; nothing pushed.` };
+  const tc = cfg.target && cfg.target.upstream === target.upstream ? cfg : targetCfg(cfg, target);
+  const cfgP = { ...tc, baseRef: p.base_ref || tc.baseRef };
+  const forkName = cfgP.target.fork;
   const neoDir = p.neo_dir || path.join(scratch, "neo");
   const head = fs.existsSync(neoDir) ? git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() : "";
   if (head !== p.head_sha) {
@@ -1747,12 +2130,14 @@ function pushPendingLocked(cfg, scratch) {
       pr_title: p.pr_title,
       pr_body: p.pr_body,
       compare_url: pushed.compare_url,
+      target_repo: cfgP.target.upstream,
     };
     if (cfgP.labAuto) return approvalNeededResult({ ...common, compare_url: undefined }, info, "Saved fix pushed.");
-    return { ...common, protected: gate.protected, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; protected path (${gate.protected.label}): no automatic lab test, test manually.` };
+    return { ...common, protected: gate.protected, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to ${forkName} ${p.branch}; protected path (${gate.protected.label}): no automatic lab test, test manually.` };
   }
   if (cfgP.labAuto) {
     const lab = enqueueLab(cfgP, { incident_id: p.incident_id, report_hash: p.report_hash, severity: p.severity, class: p.class }, {
+      target_repo: cfgP.target.upstream,
       branch: p.branch,
       fix_job: p.job || path.basename(scratch),
       attempt: Math.max(1, Number(p.attempt) || 1),
@@ -1763,10 +2148,10 @@ function pushPendingLocked(cfg, scratch) {
       // What was pushed (a replayed patch gets a new commit id).
       head_sha: git(neoDir, ["rev-parse", "HEAD"]).stdout.trim() || p.head_sha,
     });
-    return { ...common, compare_url: undefined, status: "lab_queued", lab: "queued", lab_job: lab.instance, summary: `Saved fix pushed to heimcloud/neo ${p.branch}; automated lab test queued.` };
+    return { ...common, compare_url: undefined, status: "lab_queued", lab: "queued", lab_job: lab.instance, summary: `Saved fix pushed to ${forkName} ${p.branch}; automated lab test queued.` };
   }
-  if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; compare link ready. Lab test ${pushed.lab.cancelled ? "cancelled by admin" : "skipped (not installed)"} — test manually.` };
-  if (pushed.lab.ok) return { ...common, status: "compare_ready", lab: "passed", summary: `Saved fix pushed to heimcloud/neo ${p.branch}; lab test passed.` };
+  if (pushed.lab.skipped) return { ...common, status: "awaiting_lab_test", lab: "skipped", summary: `Saved fix pushed to ${forkName} ${p.branch}; compare link ready. Lab test ${pushed.lab.cancelled ? "cancelled by admin" : "skipped (not installed)"} — test manually.` };
+  if (pushed.lab.ok) return { ...common, status: "compare_ready", lab: "passed", summary: `Saved fix pushed to ${forkName} ${p.branch}; lab test passed.` };
   return { ...common, compare_url: undefined, status: "needs_human", lab: "failed", summary: `Saved fix pushed but lab test failed (no Hermes retry in push mode): ${tail(redactIdentifyingDetails(pushed.lab.output, { knownSlugs: slugs }), 500)}` };
 }
 
@@ -1825,17 +2210,31 @@ export function processOne(cfg, entry) {
       log(`${entry.kind} incident ${job.incident_id} (${entry.name})`);
       stage(cfg, "claimed");
       const ctx = { scratch, slugs: knownSlugs(cfg) };
-      if (entry.kind === "push") {
+      // fix / lab / pr jobs work on the incident's allowlisted target repo.
+      const target = entry.kind === "triage" || entry.kind === "push" ? null : jobTarget(cfg, job);
+      if (entry.kind !== "triage" && entry.kind !== "push" && !target) {
+        const named = redactIdentifyingDetails(String(job.target_repo).slice(0, 120), { knownSlugs: ctx.slugs });
+        result = {
+          ...failureResult(entry.kind === "pr" ? "fix" : entry.kind, Number(job.incident_id), `Unknown target repo ${named}: not in the allowlist (services.ops.targets); nothing was cloned, pushed or tested.`),
+          status: "needs_human",
+          unknown_target: named,
+        };
+        bucket = "failed";
+        reason = { code: "unknown_target", reason: "target repo not allowlisted" };
+      } else if (entry.kind === "push") {
         const jm = JOB_NAME_RE.exec(String(job.job || ""));
         if (!jm || Number(jm[1]) !== Number(job.incident_id)) throw new Error("push job needs a matching fix job name");
         result = pushPending(cfg, path.join(cfg.scratchRoot, job.job));
       } else {
+        const tcfg = target ? targetCfg(cfg, target) : cfg;
         result =
           entry.kind === "triage"
             ? handleTriage(cfg, job, ctx)
             : entry.kind === "lab"
-              ? handleLab(cfg, job, { ...ctx, processing })
-              : handleFix(cfg, job, ctx);
+              ? handleLab(tcfg, job, { ...ctx, processing })
+              : entry.kind === "pr"
+                ? handlePr(tcfg, job, ctx)
+                : handleFix(tcfg, job, ctx);
       }
       if (result && result._bucket) {
         bucket = result._bucket;
@@ -1864,7 +2263,9 @@ export function processOne(cfg, entry) {
     }
   }
   if (currentJob) stage(cfg, "result", {}, { checkCancel: false });
-  const wrote = safeWriteResult(cfg, processing, result);
+  const noIngest = Boolean(result?._noIngest);
+  if (result) delete result._noIngest;
+  const wrote = noIngest ? { ok: true } : safeWriteResult(cfg, processing, result);
   if (!wrote.ok) {
     bucket = "failed";
     reason = { code: "results_unwritable", reason: `result not writable (${wrote.code})` };
@@ -1897,6 +2298,27 @@ export function writeWorkerStatus(cfg) {
   const t = tokenAvailable(cfg);
   updateStatus(cfg, { fork_push_token: t.ok, reason: t.ok ? null : t.reason, checked_at: new Date().toISOString() }, { heartbeat: false });
   return t;
+}
+
+/**
+ * `--check-token`: the one GitHub token works for both scopes, never printed.
+ *  push: heimcloud-autofix-env --check (git resolves the per-process helper
+ *        and gets a password for the fork URL)
+ *  api:  heimcloud-autofix-pr --check (token login = bot login, classic scope
+ *        public_repo, push permission on every allowlisted fork)
+ */
+export function checkToken(cfg) {
+  const push = tokenAvailable(cfg);
+  console.log(`push scope (git credential via ${cfg.envBin}): ${push.ok ? "ok" : `FAIL: ${push.reason}`}`);
+  const r = spawnSync(cfg.prBin, ["--check"], { encoding: "utf8", env: { ...prWrapperEnv(cfg) }, timeout: 90_000 });
+  let api = null;
+  try {
+    api = JSON.parse(String(r.stdout || "").trim().split("\n").pop());
+  } catch {
+    api = { ok: false, error: r.error ? String(r.error.code || r.error.message) : `exit ${r.status}` };
+  }
+  console.log(`api scope (${cfg.prBin}): ${api.ok ? "ok" : "FAIL"} ${JSON.stringify(api)}`);
+  return push.ok && api.ok ? 0 : 1;
 }
 
 // ---------------------------------------------------------------- kick
@@ -2046,10 +2468,21 @@ function drain(cfg, lockInfo) {
 
 export function main(argv = process.argv.slice(2)) {
   if (argv.includes("-h") || argv.includes("--help")) {
-    console.error("usage: heimcloud-ops-worker [--once] | --push-pending <job scratch dir> | --kick");
+    console.error("usage: heimcloud-ops-worker [--once] | --push-pending <job scratch dir> | --kick | --pr-poll | --check-token");
     return 2;
   }
   const cfg = config();
+  if (argv.includes("--check-token")) return checkToken(cfg);
+  if (argv.includes("--pr-poll")) {
+    try {
+      const out = prPoll(cfg);
+      if (out.skipped) log(`pr-poll: skipped (${out.skipped})`);
+      else for (const o of out) log(`pr-poll incident ${o.incident_id}: ${o.event || o.skipped || `error: ${o.error}`}`);
+    } catch (err) {
+      console.error(`heimcloud-ops-worker: pr-poll failed: ${err.message || err}`);
+    }
+    return 0;
+  }
   const pi = argv.indexOf("--push-pending");
   if (pi >= 0) {
     const dir = argv[pi + 1];

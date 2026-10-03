@@ -464,3 +464,12 @@ select.prio.p-low, .chip.prio.p-low { color: var(--k-muted); }
 @media (prefers-reduced-motion: reduce) { .lab-steps li { transition: none; } }
 .kc-warn { margin-top: 0.35rem; padding: 0.15rem 0.4rem; border-radius: 5px; font-size: 0.72rem; font-weight: 700; color: var(--k-crit); border: 1px solid rgba(255, 93, 108, 0.5); }
 .kc-labq { margin-top: 0.35rem; padding: 0.15rem 0.4rem; border-radius: 5px; font-size: 0.72rem; font-weight: 600; color: var(--k-muted, #94a3b8); border: 1px dashed var(--k-line); }
+
+/* PR loop line on a card (auto-opened upstream PR) */
+.kc-pr { margin-top: 0.35rem; font-size: 0.74rem; display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; }
+.kc-pr a { font-weight: 600; }
+.kc-pr .pr-st, .dr-kv .pr-st { font-size: 0.68rem; }
+.kc-pr.pr-approved .pr-st { color: #16a34a; border-color: #16a34a; }
+.kc-pr.pr-changes_requested .pr-st { color: #d97706; border-color: #d97706; }
+.kc-pr.pr-merged .pr-st { color: #7c3aed; border-color: #7c3aed; }
+.kc-pr.pr-closed .pr-st { color: #dc2626; border-color: #dc2626; }

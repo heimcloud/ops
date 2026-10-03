@@ -36,12 +36,14 @@ import {
   enqueuePushJob,
   enqueueLabRetry,
   labRetrySource,
+  enqueueOpenPrJob,
   isAutofixKindEnabled,
   getForkPushTokenState,
   NO_TOKEN_WARNING,
 } from "./queue.js";
 import { ingestResultsDir, pushRetryJob } from "./results.js";
 import { labApprovalSource, approveProtectedLab, skipProtectedLab } from "./lab-approval.js";
+import { startPrLoopValidation } from "./validation.js";
 import { registerQueueRoutes } from "./admin-queue.js";
 import { workerModel, queueModel } from "./worker-state.js";
 import { renderWorkerPanel } from "./worker-view.js";
@@ -479,14 +481,16 @@ export function createAdminRouter() {
       const incident = getIncident(id);
       if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
       try {
-        const src = labApprovalSource(incident, getLatestIncidentEvent(id, "fix_result"));
+        const src = labApprovalSource(incident, getLatestIncidentEvent(id, "fix_result"), { allowNoLab: action === "skip" });
         let msg;
         if (action === "approve") {
           const r = approveProtectedLab(incident, src);
           msg = `Lab test approved (protected: ${src.protected.label}); ${r.instance} queued`;
         } else {
-          skipProtectedLab(incident, src);
-          msg = "Lab test skipped: compare link opened (NOT lab-tested)";
+          const r = skipProtectedLab(incident, src);
+          msg = r.pr_job
+            ? `Lab test skipped: ${src.revise_round ? "revision reply" : "draft PR"} queued (NOT lab-tested)`
+            : "Lab test skipped: compare link opened (NOT lab-tested)";
         }
         if (json) return res.json({ ok: true, message: msg, ...cardPayload(id, base) });
         return res.redirect(303, backTo(req, base, id, "msg", msg));
@@ -501,6 +505,46 @@ export function createAdminRouter() {
   router.post("/incidents/:id/approve-lab", protectedLabHandler("approve"));
   router.post("/incidents/:id/skip-lab", protectedLabHandler("skip"));
   router.post("/incidents/:id/start-triage", enqueueHandler("triage"));
+  // "Open the PR now": lab-passed branch that only got a compare link.
+  router.post("/incidents/:id/open-pr", (req, res) => {
+    const base = req.adminBase;
+    const json = wantsJson(req);
+    if (ADMIN_READ_ONLY && json) return res.status(403).json({ ok: false, error: "read_only", message: "Admin is read-only (ADMIN_READ_ONLY)." });
+    if (refuseMutations(res, base)) return;
+    const id = Number(req.params.id);
+    const incident = getIncident(id);
+    if (!incident) return json ? res.status(404).json({ ok: false, error: "not_found" }) : res.status(404).send("Not found");
+    try {
+      if (incident.status !== "pr_opened" || incident.draft_pr_number) throw Object.assign(new Error(`Incident #${id} has no lab-tested branch waiting for a PR.`), { status: 409, code: "no_tested_branch" });
+      const { path: jobPath } = enqueueOpenPrJob(incident, getLatestIncidentEvent(id, "fix_result")?.meta);
+      const file = jobPath.split("/").pop();
+      addIncidentEvent(id, "pr_enqueued", "PR job queued (open the upstream PR from the lab-tested branch)", { job_file: file, job_kind: "pr" });
+      if (json) return res.json({ ok: true, message: "PR job queued", ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "msg", "PR job queued"));
+    } catch (err) {
+      const message = err.message || "Open PR failed";
+      if (json) return res.status(err.status || 409).json({ ok: false, error: err.code || "open_pr_failed", message, ...cardPayload(id, base) });
+      return res.redirect(303, backTo(req, base, id, "err", message));
+    }
+  });
+  // PR-loop validation: synthetic incident + doc-only fix branch (no Hermes
+  // for the first commit) → lab → real PR marked [validation] DO NOT MERGE.
+  router.post("/validation/pr-loop", (req, res) => {
+    const base = req.adminBase;
+    const json = wantsJson(req);
+    if (ADMIN_READ_ONLY && json) return res.status(403).json({ ok: false, error: "read_only", message: "Admin is read-only (ADMIN_READ_ONLY)." });
+    if (refuseMutations(res, base)) return;
+    try {
+      const r = startPrLoopValidation();
+      const msg = `PR-loop validation started: incident #${r.incident.id}, fix job ${r.job_file}`;
+      if (json) return res.json({ ok: true, message: msg, incident_id: r.incident.id });
+      return res.redirect(303, `${base}/?msg=${encodeURIComponent(msg)}`);
+    } catch (err) {
+      const message = err.message || "Validation could not start";
+      if (json) return res.status(err.status || 409).json({ ok: false, error: err.code || "validation_failed", message });
+      return res.redirect(303, `${base}/?err=${encodeURIComponent(message)}`);
+    }
+  });
 
   registerQueueRoutes(router, {
     readOnly: ADMIN_READ_ONLY,
@@ -558,6 +602,7 @@ function capabilities() {
     fix: isAutofixKindEnabled("fix"),
     push: isAutofixKindEnabled("push"),
     lab: isAutofixKindEnabled("lab"),
+    pr: isAutofixKindEnabled("pr"),
     protectedWatchdogSec: Math.max(60, Number(process.env.OPS_LAB_PROTECTED_WATCHDOG_SEC) || 600),
   };
 }

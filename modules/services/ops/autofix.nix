@@ -23,6 +23,12 @@
       workerOn = triageOn || fixOn;
       lab = af.lab;
       labOn = fixOn && lab.enable;
+      pr = af.pr;
+      prOn = fixOn && pr.enable;
+      # Store file, not an Environment= value: systemd strips the JSON quotes.
+      targetsFile = pkgs.writeText "heimcloud-ops-targets.json" (builtins.toJSON (import ../../../lib/targets.nix {inherit lib cfg;}));
+      # Environment= entry with spaces / quotes kept intact.
+      envQ = s: "\"${lib.escape ["\\" "\""] s}\"";
       # Upper bound of one lab run (lock wait + build + activation + settle +
       # generic/incident checks + rollback), used for unit timeouts / worker wait.
       labRunSec = lab.lockWaitSec + lab.buildTimeoutSec + lab.activateTimeoutSec + lab.settleSec + 180 + 20 * lab.checkTimeoutSec + lab.activateTimeoutSec + 300;
@@ -57,6 +63,7 @@
         "queue/fix"
         "queue/push"
         "queue/lab"
+        "queue/pr"
         "queue/processing"
         "queue/done"
         "queue/failed"
@@ -82,6 +89,7 @@
           "OPS_AUTOFIX_DENY_PATHS=${concatStringsSep "," af.denyPaths}"
           "OPS_AUTOFIX_BASE_PATHS=${concatStringsSep "," af.basePaths}"
           "OPS_NEO_BASE_REF=${af.neoBaseRef}"
+          "OPS_TARGETS_FILE=${targetsFile}"
           "OPS_AUTOFIX_HERMES_TIMEOUT_SEC=${toString af.hermesTimeoutSec}"
           "OPS_DB_PATH=${opsAppdata}/ops.sqlite"
           "HOME=${hermesState}"
@@ -102,6 +110,24 @@
           "OPS_AUTOFIX_LAB_WAIT_SEC=${toString (labRunSec + 600)}"
           "OPS_AUTOFIX_LAB_PLAN_TIMEOUT_SEC=${toString lab.planTimeoutSec}"
           "OPS_SYSTEMCTL_BIN=${config.systemd.package}/bin/systemctl"
+        ]
+        ++ optionals prOn [
+          "OPS_AUTOFIX_PR=1"
+          "OPS_AUTOFIX_PR_BIN=${workerPkg}/bin/heimcloud-autofix-pr"
+          # The one token (credentials ops.autofixForkPushToken, classic PAT).
+          "OPS_PR_TOKEN_FILE=/run/heimcloud-autofix/github-token"
+          "OPS_AUTOFIX_PR_STATE_DIR=${hermesState}/workspace/autofix-pr"
+          "OPS_PR_REVIEWER_LOGIN=${pr.reviewerLogin}"
+          "OPS_PR_REVIEWER_ID=${toString pr.reviewerId}"
+          "OPS_PR_BOT_LOGIN=${pr.botLogin}"
+          "OPS_PR_MAX_ROUNDS=${toString pr.maxRounds}"
+          (envQ "OPS_PR_STOP_PHRASE=${pr.stopPhrase}")
+          "OPS_PR_POLL_MINUTES=${toString pr.pollMinutes}"
+          "OPS_PR_DRAFT=${
+            if pr.draft
+            then "1"
+            else "0"
+          }"
         ];
 
       workerPath =
@@ -137,6 +163,9 @@
         users.users.hermes.packages = af.extraPackages;
 
         environment.systemPackages = [workerPkg];
+        # Same allowlist for interactive checks (`sudo -u hermes heimcloud-ops-worker
+        # --check-token`, `heimcloud-autofix-pr --check`): default OPS_TARGETS_FILE.
+        environment.etc."heimcloud-ops/targets.json".source = targetsFile;
 
         # Materialize autofix skills into HERMES_HOME/skills. Store path is not under
         # *-neo-hermes-skills, so hermes-neo-skills neither prunes nor shadows it.
@@ -171,7 +200,8 @@
             PathChanged =
               optional triageOn "${queueRoot}/triage"
               ++ optionals fixOn ["${queueRoot}/fix" "${queueRoot}/push"]
-              ++ optional labOn "${queueRoot}/lab";
+              ++ optional labOn "${queueRoot}/lab"
+              ++ optional prOn "${queueRoot}/pr";
             Unit = "heimcloud-ops-worker.service";
           };
         };
@@ -243,7 +273,41 @@
               ]
               ++ optional triageOn "OPS_AUTOFIX_TRIAGE=1"
               ++ optional fixOn "OPS_AUTOFIX_FIX=1"
-              ++ optional labOn "OPS_AUTOFIX_LAB=1";
+              ++ optional labOn "OPS_AUTOFIX_LAB=1"
+              ++ optional prOn "OPS_AUTOFIX_PR=1";
+          };
+        };
+
+        # PR loop poller (hermes, every pollMinutes): PR state (merged / closed)
+        # and review feedback from the configured reviewer (login + numeric id)
+        # on the PRs the loop opened; feedback queues a revise fix job. Polling,
+        # not a webhook: the ops host takes no inbound GitHub traffic and needs
+        # no webhook secret; 2-5 min latency is fine for a human review loop.
+        systemd.services.heimcloud-ops-pr-poll = mkIf prOn {
+          description = "Heimcloud Ops autofix: poll upstream PRs for state and review feedback";
+          wants = optional hasMaterialize "heimcloud-autofix-materialize-token.service";
+          after = optional hasMaterialize "heimcloud-autofix-materialize-token.service";
+          path = [workerPkg pkgs.nodejs_22 pkgs.sqlite pkgs.coreutils];
+          unitConfig.ConditionPathExists = [opsAppdata];
+          serviceConfig = {
+            Type = "oneshot";
+            User = "hermes";
+            Group = "hermes";
+            UMask = "0007";
+            WorkingDirectory = "${hermesState}/workspace";
+            TimeoutStartSec = "600";
+            ExecStart = "${workerPkg}/bin/heimcloud-ops-worker --pr-poll";
+            Environment = workerEnv;
+            EnvironmentFile = mkIf (af.redactExtraSlugsFile != null) [af.redactExtraSlugsFile];
+          };
+        };
+        systemd.timers.heimcloud-ops-pr-poll = mkIf prOn {
+          description = "Heimcloud Ops autofix PR poll";
+          wantedBy = ["timers.target"];
+          timerConfig = {
+            OnBootSec = "3min";
+            OnUnitActiveSec = "${toString pr.pollMinutes}min";
+            AccuracySec = "20s";
           };
         };
         systemd.timers.heimcloud-ops-worker-kick = mkIf workerOn {
@@ -321,6 +385,8 @@
                 else "false"
               }"
               "LABTEST_PROTECTED_PATHS=${concatStringsSep "," af.denyPaths}"
+              # Allowlisted targets: which flake input a non-neo target overrides.
+              "LABTEST_TARGETS_FILE=${targetsFile}"
               "LABTEST_BASE_PATHS=${concatStringsSep "," af.basePaths}"
               "LABTEST_PROTECTED_WATCHDOG_SEC=${toString lab.protectedWatchdogSec}"
               "LABTEST_OPS_UID=${uid}"

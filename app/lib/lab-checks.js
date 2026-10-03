@@ -342,9 +342,12 @@ export function normalizeProtected(p) {
  * uid can read) when an admin approves a protected lab test. The root runner
  * recomputes it from the job spec + its own instance name.
  */
-export function labApprovalMessage({ incident_id, instance, branch, head_sha, event_id, approved_at }) {
+export function labApprovalMessage({ incident_id, instance, branch, head_sha, event_id, approved_at, target_repo }) {
+  // v2: the target repo is signed too (the runner overrides that target's
+  // flake input); a job without one is the default neo target.
   return [
-    "heimcloud-ops-lab-approval-v1",
+    "heimcloud-ops-lab-approval-v2",
+    String(target_repo || "madebydamo/neo").toLowerCase(),
     String(Number(incident_id)),
     String(instance),
     String(branch),

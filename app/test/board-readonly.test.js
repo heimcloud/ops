@@ -124,3 +124,32 @@ test("read-only: protected-lab approval / skip refused (JSON + form), nothing si
     await new Promise((r) => server.close(r));
   }
 });
+
+test("read-only: open-pr and PR-loop validation refused (JSON + form), nothing created or queued", async () => {
+  process.env.OPS_AUTOFIX_PR = "true";
+  const inc = db.upsertIncident({ report_hash: "ro-3", unit: "docker-searxng", severity: "high", logs_excerpt: "x" }).incident;
+  const app = express();
+  app.use("/admin", createAdminRouter());
+  const server = await new Promise((r) => {
+    const s = app.listen(0, "127.0.0.1", () => r(s));
+  });
+  const port = server.address().port;
+  try {
+    const board = await request(port, "GET", "/admin/");
+    assert.doesNotMatch(board.body, /validation\/pr-loop/, "no validation button read-only");
+    const n = db.getDb().prepare("SELECT COUNT(*) AS n FROM incidents").get().n;
+    for (const p of [`/admin/incidents/${inc.id}/open-pr`, "/admin/validation/pr-loop"]) {
+      const j = await request(port, "POST", p, { json: {} });
+      assert.equal(j.status, 403, p);
+      assert.equal(JSON.parse(j.body).error, "read_only");
+      const f = await request(port, "POST", p, { form: {} });
+      assert.equal(f.status, 403, `${p} form`);
+    }
+    assert.equal(db.getDb().prepare("SELECT COUNT(*) AS n FROM incidents").get().n, n);
+    assert.equal(fs.existsSync(path.join(tmpDir, "queue", "pr")), false);
+    assert.equal(fs.existsSync(path.join(tmpDir, "queue", "fix")), false);
+  } finally {
+    delete process.env.OPS_AUTOFIX_PR;
+    await new Promise((r) => server.close(r));
+  }
+});

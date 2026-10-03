@@ -13,6 +13,10 @@
       cp ${../../scripts/autofix/queue-control.js} $out/queue-control.js
       cp ${../../app/lib/lab-checks.js} $out/lab-checks.js
       cp ${../../scripts/autofix/labtest.mjs} $out/labtest.mjs
+      cp ${../../app/lib/targets.js} $out/targets.js
+      cp ${../../scripts/autofix/pr.mjs} $out/pr.mjs
+      cp ${../../scripts/autofix/pr-wrapper.mjs} $out/pr-wrapper.mjs
+      cp ${../../scripts/autofix/push-guard.mjs} $out/push-guard.mjs
     '';
     worker = pkgs.writeShellApplication {
       name = "heimcloud-ops-worker";
@@ -31,9 +35,18 @@
         exec ${pkgs.nodejs_22}/bin/node ${workerSrc}/labtest.mjs "$@"
       '';
     };
+    # The only code that hands the GitHub token to the REST API (whitelisted
+    # PR / comment / read calls on allowlisted upstreams; --check verifies it).
+    prWrapper = pkgs.writeShellApplication {
+      name = "heimcloud-autofix-pr";
+      runtimeInputs = [pkgs.nodejs_22];
+      text = ''
+        exec ${pkgs.nodejs_22}/bin/node ${workerSrc}/pr-wrapper.mjs "$@"
+      '';
+    };
     heimcloud-ops-worker = pkgs.symlinkJoin {
       name = "heimcloud-ops-worker";
-      paths = [worker labtest];
+      paths = [worker labtest prWrapper];
     };
   in {
     packages = {

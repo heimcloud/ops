@@ -155,6 +155,16 @@ test("lab-checks.js has one source: scripts/autofix symlinks it and the worker p
   assert.match(pkg, /cp \$\{\.\.\/\.\.\/app\/lib\/lab-checks\.js\} \$out\/lab-checks\.js/);
 });
 
+test("targets.js has one source: scripts/autofix symlinks it; the worker package copies it with pr / wrapper / push guard", () => {
+  const link = path.join(repo, "scripts", "autofix", "targets.js");
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), "scripts/autofix/targets.js must be a symlink");
+  assert.equal(fs.readlinkSync(link), "../../app/lib/targets.js");
+  const pkg = fs.readFileSync(path.join(repo, "modules/packages/heimcloud-ops-worker.nix"), "utf8");
+  assert.match(pkg, /cp \$\{\.\.\/\.\.\/app\/lib\/targets\.js\} \$out\/targets\.js/);
+  for (const f of ["pr.mjs", "pr-wrapper.mjs", "push-guard.mjs"]) assert.ok(pkg.includes(`cp \${../../scripts/autofix/${f}} $out/${f}`), f);
+  assert.match(pkg, /name = "heimcloud-autofix-pr";/);
+});
+
 test("auto-triage is off unless triage.enable and triage.autoEnqueue are both set (default false)", () => {
   const opt = fs.readFileSync(path.join(repo, "modules/services/ops/option.nix"), "utf8");
   const def = fs.readFileSync(path.join(repo, "modules/services/ops/default.nix"), "utf8");

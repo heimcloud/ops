@@ -33,8 +33,10 @@
         GITHUB_TOKEN = cfg.githubToken;
         OPS_GITHUB_TOKEN = cfg.githubToken;
         SITE_URL = cfg.siteUrl;
-        OPS_TARGET_ALLOWLIST = cfg.targetAllowlist;
       };
+      # Allowlisted upstream targets (single source of truth, see lib/targets.nix).
+      targetsJson = builtins.toJSON (import ../../../lib/targets.nix {inherit lib cfg;});
+      prOn = fixOn && af.pr.enable;
       autoTriage = triageOn && af.triage.autoEnqueue;
       # Only whether a fork-push token is configured (never its value). The
       # worker's runtime check (queue/worker-status.json) overrides this hint.
@@ -57,6 +59,7 @@
         "${opsAppdata}/queue/fix"
         "${opsAppdata}/queue/push"
         "${opsAppdata}/queue/lab"
+        "${opsAppdata}/queue/pr"
         "${opsAppdata}/queue/processing"
         "${opsAppdata}/queue/done"
         "${opsAppdata}/queue/failed"
@@ -99,6 +102,10 @@
               # Shown in the "Approve lab test" confirm (protected-path fixes).
               OPS_LAB_PROTECTED_WATCHDOG_SEC = toString af.lab.protectedWatchdogSec;
               OPS_AUTOFIX_TOKEN_CONFIGURED = boolStr tokenConfigured;
+              OPS_TARGETS = targetsJson;
+              OPS_NEO_BASE_REF = af.neoBaseRef;
+              # PR loop: "Skip lab" queues a draft PR, "Open the PR now", validation button.
+              OPS_AUTOFIX_PR = boolStr prOn;
               ADMIN_ENABLED = boolStr cfg.admin.enabled;
               ADMIN_PATH = adminPath;
               ADMIN_READ_ONLY = boolStr cfg.admin.readOnly;

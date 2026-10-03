@@ -45,6 +45,7 @@ import {
 } from "./lab-checks.js";
 import { redactIdentifyingDetails, getExtraRedactSlugs } from "./redact.js";
 import { cancelRequested } from "./queue-control.js";
+import { parseTargets, findTarget, readTargetsFile } from "./targets.js";
 
 const SELF = fileURLToPath(import.meta.url);
 const SAFE_ENV_DROP = ["GH_TOKEN", "GITHUB_TOKEN", "GH_PR_TOKEN", "OPS_GITHUB_TOKEN", "NIX_CONFIG"];
@@ -102,6 +103,8 @@ export function labConfig(env = process.env) {
     // ---- protected runs (fix touches ops / Hermes / swag / base system)
     labSharesOps: !["0", "false", "no", "off"].includes(String(env.LABTEST_SHARES_OPS_HOST ?? "true").toLowerCase()),
     protectedPaths: normalizePathPrefixes(String(env.LABTEST_PROTECTED_PATHS || DEFAULT_PROTECTED_PATHS.join(",")).split(",")),
+    // Allowlisted targets (same JSON as OPS_TARGETS); unset = neo only (legacy).
+    targets: env.LABTEST_TARGETS || env.LABTEST_TARGETS_FILE ? parseTargets(env.LABTEST_TARGETS || readTargetsFile(env.LABTEST_TARGETS_FILE)) : null,
     basePaths: normalizePathPrefixes(String(env.LABTEST_BASE_PATHS || DEFAULT_BASE_PATHS.join(",")).split(",")),
     // Shorter independent watchdog deadline for approved protected runs.
     protectedWatchdogSec: num(env.LABTEST_PROTECTED_WATCHDOG_SEC, 600, 60),
@@ -545,7 +548,57 @@ export function loadSpec(cfg, instance) {
     // Written by the app on an admin approval (verified in verifyApproval).
     approval: spec.approval && typeof spec.approval === "object" ? spec.approval : null,
     claimsProtected: Boolean(spec.protected),
+    targetRepo: typeof spec.target_repo === "string" && spec.target_repo ? spec.target_repo : null,
   };
+}
+
+/** Root flake inputs whose locked/original github source is one of the slugs. */
+export function matchInputs(locks, slugs) {
+  const want = new Set(slugs.map((x) => String(x).toLowerCase()));
+  const root = locks?.nodes?.[locks.root || "root"];
+  const out = [];
+  for (const [name, ref] of Object.entries(root?.inputs || {})) {
+    if (typeof ref !== "string") continue; // follows
+    const n = locks.nodes[ref];
+    for (const src of [n?.locked, n?.original]) {
+      if (src && src.type === "github" && want.has(`${src.owner}/${src.repo}`.toLowerCase())) {
+        out.push(name);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Lab settings for the job's target: input / flake URL / protected paths. The
+ * neo entry keeps the LABTEST_INPUT / _FLAKE_URL / _PROTECTED_PATHS values.
+ * Other targets: their flakeInput, or (null) the one root input of the host
+ * flake whose source is the upstream or the fork. Fail closed: unknown
+ * target, lab = "none", 0 or >1 matching inputs → error, nothing built.
+ */
+export async function resolveLabTarget(cfg, spec) {
+  if (!cfg.targets) {
+    if (spec.targetRepo && spec.targetRepo.toLowerCase() !== "madebydamo/neo") return { ok: false, reason: `target ${spec.targetRepo} is not configured on the lab runner (LABTEST_TARGETS unset)` };
+    return { ok: true, cfg };
+  }
+  const t = spec.targetRepo ? findTarget(cfg.targets, spec.targetRepo) : cfg.targets[0];
+  if (!t) return { ok: false, reason: `target ${String(spec.targetRepo).slice(0, 120)} is not allowlisted` };
+  if (t.lab === "none") return { ok: false, reason: `target ${t.upstream} has no lab method` };
+  if (t.upstream.toLowerCase() === "madebydamo/neo") return { ok: true, cfg, target: t };
+  let input = t.flakeInput;
+  if (!input) {
+    const hm = await runCmd(cfg.nix, ["--extra-experimental-features", "nix-command flakes", "flake", "metadata", "--json", "--no-write-lock-file", cfg.flake], { timeoutSec: 300, graceSec: cfg.killGraceSec, cwd: cfg.flake });
+    let names = [];
+    try {
+      names = matchInputs(JSON.parse(hm.stdout).locks, [t.upstream, t.fork]);
+    } catch {
+      return { ok: false, reason: `could not read the host flake inputs (exit ${hm.status})` };
+    }
+    if (names.length !== 1) return { ok: false, reason: `${names.length ? "several" : "no"} host flake input(s) for ${t.upstream}${names.length ? ` (${names.join(", ")})` : ""}; set flakeInput on the target` };
+    input = names[0];
+  }
+  return { ok: true, target: t, cfg: { ...cfg, input, flakeUrl: t.flakeUrl, protectedPaths: normalizePathPrefixes(t.protectedPaths), basePaths: [] } };
 }
 
 // ------------------------------------------------------------------ protected runs
@@ -678,7 +731,7 @@ export async function verifyApproval(cfg, spec, instance) {
   if (!Number.isFinite(at) || at > Date.now() + 5 * 60_000 || Date.now() - at > cfg.approvalMaxAgeSec * 1000) return { ok: false, reason: "approval expired" };
   const k = readApprovalKey(cfg);
   if (k.error) return { ok: false, reason: k.error };
-  const msg = labApprovalMessage({ incident_id: spec.incidentId, instance, branch: spec.branch, head_sha: spec.headSha, event_id: eventId, approved_at: a.approved_at });
+  const msg = labApprovalMessage({ incident_id: spec.incidentId, instance, branch: spec.branch, head_sha: spec.headSha, event_id: eventId, approved_at: a.approved_at, target_repo: spec.targetRepo });
   const want = crypto.createHmac("sha256", k.key).update(msg).digest();
   const got = Buffer.from(a.sig, "hex");
   if (got.length !== want.length || !crypto.timingSafeEqual(got, want)) return { ok: false, reason: "approval signature invalid" };
@@ -1007,6 +1060,16 @@ export async function runLab(cfg, instance) {
     }
     result.incident_id = spec.incidentId;
     result.branch = spec.branch;
+    const lt = await resolveLabTarget(cfg, spec);
+    if (!lt.ok) {
+      result.failed_stage = "validating";
+      result.reason = `${lt.reason}; nothing built or activated`;
+      result.target_error = true;
+      return result;
+    }
+    cfg = lt.cfg;
+    result.target_repo = lt.target?.upstream || spec.targetRepo || "madebydamo/neo";
+    result.flake_input = cfg.input;
     result.flake_url = flakeUrlFor(cfg, spec.branch);
     result.plan_errors = spec.planErrors.map(red);
     // A check the runner drops must be visible on the card, never vanish.

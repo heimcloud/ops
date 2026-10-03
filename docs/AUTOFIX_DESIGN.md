@@ -1,6 +1,6 @@
 # Auto-fix loop design
 
-**Goal:** the ops host turns incidents into **already-coded, lab-tested fix branches**. The runner pushes the branch to the `heimcloud/neo` fork and posts a compare link in Ops; Damo opens the upstream PR in the GitHub web UI. Humans merge; nothing auto-merges.
+**Goal:** the ops host turns incidents into **already-coded, lab-tested fix branches**. The worker pushes the branch to the allowlisted `heimcloud/<repo>` fork and, with `autofix.pr.enable`, opens the upstream PR itself and addresses review comments from Damo on the same branch (see "PR loop"). Without it the compare link in Ops stays the way to open the PR. Humans merge; nothing auto-merges.
 
 Implements [REQ-G10](REQUIREMENTS.md#g-ops--hermes-self-improvement) (local Hermes only) and [REQ-G12](REQUIREMENTS.md#g-ops--hermes-self-improvement) (test before PR). Outbound GitHub text follows [REQ-G11](REQUIREMENTS.md#g-ops--hermes-self-improvement) via `app/lib/redact.js`.
 
@@ -23,7 +23,11 @@ flowchart TD
   L0 --> L["root heimcloud-ops-labtest@job<br/>locks, record generation + pins,<br/>arm watchdog, activate branch tip"]
   L --> M{Generic + incident checks}
   M --> O[ALWAYS switch back to the recorded system<br/>verify generation + byte-identical pins]
-  O -->|pass| N[Compare link + anonymized evidence<br/>Damo opens upstream PR / merge]
+  O -->|pass| N[Worker opens the upstream PR<br/>or compare link when pr.enable is off]
+  N --> R{Review comment from Damo?}
+  R -->|yes, round &lt; maxRounds| H
+  R -->|merged| S[resolved]
+  R -->|closed / cap / /ops stop| Q
   O -->|fail| P{Attempts &lt; maxAttempts?}
   P -->|yes: evidence fed back| H
   P -->|no| Q[needs_human<br/>NO PR]
@@ -35,11 +39,11 @@ flowchart TD
 |------|--------|
 | Local AI only | Triage, summaries, and coding run on **local Hermes** on the ops host (`hermes-agent.service`, `hermes gateway`, provider xai-oauth / `grok-build-latest`). No external/cloud coding agents. |
 | Non-interactive call | As user `hermes`: `hermes --yolo chat -Q --source tool --max-turns 40 -s <skill> --query-file <prompt_file>` (same pattern as supervise). Auth in `$HERMES_HOME/auth.json` (`HERMES_HOME=/var/neo/DATA/AppData/hermes/.hermes`). Port 18789 is configured but not listening — do not depend on it. |
-| GitHub from ops host only | No GitHub App is used in this phase. Credentials provide a fine-grained fork-push token at `/run/heimcloud-autofix/github-token`; `heimcloud-autofix-env <cmd>` sets the scoped Git helper for the child process, and `--check` non-zero means triage-only. Hermes pushes the fix branch to `heimcloud/neo`; the runner posts the compare link and prepared body in Ops, and Damo opens the upstream PR in the GitHub web UI. Never on lab machines; nix/flake fetches stay unauthenticated. |
+| GitHub from ops host only | No GitHub App. ONE token: the classic PAT of the `heimcloud` account (scope `public_repo`), `[services.credentials.ops] autofixForkPushToken` → `/run/heimcloud-autofix/github-token` (hermes, 0400). It is used only by the worker's push guard (git via `heimcloud-autofix-env`) and by the `heimcloud-autofix-pr` wrapper (whitelisted PR / comment / read calls); see "PR loop". `heimcloud-autofix-env --check` non-zero means triage-only. Hermes never gets the token. Never on lab machines; nix/flake fetches stay unauthenticated. |
 | Lab pull | Public fork **branch tip** (e.g. `github:heimcloud/neo/fix/…`) as a one-off `--override-input` for the test build; never a SHA (or anything) written to persistent config; **no** GitHub auth on lab boxes. |
 | Redaction | Before any GitHub write: branch name, commit message, diff, PR title/body, evidence. `app/lib/redact.js` + DB `DISTINCT customer_repo_slug` + `OPS_REDACT_EXTRA_SLUGS`. **Fail closed** on hit; `app/test` enforces payload anonymity. |
 | Branch names | `fix/<short-topic>` or `ops/incident-<n>` — no customer info. |
-| No auto-merge | The runner does not open or merge a PR; Damo opens the upstream PR from the compare link and merges it. |
+| No auto-merge | The worker may open a PR and push revisions to its branch; it never merges, approves, closes or touches the base branch. The wrapper has no merge / review / close endpoint at all. |
 
 ## Ops ↔ Hermes bridge (no container network change)
 
@@ -75,7 +79,7 @@ Until a dedicated lab box exists:
 
 | Runner verdict | Worker status | Incident | Board |
 |---|---|---|---|
-| pass | `compare_ready` (+ compare link, PR text) | **pr_opened** (Awaiting PR) | "Open the PR from the compare link", "Lab passed ✓n ✗0" |
+| pass | `compare_ready` (+ compare link, PR text) | **pr_opened** (PR open) | "Open the PR from the compare link", "Lab passed ✓n ✗0" |
 | fail, attempt < maxAttempts | `lab_retry` + new fix job (`attempt+1`, same branch, redacted `lab_failure` evidence) | **fixing** | no badge; card shows "Lab failed ✓n ✗m" |
 | fail, last attempt | `needs_human` (no compare link) | **needs_human** | "Lab test failed after N attempt(s)" |
 | error (network / rate limit / lock timeout / arm failure / branch moved) | `lab_error`, job → `failed/` | **testing** | "Lab test error" + Retry lab |
@@ -136,7 +140,7 @@ While `labSharesOpsHost` (default true) the path prefixes in `autofix.denyPaths`
 2. The worker does **not** enqueue a lab job. Result `lab_approval_needed` (`lab: awaiting_approval`, `protected: {areas, paths, core}`, gated `head_sha`, `pending_compare_url`, PR text) → incident **needs_human**, badge **"Protected path (hermes): approve lab test"**. `compare_url` stays empty; the pending link is only used by Skip. Without `autofix.lab.enable` the result is `awaiting_lab_test` (manual test) with the protected note.
 3. The badge stays until the admin acts (nothing times it out). Board/drawer buttons:
    - **Approve lab test** (only with the lab stage on): `POST /admin/incidents/:id/approve-lab`. The app writes a `lab_approved` incident event (`lab_job`, `branch`, `head_sha`, `protected`, `approved_by: "admin"`, `approved_at`), then the normal lab job `queue/lab/<id>-<ts>.json` with `protected`, `approved_by: "admin"` and `approval: {v: 1, by: "admin", event_id, approved_at, sig}`. The incident moves to **testing**, no badge while it runs (automated lab progress). The job then runs like every lab job (planning → root runner → verdict), with the hardening below. For a **base-system** change the button reads "Approve lab test (base system!)" (danger style) and its confirm says that the test can cut network/SSH on the shared ops/lab host, when the watchdog rolls back, and that an unreachable host needs console access.
-   - **Skip lab, open compare link**: `POST /admin/incidents/:id/skip-lab`. The incident goes to **pr_opened** (Awaiting PR) with the pending compare link and a `lab_skipped` event (`warning: "not lab-tested"`); the card shows "NOT lab-tested" and the badge reads "Open the PR from the compare link (NOT lab-tested)".
+   - **Skip lab, open compare link**: `POST /admin/incidents/:id/skip-lab`. The incident goes to **pr_opened** (PR open) with the pending compare link and a `lab_skipped` event (`warning: "not lab-tested"`); the card shows "NOT lab-tested" and the badge reads "Open the PR from the compare link (NOT lab-tested)".
    - Close, as always.
 4. A Hermes retry after a failed protected lab test produces a new commit → a new `lab_approval_needed` → a fresh approval. A runner-rejected approval also comes back as `lab_approval_needed` ("approve again").
 
@@ -145,7 +149,7 @@ While `labSharesOpsHost` (default true) the path prefixes in `autofix.denyPaths`
 **Approval check in the root runner** (independent of the worker's flags):
 
 - *Detection*: the runner diffs the protected subtrees itself: deployed neo source (`builtins.fetchTree` of the host flake's locked neo input) vs the fork branch (`nix flake metadata` of `flakeUrl`, whose revision must equal the gated `head_sha`, otherwise "fix branch moved"). Anything it cannot determine counts as protected (fail closed), as does a job that claims `protected` or carries an approval.
-- *Signature*: HMAC-SHA256 over `heimcloud-ops-lab-approval-v1 / incident / instance / branch / head_sha / event_id / approved_at`. The key `<ops appdata>/private/lab-approval.key` is created by the app on the first approval (dir 0700, file 0400, owner = the ops container uid). The runner opens it `O_NOFOLLOW` and requires owner `LABTEST_OPS_UID` and no group/other bits. The worker and Hermes (user `hermes`, group access to the queue and the DB only) cannot read it, so they cannot mint a signature even though they can write job files and DB rows.
+- *Signature*: HMAC-SHA256 over `heimcloud-ops-lab-approval-v2 / target repo / incident / instance / branch / head_sha / event_id / approved_at`. The key `<ops appdata>/private/lab-approval.key` is created by the app on the first approval (dir 0700, file 0400, owner = the ops container uid). The runner opens it `O_NOFOLLOW` and requires owner `LABTEST_OPS_UID` and no group/other bits. The worker and Hermes (user `hermes`, group access to the queue and the DB only) cannot read it, so they cannot mint a signature even though they can write job files and DB rows.
 - *DB event*: `sqlite3 -readonly` lookup of the `event_id`: kind `lab_approved`, same incident, `meta.lab_job` = this instance, same `branch`, `head_sha`, `approved_by: "admin"`.
 - *Age and single use*: at most `LABTEST_APPROVAL_MAX_AGE_SEC` (3 days) old; `<state>/approvals/<event_id>.used` is created (`O_EXCL`) before the watchdog is armed, so an approval is used at most once.
 - Missing / invalid → `failed_stage: approval`, `approval_required` / `approval_invalid`, **nothing built or activated**.
@@ -171,6 +175,47 @@ While `labSharesOpsHost` (default true) the path prefixes in `autofix.denyPaths`
 Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines; no limiter / proxy-header warning; healthz 200; search returns results.
 
 **On failure:** rollback (always, pass or fail) → attach evidence to the incident → Hermes retry with failure context up to `maxAttempts` → then stop, status **`needs_human`**, **no PR**.
+
+## PR loop (auto-PR + review feedback)
+
+`autofix.pr.enable` (default off, needs `fix.enable`). Never merges.
+
+### Flow
+
+1. **Open.** After a lab pass the worker opens the PR `heimcloud:<branch>` → `<baseRef>` on the target upstream, or adopts the open PR it already made for that head (re-run, crash between create and record, HTTP 422). The body is the prepared (already gated) body plus the redacted lab evidence and a footer naming the reviewer, the round cap and the stop phrase. `pr.draft = true` opens every PR as draft. Admin **Skip lab** (protected change, or a target with `lab = "none"`) queues a kind `pr` job that opens a **draft** PR with a "NOT lab-tested" banner. **Open the PR now** (`POST /admin/incidents/:id/open-pr`) does the same for a lab-passed branch that only got a compare link (token added later, API error). The card goes to **PR open** with `#n`, state chip, round `n/cap`.
+2. **Poll.** `heimcloud-ops-pr-poll.timer` (every `pollMinutes`, 2–5) runs `heimcloud-ops-worker --pr-poll` as `hermes`: per tracked PR the PR itself, issue comments, review comments and reviews. Polling, not webhooks: the ops container is `NetworkMode=internal` and the ops host takes no inbound GitHub traffic. A few minutes of latency is fine for a review loop; one poll costs ~4 REST calls per open PR (well inside 5000/h).
+3. **Feedback.** Only the configured reviewer counts: login **and** numeric id (`reviewerId`) **and** account type `User`. Everyone else, bots and the bot's own replies are ignored (counted as `ignored`). Every comment / review id is recorded as seen, so nothing triggers twice. An approval alone is shown on the card, never acted on; plain acknowledgements ("LGTM", "thanks") and comments made before a later approval are not feedback. Actionable feedback queues a **revise** fix job on the same branch: `revise {round, pr_number}` plus the feedback in a random fence (author verified, text untrusted: no commands, no scope change, no credentials / CI / secrets). The incident goes back to **Fixing**. While the round runs the poller waits.
+4. **Revise.** The worker fetches the PR branch from the fork; Hermes must add at least one commit that **descends from the PR head** (no history rewrite, else needs_human); the usual gates run; plain push (no `--force`); lab test as usual; then a reply comment on the PR ("Revision n/cap pushed", commit subjects, Hermes' summary, lab verdict). The title and body of the PR are kept.
+5. **Stop.** Round cap (`maxRounds`, default 3) reached and more feedback → **halted** (`revision_cap`, needs_human, nothing more posted). A line equal to `stopPhrase` (default `/ops stop`) from the reviewer → **stopped** (state still tracked, nothing more done). A revise round that fails the lab test or whose reply hits the redaction gate → halted. **Merged** → incident resolved. **Closed without merge** → needs_human "PR closed without merge". A manual close in the admin is never undone.
+
+State per PR: `$HERMES_STATE/workspace/autofix-pr/<incident>.json` (0600, hermes), a directory lock shared by the worker and the poller. The app learns everything from kind `pr` results (`pr_event` opened / adopted / state / feedback / revised / merged / closed / stopped / halted / blocked / error): `pr_state` / `pr_merged` events, `draft_pr_url` / `draft_pr_number` (only URLs of allowlisted upstreams are stored).
+
+### One token, two guarded uses
+
+`[services.credentials.ops] autofixForkPushToken` → `/run/heimcloud-autofix/github-token`: a **classic PAT** of the GitHub **user** account `heimcloud`, scope **`public_repo`**. It covers every public fork under `heimcloud` with no per-repo setup. No credentials plugin change was needed: the same key and path as the fork-push token before. The token is never in a global credential helper and never in Hermes' environment.
+
+- **git push** only through `push-guard.mjs`: destination = explicit URL `https://github.com/<fork>.git` of an allowlisted target fork (never a remote name); `git ls-remote --get-url` must return that same URL (no `insteadOf` / `pushInsteadOf` rewrite); the clone's local config must not carry `include.*`, `credential.*`, URL rewrites, `core.hooksPath`, `core.sshCommand` or `extraheader`; one refspec `<full sha>:refs/heads/<fix/*|ops/*>`, never the fork's base branch, a tag or a raw ref; hooks off (`core.hooksPath=/dev/null`, `--no-verify`), `--no-follow-tags`; `GH_TOKEN` / `GITHUB_TOKEN` / `GH_PR_TOKEN` unset for git. The credential reaches git only through `heimcloud-autofix-env`'s per-process helper.
+- **REST API** only through `heimcloud-autofix-pr` (`pr-wrapper.mjs`, the only reader of the token file for the API, `O_NOFOLLOW`): one JSON request on stdin, spawned with a minimal env. Whitelist per configured upstream U: `GET /repos/U/pulls?head=heimcloud:<fix/*|ops/*>`, `POST /repos/U/pulls` (head of the configured fork, base = baseRef, `maintainer_can_modify` false, fixed key set), `GET /repos/U/pulls/N`, `PATCH /repos/U/pulls/N` (title/body only), `POST /repos/U/issues/N/comments`, `GET` issue comments / review comments / reviews. PATCH and comments only on **our** PRs (the wrapper GETs the PR first: author = bot, head repo = the target fork, head ref `fix/*`/`ops/*`). Everything else (merge, reviews, close, contents, refs, other repos, `%2f` / `..` paths, extra query keys) is refused **before** the token is read. Outgoing title / body / comment text passes the identifier scan again (the worker runs the full gate with the DB slugs first). The API base is api.github.com; the test override may only point to loopback. No redirects.
+- `heimcloud-ops-worker --check-token` runs `heimcloud-autofix-env --check` (push side) and `heimcloud-autofix-pr --check` (`GET /user`: login = bot, `x-oauth-scopes` has `public_repo`; `GET /repos/<fork>`: `permissions.push` for every target). Prints booleans, the login and scope names, never the token.
+
+**Caveat:** Hermes runs as the same uid (`hermes`) and has passwordless sudo (neo's Hermes module), so it **could** read the token file itself. The wrappers limit what *our* code does with the token; they are not a sandbox against Hermes. The agents and the token act as the same GitHub account. Real isolation needs a separate machine account (and Hermes without general sudo).
+
+**Branch protection (applied, backstop only):** a default-branch ruleset on `heimcloud/neo`, `heimcloud/ops`, `heimcloud/credentials` and `heimcloud/shop` blocks deletion and non-fast-forward pushes (no required reviews or checks). It stops a force-push or delete of a default branch with the token; it does not separate the loop from the agents.
+
+Optional later hardening in the credentials repo (not needed now): drop the `GH_PR_TOKEN` export and narrow its git helper from `heimcloud/*` to the configured forks.
+
+### Allowlist (targets)
+
+`[[services.ops.targets]]` (Nix option `neo.services.ops.targets`) is the single allowlist for triage, worker, wrapper and lab runner (rendered to `OPS_TARGETS` JSON for the container, `OPS_TARGETS_FILE` / `LABTEST_TARGETS_FILE` for the units, `/etc/heimcloud-ops/targets.json` as the default for interactive checks; `app/lib/targets.js`, copied into the worker package). The `madebydamo/neo` → `heimcloud/neo` entry always exists and comes first (its `baseRef`, lab input, flake URL and protected paths default to the `autofix.*` options). Entry fields: `upstream`, `fork` (default `heimcloud/<repo>`, must be under `heimcloud`), `baseRef`, `flakeInput`, `lab` (`flake-override` | `none`), `flakeUrl` (default `github:<fork>/{branch}`), routing hints `units` (globs) / `paths` / `keywords`, `protectedPaths` (default none for non-neo repos). In use: `madebydamo/neo` and `madebydamo/highsea.neo` (fork `heimcloud/highsea.neo`, entry in settings.toml). `targetAllowlist` is deprecated and ignored.
+
+- **Triage** gets the list with hints and returns `target_repo`; a repo outside the list → needs_human "Unknown target repo" (never stored). Without a triage answer the deterministic router picks by hints (unit +3, path +2, keyword +1; default neo).
+- **Worker**: a job naming a repo outside the list → needs_human `unknown_target`, nothing cloned or pushed. Clone, push, compare link, PR and protected paths follow the job's target.
+- **Lab** (`flake-override`): the root runner overrides that target's host flake input with `<flakeUrl>` for the branch. `flakeInput` names the input (for a neo plugin: the input name the host flake uses for it, e.g. `pluginN` = its index in `core.plugins`); omitted, the runner auto-detects the **one** root input whose GitHub source is the upstream or the fork (0 or several → error, nothing built). `lab = "none"`: the branch is pushed and the card says "No lab method: test by hand"; **Skip lab** then opens a draft PR marked NOT lab-tested.
+- **New repo**: fork it under the `heimcloud` user account (public), add a `[[services.ops.targets]]` entry, activate. The classic PAT covers the new fork automatically; `--check-token` shows `push: true` for it.
+
+### Validation (no Fleet)
+
+Board button **Run PR-loop validation** (`POST /admin/validation/pr-loop`, admin only, refused read-only / cross-origin), or on the host `sudo docker exec ops node /app/lib/validation.js` (Damo or Hermes). It creates a synthetic incident (`report_hash validation-pr-loop-…`, unit `docker-ops.service`, severity info, target neo) and a fix job with `validation: true`: the worker writes the first commit itself (no Hermes), one doc-only file `docs/ops-autofix-validation.md` on `ops/validation-pr-loop-<id>`, then the normal loop: gates → guarded push → lab → real PR on `madebydamo/neo` titled `[validation] Heimcloud Ops autofix PR-loop check (incident #<id>) - DO NOT MERGE`. One review comment asking for a wording change drives one revise round (Hermes edits the same file). Close the PR afterwards (card → needs_human "PR closed without merge"; close the incident) or comment `/ops stop`.
 
 ## Schema / control plane
 
@@ -210,14 +255,14 @@ Example checks for Ops incident #10 (SearXNG): no `can't register engine` lines;
 | Skills | `skills/heimcloud-ops-triage`, `skills/heimcloud-ops-fix`, `skills/heimcloud-ops-labtest` (check plan) materialized into `HERMES_HOME/skills` when autofix enable. |
 | Triage verdict | The triage skill also returns `verdict` (`code_fix` / `config_error` / `not_actionable` / `uncertain`) and `confidence` (0–1). The worker validates both (`triageVerdictFields`) and passes them into the `triage_result` payload. The admin board flags `uncertain` or confidence < 0.6 as "Triage unsure" (Start fix / Mark config error & close). Older results without these fields are mapped from `class` + `fixable`. |
 | Admin board | Kanban on `/admin`: manual status moves go through a transition table (never into `fixing`/`testing`), with an `admin_update` event per move. "Needs my input" badges are derived from the latest `triage_result` / `fix_result` payloads (see README "Admin board"). Live updates via SSE `/admin/events` (`X-Accel-Buffering: no`, 15 s heartbeat) with 5 s ETag polling fallback; worker panel + `/admin/queue` controls (README "Live updates, worker panel, queue"). |
-| Credentials | `neo.services.credentials.ops.autofixForkPushToken` → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check` then wrap git/gh. |
-| Fix run | Fresh partial clone (`--filter=blob:none`) of `autofix.neoBaseRef` (upstream first, fork second); Hermes runs **without** the push token, with git identity pinned to `heimcloud <heimcloud@users.noreply.github.com>`; the worker requires ≥1 commit, checks author/committer identity, protected paths by path prefix, then the redaction gate, then `heimcloud-autofix-env git push --force fork HEAD:refs/heads/<branch>` (fork `fix/*`/`ops/*` namespace is owned by this loop). Lab test: with `autofix.lab.enable` a lab job (see "Lab test"); otherwise `heimcloud-lab-test <branch> <class>` if on PATH; pass → `compare_ready`; fail → Hermes retry with redacted evidence up to `maxAttempts`, then `needs_human` without a compare link; absent → `awaiting_lab_test` (manual test). |
+| Credentials | `neo.services.credentials.ops.autofixForkPushToken` (classic PAT, `public_repo`, account `heimcloud`) → `/run/heimcloud-autofix/github-token`. Worker: `heimcloud-autofix-env --check`, then guarded pushes; PR API only through `heimcloud-autofix-pr`. `heimcloud-ops-worker --check-token` checks both. |
+| Fix run | Fresh partial clone (`--filter=blob:none`) of `autofix.neoBaseRef` (upstream first, fork second); Hermes runs **without** the push token, with git identity pinned to `heimcloud <heimcloud@users.noreply.github.com>`; the worker requires ≥1 commit, checks author/committer identity, protected paths by path prefix, then the redaction gate, then the push guard (`push-guard.mjs`): `heimcloud-autofix-env env -u GH_TOKEN … git -c core.hooksPath=/dev/null push --no-verify <https://github.com/heimcloud/<repo>.git> <sha>:refs/heads/<branch>`, explicit URL of the target's fork, `--force` for fix runs (the fork `fix/*`/`ops/*` namespace is owned by this loop), never for a PR revision (fast-forward only). Lab test: with `autofix.lab.enable` a lab job (see "Lab test"); otherwise `heimcloud-lab-test <branch> <class>` if on PATH; pass → `compare_ready`; fail → Hermes retry with redacted evidence up to `maxAttempts`, then `needs_human` without a compare link; absent → `awaiting_lab_test` (manual test). |
 | No token | The fork-push token is checked only right before push. Without it the fix job still runs Hermes, requires a commit, runs identity/protected-path/redaction gates, saves `fix.patch` + `push-pending.json` in the job scratch dir (`$HERMES_STATE/workspace/autofix/<job>/`, clone kept), skips push and lab test (the lab pulls the pushed fork branch), and ends `ready_no_token` → incident `triaged` with an event naming the local branch. Later: `systemctl start heimcloud-ops-worker-push@<job>.service` re-gates and pushes without a second Hermes run (replays the patch if the clone is gone), then lab-tests. The worker records the last runtime token check in `queue/worker-status.json`; the admin warns (does not block) on Start fix when it is false, falling back to `OPS_AUTOFIX_TOKEN_CONFIGURED` from Nix. |
 | Push failure | Any `git push` error after a successful Hermes run (auth, network, rejected) is **not** a Hermes failure: no Hermes retry, the per-job attempt budget (`maxAttempts`, Hermes lab retries only) is untouched. The worker saves `fix.patch` + `push-pending.json` exactly like `ready_no_token`, keeps the clone and returns `push_failed` with `push_error` = `auth`/`network`/`rejected`/`unknown` and a one-line message naming the retry (admin **Retry push** or `heimcloud-ops-worker-push@<job>.service`). Raw git output only goes to the journal with URL userinfo stripped; never to results/DB. Incident → `triaged`. |
 | Retry push | Admin shows **Retry push** on `needs_human`/`triaged` incidents whose latest `fix_result` is `ready_no_token`/`push_failed` (or the legacy `needs_human` "git push to fork failed" whose `evidence_path` is under `/autofix/<job>/`). It writes `queue/push/<id>-<ts>.json` `{kind:"push", incident_id, job}` (job name taken from the DB, `fix-<id>-…`, must match the incident); the path unit watches `queue/push` when fix is enabled and the worker runs the same code as `--push-pending` (per-job lock in the scratch dir). Event `push_enqueued`. |
 | Recovery | `--push-pending` / push jobs also work on a scratch clone **without** `push-pending.json` (jobs from before `push_failed`): branch = current branch of the clone (must be `fix/*`/`ops/*`), base = recorded `base_sha` from `results/<job>(.ingested).json`, else merge-base with `origin/<neoBaseRef>`; incident/class/severity from `queue/done|failed/<job>.json` or the name. The fork remote is re-added and identity, protected-path and redaction gates run again before push; then lab test + compare link as usual. Find `<job>`: `ls $HERMES_STATE/workspace/autofix/ \| grep "^fix-<id>-"`, or `job`/`evidence_path` in the incident's latest `fix_result` event, or `queue/done/fix-<id>-*.json`. |
 | Toolchain | `autofix.extraPackages` (internal; default cargo, rustc, clippy, rustfmt, stdenv.cc, pkg-config, openssl(+dev), gnumake: what the neo `cli/` crane build uses, no rust-toolchain file) is on the worker/push@ PATH and in `users.users.hermes.packages` (Hermes's terminal tool rebuilds PATH from the NixOS profiles). Worker env sets `CARGO_TARGET_DIR` outside the clone plus `PKG_CONFIG_PATH`/`OPENSSL_*` for openssl-sys. The fix skill runs `cargo check`/`cargo test` for `cli/` changes and `nix-instantiate --parse` for nix changes when available; an unavailable check (no network for crates) is a note, not a failure. |
-| Upstream PR | The worker pushes the `heimcloud/neo` branch and posts compare URL `https://github.com/madebydamo/neo/compare/<neoBaseRef>...heimcloud:neo:<branch>?expand=1` plus the prepared title/body in admin. Damo opens the upstream PR in the GitHub web UI. The worker's optional `GH_PR_TOKEN` → `gh pr create --draft` branch remains dormant and unused this phase; no `/run/heimcloud-autofix/pr-token` is provisioned. |
+| Upstream PR | With `autofix.pr.enable`: the worker opens (or adopts) the PR `heimcloud:<branch>` → `<baseRef>` on the target upstream after the lab pass (see "PR loop"). Otherwise, or when the API call fails, the compare URL `https://github.com/<upstream>/compare/<baseRef>...heimcloud:<repo>:<branch>?expand=1` plus the prepared title/body stay in admin. No `gh`, no `GH_PR_TOKEN`, no separate PR token. |
 | Redaction | Fail-closed scan of branch, commit message, diff, PR title/body. `OPS_REDACT_EXTRA_SLUGS` via `neo.services.ops.redactExtraSlugsFile` (docker-ops `environmentFiles`) and the same path for the autofix worker (`autofix.redactExtraSlugsFile` defaults to it). |
 | Protected paths | While `labSharesOpsHost` (default true): diffs under `autofix.denyPaths` (`nix/services/{ops,hermes,swag}`, `nix/modules/core` = base system via `autofix.basePaths`) are pushed but their lab test waits for an admin approval (see "Protected paths"). Worker env `OPS_AUTOFIX_DENY_PATHS`, `OPS_AUTOFIX_BASE_PATHS`; runner env `LABTEST_SHARES_OPS_HOST`, `LABTEST_PROTECTED_PATHS`, `LABTEST_BASE_PATHS`, `LABTEST_PROTECTED_WATCHDOG_SEC`, `LABTEST_OPS_UID`, `LABTEST_OPS_UNIT`, `LABTEST_DB_PATH`, `LABTEST_SQLITE_BIN`; container env `OPS_LAB_PROTECTED_WATCHDOG_SEC` (shown in the approval confirm). |
 | Lab stage | `lab-checks.js` (schema) is byte-identical in `app/lib` and `scripts/autofix` (test-enforced). Worker env: `OPS_AUTOFIX_LAB=1`, `OPS_AUTOFIX_LAB_STATE_DIR`, `OPS_AUTOFIX_LAB_WAIT_SEC`, `OPS_AUTOFIX_LAB_PLAN_TIMEOUT_SEC`, `OPS_SYSTEMCTL_BIN`. Container env `OPS_AUTOFIX_LAB` (board: no "Lab test needed" badge while an automated lab job is queued/running). Runner env `LABTEST_*` from the `autofix.lab` options. |
@@ -252,16 +297,38 @@ enable = true                      # automated lab stage (root runner + polkit r
 # flakeUrl = "github:heimcloud/neo/{branch}"
 # protectedWatchdogSec = 600       # watchdog deadline of admin-approved protected runs
 
+[services.ops.autofix.pr]
+enable = true          # worker opens the PR + feedback loop (needs fix.enable)
+pollMinutes = 3        # 2–5
+reviewerLogin = "madebydamo"
+reviewerId = 94169482  # numeric GitHub id: login AND id must match
+maxRounds = 3          # revise rounds per PR (1–10)
+stopPhrase = "/ops stop"
+# draft = false        # true: every PR opens as draft
+
+[[services.ops.targets]]   # optional: the neo entry is always there and first
+upstream = "madebydamo/neo"
+# units = ["docker-*"]; paths = ["nix/services"]; keywords = ["…"]   # triage hints
+
+[[services.ops.targets]]
+upstream = "madebydamo/highsea.neo"
+fork = "heimcloud/highsea.neo"   # default heimcloud/<repo>; must be heimcloud/*
+baseRef = "master"
+# flakeInput = "plugin0"         # host flake input; omitted = auto-detect by URL
+lab = "flake-override"           # or "none" (test by hand, then Skip lab)
+units = ["docker-highsea*"]
+keywords = ["highsea"]
+
 [services.credentials.ops]
-autofixForkPushToken = "…"  # fine-grained, heimcloud/neo contents:write only
+autofixForkPushToken = "…"  # classic PAT of the heimcloud account, scope public_repo
 ```
 
-Also ensure Hermes is enabled on the ops host. Deploy = activate ops + credentials tips on the ops host.
+Also ensure Hermes is enabled on the ops host. Deploy = Damo runs `neo update` + activate on the ops host (ops tip; the credentials plugin needs no change for the PR loop).
 Ensure `/var/neo/DATA/AppData/ops/redact-extra.env` exists (0600, `OPS_REDACT_EXTRA_SLUGS=…`); docker `--env-file` fails if missing.
 
 ## Open decisions (Damo)
 
-1. **GitHub App and token scope** — GitHub App setup and automatic upstream PR creation are out of scope/deferred for this phase. The final phase flow uses the Credentials-provided fine-grained `heimcloud/neo` fork-push token; the broad `OPS_GITHUB_TOKEN` in the ops container remains as-is, with revocation an open item rather than a planned step.
+1. **GitHub App and token scope**: no GitHub App. The loop uses ONE classic PAT (`public_repo`) of the `heimcloud` account for pushes and PRs (see "PR loop"). A separate machine account would give real isolation from the agents (today they act as the same account). The broad `OPS_GITHUB_TOKEN` in the ops container remains as-is; revoking it is still open.
 2. **xAI quota / credential** dedicated to the pipeline (spending limit → 403 on 20 Sep); backoff + `triage_failed` when unavailable.
 3. **Revive the dedicated lab box** (protected subsystems could then be lab-tested without an approval; see "Protected paths").
 5. **Hermes's general sudo** (neo's Hermes module: wheel + passwordless sudo for all commands) makes the narrow lab entry point defence in depth only. Removing it is a Fleet/neo decision.

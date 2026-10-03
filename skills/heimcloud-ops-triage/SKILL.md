@@ -32,4 +32,6 @@ Reply with a single JSON object (no markdown fences), exactly:
 {"class":"software|human_config|unknown","severity":"warning|high|low|…","summary":"one short paragraph","target_repo":"madebydamo/neo","fixable":true,"verdict":"code_fix|config_error|not_actionable|uncertain","confidence":0.8}
 ```
 
+`target_repo` must be one of the allowlisted repos listed in the prompt (the first is the default, `madebydamo/neo`). Pick another one only when the logs or the unit clearly belong to it (e.g. a highsea service → `madebydamo/highsea.neo`). Never invent a repo: an unlisted value sends the incident to a human.
+
 `verdict` and `confidence` were added later; the admin still reads older results without them (class + `fixable` only).

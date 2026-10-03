@@ -58,7 +58,7 @@ Bearer also works: `-H "Authorization: Bearer $OPS_INGEST_SECRET"`.
 
 `/admin` is a server-rendered kanban board, progressively enhanced by `app/public/js/board.js` (vanilla JS, no framework, no CDN/fonts; CSS in `app/public/css/board.css`, light + dark via `prefers-color-scheme`). Without JS every card still has working forms.
 
-**Columns** (= lifecycle status): Open · Triaged · Fixing · Testing · Needs human · Awaiting PR (`pr_opened`) · Done (`resolved` + `closed`, tagged on the card). Column headers carry the per-status counts that used to be tiles, plus how many cards in the column need input. Fixing/Testing are marked worker-owned.
+**Columns** (= lifecycle status): Open · Triaged · Fixing · Testing · Needs human · PR open (`pr_opened`) · Done (`resolved` + `closed`, tagged on the card). Column headers carry the per-status counts that used to be tiles, plus how many cards in the column need input. Fixing/Testing are marked worker-owned.
 
 **Moving cards**: drag and drop (native HTML5) or the **Move to…** select on each card/drawer (keyboard + touch). Moves are optimistic and roll back on error. They go through the existing update path `POST /admin/incidents/:id` (form, or JSON with `Content-Type: application/json`), which checks the transition table below (409 + message otherwise), refuses stale moves (`expect_from`), and always writes an `admin_update` event `status X -> Y` with `meta.from` / `meta.to`. All admin POSTs require same-origin (`Sec-Fetch-Site`, or `Origin` = Host when that header is missing). `ADMIN_READ_ONLY` removes drag handles, menus and buttons, and the server answers 403.
 
@@ -149,7 +149,8 @@ Env placeholders (never commit secrets):
 - `OPS_INGEST_SECRET` — ingest shared secret
 - `OPS_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN` — container GitHub API credentials, kept as-is; the autofix runner uses the separate Credentials fork-push token
 - `OPS_DB_PATH` — SQLite path (WAL)
-- `OPS_TARGET_ALLOWLIST` — default `madebydamo/neo,heimcloud/*`
+- `OPS_TARGETS` — allowlisted upstream repos (JSON, rendered from `[[services.ops.targets]]`; built-in `madebydamo/neo` → `heimcloud/neo` without it). `OPS_TARGET_ALLOWLIST` is no longer read.
+- `OPS_AUTOFIX_PR` — PR loop on (board: "PR loop on", Open the PR now, Run PR-loop validation)
 
 ## As a Neo plugin
 
@@ -179,16 +180,16 @@ Client reporting (not this repo): credentials tip `github:heimcloud/credentials`
 ## Out of scope (phase 1)
 
 - Hermes client plugin (reporting lives in credentials / Neo units)
-- Automatic upstream PR creation / GitHub App
+- GitHub App
 - Auto-merge
 
 ## Autofix runner (opt-in, default off)
 
-Host-side loop: queue → local Hermes → fork branch → compare link. Design: [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md).
+Host-side loop: queue → local Hermes → fork branch → lab → upstream PR (or compare link) → review rounds. Design: [`docs/AUTOFIX_DESIGN.md`](docs/AUTOFIX_DESIGN.md).
 
-Fleet enable (ops host):
+Enable (ops host; Damo deploys with `neo update` + activate):
 
-1. Credentials: set `[services.credentials.ops] autofixForkPushToken` (fine-grained, `heimcloud/neo` contents:write). Materializes `/run/heimcloud-autofix/github-token`.
+1. Credentials: set `[services.credentials.ops] autofixForkPushToken`: a **classic PAT** of the `heimcloud` GitHub user account, scope **`public_repo`** (covers every `heimcloud/*` fork). Materializes `/run/heimcloud-autofix/github-token` (hermes, 0400). The same token pushes fork branches (push guard) and opens PRs / posts replies (`heimcloud-autofix-pr` wrapper); nothing else uses it.
 2. Ops settings:
 
 ```toml
@@ -210,7 +211,7 @@ enable = true
 
 3. EnvironmentFile contents (0600) at that path: `OPS_REDACT_EXTRA_SLUGS=<burned-slug-list>`. Fleet must create it or docker `--env-file` fails.
 4. Activate. Confirm no worker units when `autofix.enable = false`. Confirm docker-ops has `OPS_REDACT_EXTRA_SLUGS` set (do not print the value).
-5. Admin **Start fix** enqueues a job; worker runs as `hermes`, pushes the fork branch, and posts a compare link. Damo opens the upstream PR from the incident page in the GitHub web UI.
+5. Admin **Start fix** enqueues a job; worker runs as `hermes`, pushes the fork branch, lab-tests it and (with `autofix.pr.enable`) opens the upstream PR; otherwise it posts a compare link and Damo opens the PR in the GitHub web UI.
 
 ### Automated lab stage (opt-in)
 
@@ -224,7 +225,29 @@ enable = true      # needs autofix.fix.enable
 # lockWaitSec = 1800; buildTimeoutSec = 3600; activateTimeoutSec = 900; settleSec = 30; checkTimeoutSec = 60; planTimeoutSec = 600
 ```
 
-After a fix branch is pushed the worker queues a **lab** job: Hermes (skill `heimcloud-ops-labtest`) plans whitelisted checks, and the worker starts the root unit `heimcloud-ops-labtest@lab-<id>-<ts>.service` (allowed for `hermes` by a polkit rule for exactly that unit pattern, verb start). The runner takes the lab lock and Neo's activation lock, builds the host flake with only `neo` overridden to the fork branch (`--no-write-lock-file`), arms an independent transient systemd rollback timer, activates with `switch-to-configuration test`, runs the generic + incident checks, **always** switches back to the recorded system, verifies the generation and byte-identical `flake.lock`/`flake.nix`/`settings.toml`, and disarms the timer. Pass → compare link (Awaiting PR); fail → Hermes retry with the redacted evidence (per `maxAttempts`), then needs_human. Details: [`docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage`](docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage).
+After a fix branch is pushed the worker queues a **lab** job: Hermes (skill `heimcloud-ops-labtest`) plans whitelisted checks, and the worker starts the root unit `heimcloud-ops-labtest@lab-<id>-<ts>.service` (allowed for `hermes` by a polkit rule for exactly that unit pattern, verb start). The runner takes the lab lock and Neo's activation lock, builds the host flake with only `neo` overridden to the fork branch (`--no-write-lock-file`), arms an independent transient systemd rollback timer, activates with `switch-to-configuration test`, runs the generic + incident checks, **always** switches back to the recorded system, verifies the generation and byte-identical `flake.lock`/`flake.nix`/`settings.toml`, and disarms the timer. Pass → compare link (PR open); fail → Hermes retry with the redacted evidence (per `maxAttempts`), then needs_human. Details: [`docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage`](docs/AUTOFIX_DESIGN.md#lab-test-automated-lab-stage).
 
 Board: the Testing card shows live lab progress (`lab · Building`, `Activating`, `Checks 3/8`, `Rolling back`, `Restored`) without a human badge; results show as "Lab passed/failed ✓n ✗m" on the card and a per-check list (generation before/after, watchdog, pins, tested commit, redacted evidence) in the drawer. `/admin/queue` lists lab jobs (claim order push › lab › triage › fix); cancel of a running lab job is honoured only before activation.
 
+### PR loop (opt-in)
+
+```toml
+[services.ops.autofix.pr]
+enable = true            # needs autofix.fix.enable
+pollMinutes = 3          # heimcloud-ops-pr-poll.timer, 2–5
+reviewerLogin = "madebydamo"
+reviewerId = 94169482    # login AND numeric id must match
+maxRounds = 3            # revise rounds per PR
+stopPhrase = "/ops stop"
+# draft = false
+
+[[services.ops.targets]]           # neo is always there and first
+upstream = "madebydamo/highsea.neo"
+fork = "heimcloud/highsea.neo"
+baseRef = "master"
+# flakeInput = "plugin0"           # omitted = auto-detect the host flake input
+lab = "flake-override"             # or "none"
+units = ["docker-highsea*"]
+```
+
+After a lab pass the worker opens the PR `heimcloud:<branch>` → base on the target upstream (draft + "NOT lab-tested" after **Skip lab**). The poller reads review comments from the configured reviewer only (login + id + User; everyone else is ignored), queues a revise round on the same branch (Hermes adds commits, lab test, fast-forward push, reply comment), up to `maxRounds`. `/ops stop` on its own line stops it; merged → resolved; closed → needs_human. The worker never merges. Card: PR #n, state chip, round n/cap. Checks after activation: `sudo -u hermes heimcloud-ops-worker --check-token`, `systemctl list-timers | grep heimcloud-ops-pr-poll`. Validation: board **Run PR-loop validation** or `sudo docker exec ops node /app/lib/validation.js`. Details, token restrictions and caveats: [`docs/AUTOFIX_DESIGN.md#pr-loop-auto-pr--review-feedback`](docs/AUTOFIX_DESIGN.md#pr-loop-auto-pr--review-feedback).

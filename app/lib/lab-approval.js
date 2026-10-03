@@ -16,6 +16,7 @@ import crypto from "node:crypto";
 import { getDataDir, queueDir, ensureDir, findPendingJobs, isAutofixKindEnabled, QueueError } from "./queue.js";
 import { labApprovalMessage, normalizeProtected } from "./lab-checks.js";
 import { addIncidentEvent, updateIncident } from "./db.js";
+import { loadTargets, findTarget } from "./targets.js";
 
 export class ApprovalKeyError extends Error {
   constructor(message) {
@@ -85,16 +86,32 @@ function refuse(code, message, status = 409) {
  * the DB only (latest fix_result), or null. The incident must still be
  * needs_human: approving / skipping moves it on, so a second click is refused.
  */
-export function labApprovalSource(incident, latestFixEvent) {
+export function labApprovalSource(incident, latestFixEvent, { allowNoLab = false } = {}) {
   if (!incident || incident.status !== "needs_human") return null;
   const m = latestFixEvent?.meta;
-  if (!m || m.status !== "lab_approval_needed") return null;
+  // lab_unavailable (target without a lab method) can only be skipped.
+  if (!m || !(m.status === "lab_approval_needed" || (allowNoLab && m.status === "lab_unavailable"))) return null;
   const branch = String(m.branch || "");
   if (!BRANCH_RE.test(branch) || branch.includes("..")) return null;
   if (!SHA_RE.test(String(m.head_sha || ""))) return null;
   const prot = normalizeProtected(m.protected);
-  if (!prot) return null;
+  if (!prot && m.status === "lab_approval_needed") return null;
+  // Target must still be allowlisted (default: the first entry, neo).
+  const target = m.target_repo ? findTarget(loadTargets(), m.target_repo) : loadTargets()[0];
+  if (!target) return null;
+  const n = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 && Number(v) < 1e9 ? Number(v) : undefined);
+  const cs = m.change_summary && typeof m.change_summary === "object" ? m.change_summary : null;
   return {
+    no_lab_method: m.status === "lab_unavailable",
+    target_repo: target.upstream,
+    pr_number: n(m.pr_number) && n(m.revise_round) ? n(m.pr_number) : undefined,
+    revise_round: n(m.pr_number) && n(m.revise_round) ? n(m.revise_round) : undefined,
+    change_summary: cs
+      ? {
+          commits: (Array.isArray(cs.commits) ? cs.commits : []).slice(0, 10).map((c) => String(c).slice(0, 200)),
+          summary: String(cs.summary || "").slice(0, 800),
+        }
+      : undefined,
     event_id: latestFixEvent.id,
     branch,
     head_sha: m.head_sha,
@@ -124,7 +141,7 @@ export function approveProtectedLab(incident, src, { now = new Date() } = {}) {
   if (!isAutofixKindEnabled("lab")) {
     throw refuse("autofix_disabled", "Automated lab testing is not enabled on this host (autofix.lab.enable).");
   }
-  if (!src) throw refuse("no_lab_approval", `Incident #${incident.id} has no protected fix waiting for a lab approval.`);
+  if (!src || src.no_lab_method) throw refuse("no_lab_approval", `Incident #${incident.id} has no protected fix waiting for a lab approval.`);
   const pending = [...findPendingJobs("lab", incident.id), ...findPendingJobs("fix", incident.id)];
   if (pending.length) throw refuse("already_queued", `A job for incident #${incident.id} is already queued or running (${path.basename(pending[0])}).`);
   const key = loadApprovalKey(); // fail before writing anything
@@ -149,7 +166,7 @@ export function approveProtectedLab(incident, src, { now = new Date() } = {}) {
     },
   ).id);
   try {
-    const sig = signApproval({ incident_id: incident.id, instance, branch: src.branch, head_sha: src.head_sha, event_id: eventId, approved_at: approvedAt }, key);
+    const sig = signApproval({ incident_id: incident.id, instance, branch: src.branch, head_sha: src.head_sha, event_id: eventId, approved_at: approvedAt, target_repo: src.target_repo }, key);
     const job = {
       job_version: 1,
       kind: "lab",
@@ -170,6 +187,10 @@ export function approveProtectedLab(incident, src, { now = new Date() } = {}) {
       base_sha: src.base_sha,
       head_sha: src.head_sha,
       protected: src.protected,
+      target_repo: src.target_repo,
+      pr_number: src.pr_number,
+      revise_round: src.revise_round,
+      change_summary: src.change_summary,
       approved_by: "admin",
       approval: { v: 1, by: "admin", event_id: eventId, approved_at: approvedAt, sig },
       enqueued_at: approvedAt,
@@ -191,16 +212,54 @@ export function approveProtectedLab(incident, src, { now = new Date() } = {}) {
   }
 }
 
-/** Admin skipped the lab test: Awaiting PR with a "not lab-tested" warning. */
+/**
+ * Admin skipped the lab test (protected path, or a target without a lab
+ * method): PR open column with a "NOT lab-tested" warning. With PR automation
+ * on, a kind "pr" job opens the PR as a draft marked NOT lab-tested (or, in a
+ * revise round, posts the reply); the compare link stays the fallback.
+ */
 export function skipProtectedLab(incident, src) {
   if (!src) throw refuse("no_lab_approval", `Incident #${incident.id} has no protected fix waiting for a lab approval.`);
   if (!src.compare_url) throw refuse("no_compare_url", `Incident #${incident.id} has no compare link for the pushed branch.`);
   updateIncident(incident.id, { status: "pr_opened", compare_url: src.compare_url });
+  const what = src.no_lab_method ? `change on ${src.target_repo} (no lab method)` : `protected change (${src.protected.label})`;
+  let prJob = null;
+  if (isAutofixKindEnabled("pr") && !findPendingJobs("pr", incident.id).length) {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const job = {
+      job_version: 1,
+      kind: "pr",
+      mode: "untested",
+      incident_id: incident.id,
+      report_hash: incident.report_hash,
+      unit: incident.unit,
+      severity: incident.severity,
+      class: incident.class,
+      neo_version: incident.neo_version,
+      logs_excerpt: incident.logs_excerpt,
+      target_repo: src.target_repo,
+      branch: src.branch,
+      head_sha: src.head_sha,
+      pr_title: src.pr_title,
+      pr_body: src.pr_body,
+      protected: src.protected || undefined,
+      pr_number: src.pr_number,
+      revise_round: src.revise_round,
+      change_summary: src.change_summary,
+      enqueued_at: new Date().toISOString(),
+      enqueued_by: "admin",
+    };
+    const dir = queueDir("pr");
+    ensureDir(dir);
+    const dest = path.join(dir, `${incident.id}-${ts}.json`);
+    writeJobAtomic(dest, job);
+    prJob = path.basename(dest);
+  }
   const eventId = Number(addIncidentEvent(
     incident.id,
     "lab_skipped",
-    `Admin skipped the lab test of protected change (${src.protected.label}); compare link opened — NOT lab-tested`,
-    { compare_url: src.compare_url, branch: src.branch, head_sha: src.head_sha, protected: src.protected, warning: "not lab-tested", by: "admin" },
+    `Admin skipped the lab test of ${what}; ${prJob ? (src.revise_round ? "revision reply queued" : "draft PR queued") : "compare link opened"} — NOT lab-tested`,
+    { compare_url: src.compare_url, branch: src.branch, head_sha: src.head_sha, protected: src.protected, warning: "not lab-tested", by: "admin", target_repo: src.target_repo, pr_job: prJob || undefined, job_kind: prJob ? "pr" : undefined, job_file: prJob || undefined },
   ).id);
-  return { compare_url: src.compare_url, event_id: eventId };
+  return { compare_url: src.compare_url, event_id: eventId, pr_job: prJob };
 }

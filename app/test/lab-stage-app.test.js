@@ -330,7 +330,7 @@ test("card + drawer: dropped checks and a tolerated activation exit 4 are visibl
 // ---------------------------------------------------------------- queue + admin
 
 test("queue: lab kind listed, priority push › lab › triage › fix; fix refused while a lab job is pending", async () => {
-  assert.deepEqual(QC.KINDS.slice().sort(), ["fix", "lab", "push", "triage"]);
+  assert.deepEqual(QC.KINDS.slice().sort(), ["fix", "lab", "pr", "push", "triage"]);
   const a = incident();
   const b = incident();
   const c = incident();

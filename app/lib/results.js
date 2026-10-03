@@ -12,6 +12,7 @@ import {
   updateLatestFixAttempt,
 } from "./db.js";
 import { resultsDir } from "./queue.js";
+import { isRepoAllowed } from "./github.js";
 
 let lastDirWarning = "";
 
@@ -146,26 +147,38 @@ export function startResultsIngestLoop({ intervalMs = 15_000, watch = true } = {
   };
 }
 
-export function applyResult(result) {
+export function applyResult(result0) {
+  let result = result0;
   const id = Number(result.incident_id);
   if (!id) throw new Error("incident_id_required");
   const incident = getIncident(id);
   if (!incident) throw new Error(`incident_not_found:${id}`);
 
   const kind = result.kind || "unknown";
+  if (kind === "pr") {
+    applyPrResult(incident, result);
+    return;
+  }
   if (kind === "triage" || result.type === "triage") {
     const klass = result.class || incident.class;
+    // Target must be allowlisted (services.ops.targets); an unknown repo is
+    // never stored and the incident waits for a human.
+    const targetOk = result.target_repo && isRepoAllowed(result.target_repo);
+    const unknownTarget = result.target_unknown || (result.target_repo && !targetOk) ? String(result.target_unknown || result.target_repo).slice(0, 120) : null;
+    if (unknownTarget) result = { ...result, target_unknown: unknownTarget, target_repo: undefined };
     // Only promote open → triaged; never pull a fixing/testing incident back.
     const status =
       !["triage_failed", "triage_cancelled"].includes(result.status) && incident.status === "open"
-        ? "triaged"
+        ? unknownTarget
+          ? "needs_human"
+          : "triaged"
         : incident.status;
     updateIncident(id, {
       class: ["software", "human_config", "unknown"].includes(klass)
         ? klass
         : incident.class,
       status,
-      target_repo: result.target_repo || incident.target_repo,
+      target_repo: (targetOk && result.target_repo) || incident.target_repo,
     });
     addIncidentEvent(id, "triage_result", result.summary || "Triage result", result);
     return;
@@ -206,6 +219,40 @@ export function applyResult(result) {
     result.via === "lab" && ["resolved", "closed"].includes(incident.status) ? incident.status : fixStatusToIncidentStatus(result.status);
   if (Object.keys(patch).length) updateIncident(id, patch);
   addIncidentEvent(id, "fix_result", result.summary || result.status || "Fix result", result);
+}
+
+const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
+
+/**
+ * kind "pr" results (worker PR loop): PR number/url on the incident, a
+ * pr_state event (the card reads it) and the status the PR state implies:
+ * opened/adopted/revised → PR open, feedback → Fixing (revise job queued),
+ * merged → Resolved, closed / halted / blocked → Needs human. A manual close
+ * is never undone; "state", "stopped" and "error" change no status.
+ */
+export function applyPrResult(incident, result) {
+  const id = incident.id;
+  const patch = {};
+  const m = PR_URL_RE.exec(String(result.pr_url || ""));
+  if (m && isRepoAllowed(m[1]) && Number(m[2]) === Number(result.pr_number)) {
+    patch.draft_pr_url = result.pr_url;
+    patch.draft_pr_number = Number(result.pr_number);
+  }
+  const final = ["closed"].includes(incident.status) || (incident.status === "resolved" && result.pr_event !== "merged");
+  const next = {
+    opened: "pr_opened",
+    adopted: "pr_opened",
+    revised: "pr_opened",
+    feedback: "fixing",
+    merged: "resolved",
+    closed: "needs_human",
+    halted: "needs_human",
+    blocked: "needs_human",
+  }[result.pr_event];
+  if (next && !final && !(incident.status === "resolved" && next === "resolved")) patch.status = next;
+  if (Object.keys(patch).length) updateIncident(id, patch);
+  const kindOf = result.pr_event === "merged" ? "pr_merged" : "pr_state";
+  addIncidentEvent(id, kindOf, result.summary || `PR ${result.pr_event}`, result);
 }
 
 const NON_ATTEMPT_STATUSES = new Set(["no_token", "ready_no_token", "push_failed", "cancelled"]);
